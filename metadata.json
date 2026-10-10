@@ -1,0 +1,6 @@
+{
+  "name": "Q-Commerce Platform & Backend Architecture",
+  "description": "Unified Quick Commerce ecosystem encompassing Customer App, Admin Portal, Seller App, Delivery App, and Backend Engine.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
