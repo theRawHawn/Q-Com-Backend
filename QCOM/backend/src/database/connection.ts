@@ -71,12 +71,51 @@ export async function query<T = any>(text: string, params?: any[]): Promise<Quer
  * Executes a callback within a managed ACID transaction.
  * Automatically issues BEGIN, COMMIT, or ROLLBACK and safely releases the client.
  */
+let memDbMutex: Promise<any> = Promise.resolve();
+
 export async function transaction<T>(
   callback: (client: TransactionClient) => Promise<T>,
   poolOverride?: pg.Pool
 ): Promise<T> {
   const currentPool = poolOverride || getPool();
   const memDb = (currentPool as any).__pgMemDb;
+
+  if (memDb) {
+    const runInQueue = async () => {
+      let memDbBackup: any = null;
+      if (memDb) {
+        memDbBackup = memDb.backup();
+      }
+      const client = await currentPool.connect();
+      try {
+        await client.query('BEGIN');
+        const result = await callback(client);
+        await client.query('COMMIT');
+        return result;
+      } catch (err) {
+        if (memDbBackup) {
+          try {
+            memDbBackup.restore();
+          } catch (restoreErr: any) {
+            console.error('[pg-mem Restore Error]', restoreErr.message);
+          }
+        }
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackErr: any) {
+          console.error('[Database Rollback Error] Failed to rollback transaction:', rollbackErr.message);
+        }
+        throw err;
+      } finally {
+        client.release();
+      }
+    };
+
+    const next = memDbMutex.then(runInQueue, runInQueue);
+    memDbMutex = next.catch(() => {});
+    return next;
+  }
+
   const client = await currentPool.connect();
   try {
     await client.query('BEGIN');

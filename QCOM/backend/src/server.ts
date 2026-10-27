@@ -9,6 +9,7 @@ import { inventoryService } from './modules/inventory/inventoryService.js';
 import { bloomFilterService } from './modules/resilience/bloomFilterService.js';
 import { bloomSyncBus } from './modules/resilience/bloomSyncBus.js';
 import { RESILIENCE_CONFIG } from './modules/resilience/resilienceConfig.js';
+import { financialRecoveryWorker } from './modules/recovery/financialRecoveryWorker.js';
 
 const app = createApp();
 
@@ -108,6 +109,12 @@ const server = app.listen(env.PORT, async () => {
     console.log('[QCOM Backend] Inventory reservation expiry reaper worker active.');
   }
 
+  // Start financial recovery worker for stale PROCESSING operations (Sprint 10.1C)
+  if (env.NODE_ENV !== 'test') {
+    financialRecoveryWorker.start();
+    console.log('[QCOM Backend] Financial recovery worker registered and active.');
+  }
+
   // Perform initial readiness probe check on startup
   const dbHealth = await checkDatabaseHealth();
   if (dbHealth.alive) {
@@ -153,6 +160,7 @@ async function handleShutdown(signal: string) {
     rebuildIntervalTimer = null;
   }
 
+  await financialRecoveryWorker.stop();
   outboxService.stopOutboxRelayer();
   realtimeGateway.close();
 

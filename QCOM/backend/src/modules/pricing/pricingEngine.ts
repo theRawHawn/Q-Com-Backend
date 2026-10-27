@@ -198,7 +198,7 @@ export class PricingEngine {
     const productIds = input.items.map(i => i.productId);
     const prodRes = await runner.query(
       `SELECT p.id as product_id, p.sku, p.name, p.category, p.hsn_code, p.gst_rate_percent,
-              si.selling_price, si.original_mrp, si.stock_count, si.is_available
+              si.selling_price, si.original_mrp, si.stock_count, si.reserved_count, si.is_available
          FROM store_inventory si
          JOIN products p ON p.id = si.product_id
         WHERE si.merchant_id = $1
@@ -220,6 +220,16 @@ export class PricingEngine {
       const p = productMap.get(itm.productId);
       if (!p.is_available) {
         throw new PricingEngineError('PRODUCT_UNAVAILABLE', `Product '${p.name}' is currently marked unavailable.`, 422);
+      }
+      const stockCount = Number(p.stock_count);
+      const reservedCount = Number(p.reserved_count || 0);
+      const available = stockCount - reservedCount;
+      if (available < itm.quantity) {
+        throw new PricingEngineError(
+          'INSUFFICIENT_STOCK',
+          `Insufficient stock for '${p.name}'. Requested ${itm.quantity}, but only ${Math.max(0, available)} available. Please reduce quantity or remove item.`,
+          422
+        );
       }
     }
 

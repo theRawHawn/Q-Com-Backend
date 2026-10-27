@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS payment_intents (
     order_id UUID NOT NULL,
     amount NUMERIC(10,2) NOT NULL CHECK (amount >= 0),
     currency VARCHAR(10) NOT NULL DEFAULT 'INR',
-    status VARCHAR(30) NOT NULL DEFAULT 'CREATED' CHECK (status IN ('CREATED', 'CAPTURED', 'FAILED', 'REFUNDED')),
+    status VARCHAR(30) NOT NULL DEFAULT 'CREATED' CONSTRAINT payment_intents_status_check CHECK (status IN ('CREATED', 'CAPTURED', 'FAILED', 'REFUNDED')),
     signature VARCHAR(128) NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()

@@ -1,0 +1,58 @@
+# ==============================================================================
+# QCOM BACKEND STAGING INFRASTRUCTURE DOCKER-COMPOSE SPECIFICATION
+# ==============================================================================
+# Spins up an isolated, physical PostgreSQL 16 cluster and Redis 7 cache
+# specifically designed for staging environment validation and concurrency tests.
+
+version: '3.8'
+
+services:
+  staging-postgres:
+    image: postgres:16-alpine
+    container_name: qcom-staging-postgres-16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: qcom_staging_user
+      POSTGRES_PASSWORD: qcom_staging_password
+      POSTGRES_DB: qcom_staging
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command: >
+      postgres
+        -c max_connections=200
+        -c shared_buffers=256MB
+        -c work_mem=16MB
+        -c maintenance_work_mem=64MB
+        -c effective_cache_size=768MB
+        -c synchronous_commit=on
+        -c wal_level=replica
+        -c log_min_duration_statement=250
+    ports:
+      - "5432:5432"
+    volumes:
+      - staging_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qcom_staging_user -d qcom_staging"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  staging-redis:
+    image: redis:7-alpine
+    container_name: qcom-staging-redis-7
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - staging_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  staging_pg_data:
+    name: qcom_staging_pg16_data
+  staging_redis_data:
+    name: qcom_staging_redis7_data

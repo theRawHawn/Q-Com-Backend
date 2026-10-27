@@ -33,6 +33,8 @@ export interface AuthResult {
 }
 
 export class AuthService {
+  private static inFlightRefreshes = new Map<string, Promise<{ accessToken: string; refreshToken: string }>>();
+
   /**
    * Generates and dispatches a secure numeric OTP with rate limit checks
    */
@@ -311,8 +313,31 @@ export class AuthService {
     userAgent?: string,
     poolOverride?: pg.Pool
   ): Promise<{ accessToken: string; refreshToken: string }> {
-    const runner = poolOverride || getPool();
     const tokenHash = hashToken(rawRefreshToken);
+
+    const activeInFlight = AuthService.inFlightRefreshes.get(tokenHash);
+    if (activeInFlight) {
+      await activeInFlight.catch(() => {});
+      throw new Error('Refresh token already rotated concurrently.');
+    }
+
+    const refreshPromise = this.executeRefreshTokens(rawRefreshToken, tokenHash, ipAddress, userAgent, poolOverride);
+    AuthService.inFlightRefreshes.set(tokenHash, refreshPromise);
+    try {
+      return await refreshPromise;
+    } finally {
+      AuthService.inFlightRefreshes.delete(tokenHash);
+    }
+  }
+
+  private async executeRefreshTokens(
+    rawRefreshToken: string,
+    tokenHash: string,
+    ipAddress?: string,
+    userAgent?: string,
+    poolOverride?: pg.Pool
+  ): Promise<{ accessToken: string; refreshToken: string }> {
+    const runner = poolOverride || getPool();
 
     const result = await transaction(async (txClient) => {
       // 1. SELECT row FOR UPDATE to lock the refresh token record against concurrent races

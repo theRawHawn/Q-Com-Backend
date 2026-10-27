@@ -263,6 +263,37 @@ export async function testAuthAndRbac() {
       /Mock OTP.*prohibited in production/i,
       'Production startup must fail if mock OTP provider is enabled'
     );
+
+    assert.throws(
+      () => {
+        validateProductionSecurity({
+          NODE_ENV: 'production',
+          JWT_ACCESS_SECRET: 'prod_ultra_secure_secret_key_12345678901234567890',
+          JWT_REFRESH_SECRET: 'prod_ultra_secure_secret_key_12345678901234567890',
+          TELEPHONY_MODE: 'exotel',
+          PAYMENT_MODE: 'production',
+          RAZORPAY_KEY_ID: 'rzp_test_mockkey123',
+          RAZORPAY_KEY_SECRET: 'prod_secret_key_1234567890',
+          PAYMENT_SECRET: 'custom_payment_secret_prod_1234567890',
+          RAZORPAY_WEBHOOK_SECRET: 'custom_webhook_secret_prod_1234567890',
+          CORS_ALLOWED_ORIGINS: 'https://admin.qcom.in',
+        } as any);
+      },
+      /Test key ID \(rzp_test_\*\) cannot be used for live payments in production/i,
+      'Production startup must fail if test Razorpay key ID is passed'
+    );
+
+    assert.throws(
+      () => {
+        validateProductionSecurity({
+          NODE_ENV: 'test',
+          RAZORPAY_KEY_ID: 'rzp_live_productionkey123',
+        } as any);
+      },
+      /Live payment credentials cannot be used in test environment/i,
+      'Test startup must fail if live Razorpay credentials are used'
+    );
+
     console.log('✓ Production fail-closed security configuration rules verified');
 
   } finally {

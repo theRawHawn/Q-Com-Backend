@@ -19,10 +19,25 @@ import { runSprint91ResilienceTests } from './sprint9-1-bloom-resilience.test.js
 import { runSprint91RemediationTests } from './sprint9-1-remediation.test.js';
 import { runSprint92SubscriberCacheResilienceTests } from './sprint9-2-subscriber-cache-resilience.test.js';
 import { testAuthRemediation } from './auth-remediation.test.js';
+import { runSprint10DecouplingTests } from './sprint10-1a-decoupling.test.js';
+import { runSprint10CRecoveryAndWebhookTests } from './sprint10-1c-recovery-webhooks.test.js';
+import { runSprint11_5RemediationTests } from './sprint11-5-inventory-remediation.test.js';
+import { runSprint11_6RemediationTests } from './sprint11-6-payment-inventory-remediation.test.js';
+import { runSprint11_7SelectiveReservationsAndStockAlertsTests } from './sprint11-7-selective-reservations-and-stock-alerts.test.js';
+import { runSprint11_8ConcurrencyAndIntegrityTests } from './sprint11-8-concurrency-and-integrity.test.js';
+import { runSprint12PaymentProviderAgnosticTests } from './sprint12-payment-provider-agnostic.test.js';
+import { runSprint12_5RecoveryConcurrencyAndProviderNeutralityTests } from './sprint12-5-recovery-concurrency-and-provider-neutrality.test.js';
+import { runSprint13CrossPanelIntegrationTests } from './sprint13-cross-panel-integration.test.js';
+import { runSprint13_1ProductionSecurityAndRecoveryTests } from './sprint13-1-production-security-and-recovery.test.js';
+import { runSprint14StagingValidationTests } from './sprint14-staging-validation.test.js';
+import { runFourAppCompatibilityTests } from './four-app-compatibility.test.js';
+import { runSprint14_1RealPostgreSql16Tests } from './sprint14-1-real-postgresql16.test.js';
+import { runSprint14_2WorkflowClosureTests } from './sprint14-2-workflow-closure.test.js';
+import { runSprint14_3StagingReleaseCandidateTests } from './sprint14-3-staging-release-candidate.test.js';
 
 async function runAllTests() {
   console.log('===========================================================');
-  console.log('  QCOM Unified Backend Engine — Automated Test Suite (Sprint 1–9.1 + Auth Remediation)');
+  console.log('  QCOM Unified Backend Engine — Automated Test Suite (Sprint 1–10.1A)');
   console.log('===========================================================');
   const start = Date.now();
   try {
@@ -73,9 +88,53 @@ async function runAllTests() {
     // Sprint 9.2 Redis Subscriber, Stampede Protection & Cache Resilience Tests
     await runSprint92SubscriberCacheResilienceTests();
 
+    // Sprint 10.1A Financial Transaction Decoupling & Concurrency Remediation Tests
+    await runSprint10DecouplingTests();
+
+    // Sprint 10.1C Durable Financial Recovery & Webhook Ingestion Tests
+    await runSprint10CRecoveryAndWebhookTests();
+
+    // Sprint 11.5 Critical Inventory Remediation Tests
+    await runSprint11_5RemediationTests();
+
+    // Sprint 11.6.1 Critical Payment-Inventory Remediation Tests
+    await runSprint11_6RemediationTests();
+
+    // Sprint 11.7 Selective Stock Reservation & Seller Stock Alert Tests
+    await runSprint11_7SelectiveReservationsAndStockAlertsTests();
+
+    // Sprint 11.8 Concurrency Stress Testing & Financial Integrity Verification Tests
+    await runSprint11_8ConcurrencyAndIntegrityTests();
+
+    // Sprint 12.0 Payment-Provider-Agnostic Architecture Tests
+    await runSprint12PaymentProviderAgnosticTests();
+
+    // Sprint 12.5 Recovery Worker Concurrency & Provider-Neutral Configuration Tests
+    await runSprint12_5RecoveryConcurrencyAndProviderNeutralityTests();
+
+    // Sprint 13.0 Cross-Panel Backend Integration & Workflow Integrity Tests
+    await runSprint13CrossPanelIntegrationTests();
+
+    // Sprint 13.1 Production Security, Concurrency & Failure-Recovery Tests
+    await runSprint13_1ProductionSecurityAndRecoveryTests();
+
+    // Sprint 14.0 Staging Environment, Real PostgreSQL 16 Validation & Release Readiness Tests
+    await runSprint14StagingValidationTests();
+
+    // Four-Application Backend Compatibility Verification Tests
+    await runFourAppCompatibilityTests();
+
+    // Sprint 14.1 Real PostgreSQL 16 Validation & Concurrency Tests
+    await runSprint14_1RealPostgreSql16Tests();
+
+    // Sprint 14.2 Backend Feature Completeness & Cross-App Workflow Closure Tests
+    await runSprint14_2WorkflowClosureTests();
+    // Sprint 14.3 Four-Application Staging Integration & Release Candidate Tests
+    await runSprint14_3StagingReleaseCandidateTests();
+
     const duration = ((Date.now() - start) / 1000).toFixed(2);
     console.log('\n===========================================================');
-    console.log(`✓ ALL SPRINT 1 TO 9.2 TESTS PASSED SUCCESSFULLY in ${duration}s!`);
+    console.log(`✓ ALL TESTS & FOUR-APPLICATION COMPATIBILITY PASSED in ${duration}s!`);
     console.log('===========================================================\n');
     process.exit(0);
   } catch (err: any) {

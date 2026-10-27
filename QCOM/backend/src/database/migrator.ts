@@ -74,45 +74,66 @@ export async function runMigrations(options?: {
   poolOverride?: pg.Pool;
 }): Promise<string[]> {
   const currentPool = options?.poolOverride || getPool();
-  await ensureMigrationTable(currentPool);
+  const MIGRATION_ADVISORY_LOCK = 987654321;
+  let acquiredLock = false;
 
-  const appliedRes = await currentPool.query<MigrationRecord>('SELECT version FROM schema_migrations ORDER BY id ASC');
-  const appliedVersions = new Set(appliedRes.rows.map(r => r.version));
-
-  const allMigrations = getMigrationFiles(options?.migrationsDir);
-  const pendingMigrations = allMigrations.filter(m => !appliedVersions.has(m.version));
-
-  if (pendingMigrations.length === 0) {
-    console.log('[Migrator] Database is already up to date. Zero pending migrations.');
-    return [];
+  try {
+    // Acquire session-level advisory lock on PostgreSQL to serialize concurrent migrations
+    await currentPool.query('SELECT pg_advisory_lock($1)', [MIGRATION_ADVISORY_LOCK]);
+    acquiredLock = true;
+  } catch {
+    // Fall through gracefully if database engine (such as pg-mem) does not support advisory locks
   }
 
-  const appliedNow: string[] = [];
+  try {
+    await ensureMigrationTable(currentPool);
 
-  for (const mig of pendingMigrations) {
-    console.log(`[Migrator] Applying migration: ${mig.name}...`);
-    const sql = fs.readFileSync(mig.fullPath, 'utf8');
+    const appliedRes = await currentPool.query<MigrationRecord>('SELECT version FROM schema_migrations ORDER BY id ASC');
+    const appliedVersions = new Set(appliedRes.rows.map(r => r.version));
 
-    // Execute migration inside an atomic transaction
-    const client = await currentPool.connect();
-    try {
-      await client.query('BEGIN');
-      await client.query(sql);
-      await client.query(
-        'INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, NOW())',
-        [mig.version, mig.name]
-      );
-      await client.query('COMMIT');
-      appliedNow.push(mig.name);
-      console.log(`[Migrator] Successfully applied: ${mig.name}`);
-    } catch (err: any) {
-      await client.query('ROLLBACK');
-      console.error(`[Migrator] Failed applying migration ${mig.name}:`, err.message);
-      throw err;
-    } finally {
-      client.release();
+    const allMigrations = getMigrationFiles(options?.migrationsDir);
+    const pendingMigrations = allMigrations.filter(m => !appliedVersions.has(m.version));
+
+    if (pendingMigrations.length === 0) {
+      console.log('[Migrator] Database is already up to date. Zero pending migrations.');
+      return [];
+    }
+
+    const appliedNow: string[] = [];
+
+    for (const mig of pendingMigrations) {
+      console.log(`[Migrator] Applying migration: ${mig.name}...`);
+      const sql = fs.readFileSync(mig.fullPath, 'utf8');
+
+      // Execute migration inside an atomic transaction
+      const client = await currentPool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(sql);
+        await client.query(
+          'INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, NOW())',
+          [mig.version, mig.name]
+        );
+        await client.query('COMMIT');
+        appliedNow.push(mig.name);
+        console.log(`[Migrator] Successfully applied: ${mig.name}`);
+      } catch (err: any) {
+        await client.query('ROLLBACK');
+        console.error(`[Migrator] Failed applying migration ${mig.name}:`, err.message);
+        throw err;
+      } finally {
+        client.release();
+      }
+    }
+
+    return appliedNow;
+  } finally {
+    if (acquiredLock) {
+      try {
+        await currentPool.query('SELECT pg_advisory_unlock($1)', [MIGRATION_ADVISORY_LOCK]);
+      } catch {
+        // Suppress unlock errors during shutdown
+      }
     }
   }
-
-  return appliedNow;
 }

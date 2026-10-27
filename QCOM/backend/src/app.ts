@@ -29,6 +29,8 @@ import { notificationRouter } from './routes/notificationRoutes.js';
 import { adminCampaignRouter } from './routes/adminCampaignRoutes.js';
 import { returnRouter } from './routes/returnRoutes.js';
 import { refundRouter } from './routes/refundRoutes.js';
+import { adminCompatibilityRouter } from './routes/adminCompatibilityRoutes.js';
+import { partnerCompatibilityRouter, tasksCompatibilityRouter } from './routes/partnerCompatibilityRoutes.js';
 
 export function createApp(): Express {
   const app = express();
@@ -82,7 +84,7 @@ export function createApp(): Express {
   app.use(requestLoggerMiddleware);
 
   // 6. Base Health Check (Process Liveness Probe)
-  app.get('/health', (req: Request, res: Response) => {
+  app.get(['/health', '/health/live'], (req: Request, res: Response) => {
     res.status(200).json({
       success: true,
       status: 'OK',
@@ -94,9 +96,12 @@ export function createApp(): Express {
   });
 
   // 7. Authoritative Readiness Probe (Checks PostgreSQL & Cache Connectivity)
-  app.get('/ready', async (req: Request, res: Response) => {
+  app.get(['/ready', '/health/ready'], async (req: Request, res: Response) => {
     const dbHealth = await checkDatabaseHealth();
     const cacheHealth = await checkRedisHealth();
+
+    const isPaymentConfigured = env.PAYMENT_MODE !== 'none';
+    const paymentStatus = isPaymentConfigured ? 'READY' : 'UNCONFIGURED';
 
     if (dbHealth.alive) {
       res.status(200).json({
@@ -112,6 +117,12 @@ export function createApp(): Express {
           latencyMs: cacheHealth.latencyMs,
           ...(cacheHealth.error ? { warning: cacheHealth.error } : {}),
         },
+        payments: {
+          status: paymentStatus,
+          mode: env.PAYMENT_MODE,
+          provider: env.PAYMENT_PROVIDER || env.PAYMENT_MODE,
+          onlinePaymentsAvailable: isPaymentConfigured,
+        },
         timestamp: new Date().toISOString(),
       });
     } else {
@@ -126,6 +137,12 @@ export function createApp(): Express {
           status: cacheHealth.alive ? 'UP' : 'DOWN',
           mode: cacheHealth.mode,
           latencyMs: cacheHealth.latencyMs,
+        },
+        payments: {
+          status: paymentStatus,
+          mode: env.PAYMENT_MODE,
+          provider: env.PAYMENT_PROVIDER || env.PAYMENT_MODE,
+          onlinePaymentsAvailable: isPaymentConfigured,
         },
         timestamp: new Date().toISOString(),
       });
@@ -179,6 +196,10 @@ export function createApp(): Express {
   apiRouter.use('/', refundRouter);
   apiRouter.use('/returns', returnRouter);
   apiRouter.use('/refunds', refundRouter);
+  apiRouter.use('/admin', adminCompatibilityRouter);
+  apiRouter.use('/', adminCompatibilityRouter);
+  apiRouter.use('/partner', partnerCompatibilityRouter);
+  apiRouter.use('/tasks', tasksCompatibilityRouter);
   apiRouter.use('/', aiRouter);
 
   // Mount on /api/v1 as primary versioned endpoint

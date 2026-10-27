@@ -236,7 +236,8 @@ export class RealtimeGateway {
   ): Promise<void> {
     if (!ws.authContext) return;
 
-    switch (msg.action) {
+    const action = msg.action || (msg as any).type;
+    switch (action) {
       case 'ping':
         this.send(ws, {
           type: 'pong',

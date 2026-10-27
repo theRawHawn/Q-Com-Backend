@@ -611,7 +611,7 @@ export async function runSeeds(poolOverride?: pg.Pool): Promise<void> {
     const customerRoleId = roleMap.get('CUSTOMER');
     if (customerRoleId) {
       await client.query(
-        `INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2), ($3, $2) ON CONFLICT DO NOTHING`,
+        `INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2), ($3, $4) ON CONFLICT DO NOTHING`,
         [userId, customerRoleId, userBId, customerRoleId]
       );
     }

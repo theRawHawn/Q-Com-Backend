@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { getPool, transaction } from '../../database/connection.js';
 import { OutboxEvent, OutboxEventHandler, StageEventInput } from './outboxTypes.js';
 import { calculateFullJitterDelay } from '../resilience/retryPolicy.js';
+import { stockNotificationConsumer } from '../notifications/stockNotificationConsumer.js';
 
 export class OutboxService {
   private consumers: Map<string, OutboxEventHandler[]> = new Map();
@@ -280,6 +281,20 @@ export class OutboxService {
 
 export const outboxService = new OutboxService();
 
+// Automatically wire default stock notification consumers
+outboxService.registerConsumer('INVENTORY_LOW_STOCK', async (event) => {
+  await stockNotificationConsumer.handleStockAlert(event.payload);
+});
+outboxService.registerConsumer('InventoryLowStock', async (event) => {
+  await stockNotificationConsumer.handleStockAlert(event.payload);
+});
+outboxService.registerConsumer('INVENTORY_OUT_OF_STOCK', async (event) => {
+  await stockNotificationConsumer.handleStockAlert(event.payload);
+});
+outboxService.registerConsumer('InventoryOutOfStock', async (event) => {
+  await stockNotificationConsumer.handleStockAlert(event.payload);
+});
+
 /**
  * Registers core application consumers for outbox events (OrderCreated, RefundInitiated, DispatchAssigned)
  */
@@ -287,6 +302,7 @@ export function registerCoreOutboxConsumers(options?: {
   onOrderCreated?: (payload: any) => Promise<void>;
   onRefundInitiated?: (payload: any) => Promise<void>;
   onDispatchAssigned?: (payload: any) => Promise<void>;
+  onStockAlert?: (payload: any) => Promise<void>;
 }): void {
   outboxService.registerConsumer('OrderCreated', async (event) => {
     if (options?.onOrderCreated) {
@@ -304,6 +320,34 @@ export function registerCoreOutboxConsumers(options?: {
     if (options?.onDispatchAssigned) {
       await options.onDispatchAssigned(event.payload);
     }
+  });
+
+  outboxService.registerConsumer('INVENTORY_LOW_STOCK', async (event) => {
+    if (options?.onStockAlert) {
+      await options.onStockAlert(event.payload);
+    }
+    await stockNotificationConsumer.handleStockAlert(event.payload);
+  });
+
+  outboxService.registerConsumer('InventoryLowStock', async (event) => {
+    if (options?.onStockAlert) {
+      await options.onStockAlert(event.payload);
+    }
+    await stockNotificationConsumer.handleStockAlert(event.payload);
+  });
+
+  outboxService.registerConsumer('INVENTORY_OUT_OF_STOCK', async (event) => {
+    if (options?.onStockAlert) {
+      await options.onStockAlert(event.payload);
+    }
+    await stockNotificationConsumer.handleStockAlert(event.payload);
+  });
+
+  outboxService.registerConsumer('InventoryOutOfStock', async (event) => {
+    if (options?.onStockAlert) {
+      await options.onStockAlert(event.payload);
+    }
+    await stockNotificationConsumer.handleStockAlert(event.payload);
   });
 }
 
