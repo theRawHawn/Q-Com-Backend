@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
 import { paymentService } from '../modules/payments/paymentService.js';
+import { paymentProviderRegistry } from '../modules/payments/paymentProvider.js';
 import { authenticate } from '../middleware/auth.js';
 import { getPool } from '../database/connection.js';
 
@@ -10,13 +11,19 @@ export const paymentRouter = Router();
  * Common webhook request handler
  */
 export async function handleWebhookRequest(req: Request, res: Response): Promise<void> {
-  const signature = (req.headers['x-razorpay-signature'] || req.headers['x-signature']) as string | undefined;
+  const signature = (
+    req.headers['x-razorpay-signature'] ||
+    req.headers['x-webhook-signature'] ||
+    req.headers['x-signature'] ||
+    req.headers['x-provider-signature'] ||
+    req.headers['signature']
+  ) as string | undefined;
 
   if (!signature) {
     res.status(400).json({
       success: false,
       error: 'MISSING_WEBHOOK_SIGNATURE',
-      message: 'x-razorpay-signature header is required for webhook authentication.',
+      message: 'Webhook signature header (x-webhook-signature, x-signature, or provider header) is required.',
     });
     return;
   }
@@ -25,10 +32,12 @@ export async function handleWebhookRequest(req: Request, res: Response): Promise
   const rawBody = (req as any).rawBody || Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body));
 
   try {
+    const gateway = (req.params.providerId || req.query.provider || 'mock') as string;
     const result = await paymentService.processWebhook({
       rawBody,
       signature,
-      gateway: 'RAZORPAY',
+      gateway,
+      headers: req.headers,
     });
 
     res.status(200).json({
@@ -219,12 +228,21 @@ paymentRouter.post('/create-order', authenticate, async (req: Request, res: Resp
     const isNotFound = msg.includes('order not found') || (msg.includes('not found') && !msg.includes('column') && !msg.includes('relation'));
     const isCod = msg.includes('cod_order');
     const isAlreadyPaid = msg.includes('already_paid');
+    const isGatewayNotConfigured = msg.includes('payment_gateway_not_configured');
 
-    const statusCode = isUnauthorized ? 403 : isNotFound ? 404 : isCod || isAlreadyPaid ? 400 : 400;
+    const statusCode = isUnauthorized ? 403 : isNotFound ? 404 : isGatewayNotConfigured ? 503 : isCod || isAlreadyPaid ? 400 : 400;
 
     res.status(statusCode).json({
       success: false,
-      error: isUnauthorized ? 'UNAUTHORIZED_ORDER_ACCESS' : isNotFound ? 'ORDER_NOT_FOUND' : isCod ? 'COD_ORDER_CANNOT_INITIATE_ONLINE_PAYMENT' : 'PAYMENT_INTENT_FAILED',
+      error: isUnauthorized
+        ? 'UNAUTHORIZED_ORDER_ACCESS'
+        : isNotFound
+        ? 'ORDER_NOT_FOUND'
+        : isGatewayNotConfigured
+        ? 'PAYMENT_GATEWAY_NOT_CONFIGURED'
+        : isCod
+        ? 'COD_ORDER_CANNOT_INITIATE_ONLINE_PAYMENT'
+        : 'PAYMENT_INTENT_FAILED',
       message: err.message || 'Failed to generate payment intent.',
       requestId,
     });
@@ -449,6 +467,31 @@ paymentRouter.post('/webhook', handleWebhookRequest);
 paymentRouter.post('/razorpay-webhook', handleWebhookRequest);
 
 /**
+ * GET /api/payment/providers & GET /api/v1/payments/providers
+ * Returns registered payment providers and their capabilities
+ */
+paymentRouter.get('/providers/list', (_req: Request, res: Response): void => {
+  const providers = paymentProviderRegistry.listProviders().map(p => {
+    const providerInstance = paymentProviderRegistry.getProvider(p.providerId);
+    return {
+      ...p,
+      capabilities: typeof providerInstance.getCapabilities === 'function' ? providerInstance.getCapabilities() : null,
+    };
+  });
+  res.status(200).json({ success: true, providers });
+});
+paymentRouter.get('/providers', (_req: Request, res: Response): void => {
+  const providers = paymentProviderRegistry.listProviders().map(p => {
+    const providerInstance = paymentProviderRegistry.getProvider(p.providerId);
+    return {
+      ...p,
+      capabilities: typeof providerInstance.getCapabilities === 'function' ? providerInstance.getCapabilities() : null,
+    };
+  });
+  res.status(200).json({ success: true, providers });
+});
+
+/**
  * GET /api/payment/:orderId & GET /api/v1/payments/:orderId
  * Safe payment status query for authenticated order owner
  */
@@ -492,3 +535,75 @@ paymentRouter.get('/:orderId', authenticate, async (req: Request, res: Response)
     });
   }
 });
+
+/**
+ * POST /api/payment/webhook/:providerId
+ * Provider-specific webhook ingestion route
+ */
+paymentRouter.post('/webhook/:providerId', handleWebhookRequest);
+
+/**
+ * POST /api/payment/attempt
+ * Provider-agnostic payment attempt creation
+ */
+paymentRouter.post('/attempt', authenticate, async (req: Request, res: Response): Promise<void> => {
+  const { orderId, providerId } = req.body;
+  const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
+
+  if (!orderId) {
+    res.status(400).json({ success: false, error: 'MISSING_ORDER_ID', message: 'orderId is required.' });
+    return;
+  }
+
+  try {
+    const result = await paymentService.createPaymentAttempt({
+      orderId,
+      userId: req.auth!.userId,
+      providerId,
+      idempotencyKey,
+    });
+    res.status(200).json({ success: true, ...result });
+  } catch (err: any) {
+    const msg = (err.message || '').toLowerCase();
+    const isUnauthorized = msg.includes('unauthorized');
+    const isNotFound = msg.includes('not found');
+    const isGatewayNotConfigured = msg.includes('payment_gateway_not_configured');
+    res.status(isUnauthorized ? 403 : isNotFound ? 404 : isGatewayNotConfigured ? 503 : 400).json({
+      success: false,
+      error: isUnauthorized
+        ? 'UNAUTHORIZED_ORDER_ACCESS'
+        : isNotFound
+        ? 'ORDER_NOT_FOUND'
+        : isGatewayNotConfigured
+        ? 'PAYMENT_GATEWAY_NOT_CONFIGURED'
+        : 'PAYMENT_ATTEMPT_FAILED',
+      message: err.message || 'Failed to create payment attempt.',
+    });
+  }
+});
+
+/**
+ * POST /api/payment/reconcile/:orderId
+ * Authoritative reconciliation of ambiguous payment status
+ */
+paymentRouter.post('/reconcile/:orderId', authenticate, async (req: Request, res: Response): Promise<void> => {
+  const { orderId } = req.params;
+  if (!orderId) {
+    res.status(400).json({ success: false, error: 'MISSING_ORDER_ID', message: 'orderId is required.' });
+    return;
+  }
+
+  try {
+    const reconciliation = await paymentService.reconcilePayment(orderId);
+    res.status(200).json({ success: true, reconciliation });
+  } catch (err: any) {
+    const msg = (err.message || '').toLowerCase();
+    const isNotFound = msg.includes('not found');
+    res.status(isNotFound ? 404 : 500).json({
+      success: false,
+      error: isNotFound ? 'ORDER_NOT_FOUND' : 'RECONCILIATION_FAILED',
+      message: err.message || 'Payment reconciliation failed.',
+    });
+  }
+});
+

@@ -1,3 +1,5 @@
+import { handleWebhookRequest } from "./paymentRoutes.js";
+import { financialRecoveryWorker } from "../modules/recovery/financialRecoveryWorker.js";
 import { Router, Request, Response } from 'express';
 import { refundService } from '../modules/payments/refundService.js';
 import { authenticate } from '../middleware/auth.js';
@@ -175,3 +177,47 @@ refundRouter.get(
   }
 );
 
+
+/**
+ * POST /api/v1/refunds/webhooks/refunds
+ * Dedicated endpoint for refund webhook ingestion
+ */
+refundRouter.post("/webhooks/refunds", handleWebhookRequest);
+
+/**
+ * POST /api/v1/admin/recovery/trigger
+ * Operator-triggered immediate financial recovery cycle
+ */
+refundRouter.post(
+  "/admin/recovery/trigger",
+  authenticate,
+  requireRole(["SUPER_ADMIN", "FINANCE_ADMIN"]),
+  async (_req: Request, res: Response): Promise<void> => {
+    try {
+      const summary = await financialRecoveryWorker.runRecoveryCycle();
+      res.status(200).json({
+        success: true,
+        message: "Financial recovery cycle executed.",
+        summary,
+      });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: "RECOVERY_CYCLE_FAILED", message: err.message });
+    }
+  }
+);
+
+/**
+ * GET /api/v1/admin/recovery/stats
+ * Real-time operational metrics for financial recovery worker
+ */
+refundRouter.get(
+  "/admin/recovery/stats",
+  authenticate,
+  requireRole(["SUPER_ADMIN", "FINANCE_ADMIN", "OPERATIONS"]),
+  async (_req: Request, res: Response): Promise<void> => {
+    res.status(200).json({
+      success: true,
+      stats: financialRecoveryWorker.getStats(),
+    });
+  }
+);

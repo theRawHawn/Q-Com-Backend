@@ -1,27 +1,33 @@
 /**
- * Sprint 6: Authoritative Payment State Machine
- * Defines deterministic state transitions, idempotency rules, and terminal guards.
+ * Sprint 12.0: Authoritative Provider-Agnostic Payment State Machine
+ * Defines deterministic state transitions, terminal guards, and reconciliation workflows.
  */
 
 export type PaymentState =
   | 'CREATED'
   | 'PENDING'
+  | 'PROCESSING'
   | 'AUTHORIZED'
   | 'CAPTURED'
   | 'FAILED'
   | 'CANCELLED'
+  | 'REFUND_PENDING'
+  | 'PARTIALLY_REFUNDED'
   | 'REFUNDED'
-  | 'PARTIALLY_REFUNDED';
+  | 'RECONCILIATION_REQUIRED';
 
 export const ALL_PAYMENT_STATES: readonly PaymentState[] = [
   'CREATED',
   'PENDING',
+  'PROCESSING',
   'AUTHORIZED',
   'CAPTURED',
   'FAILED',
   'CANCELLED',
-  'REFUNDED',
+  'REFUND_PENDING',
   'PARTIALLY_REFUNDED',
+  'REFUNDED',
+  'RECONCILIATION_REQUIRED',
 ] as const;
 
 export const TERMINAL_PAYMENT_STATES: ReadonlySet<PaymentState> = new Set([
@@ -31,13 +37,16 @@ export const TERMINAL_PAYMENT_STATES: ReadonlySet<PaymentState> = new Set([
 ]);
 
 const ALLOWED_TRANSITIONS: Record<PaymentState, ReadonlySet<PaymentState>> = {
-  CREATED: new Set(['PENDING', 'AUTHORIZED', 'CAPTURED', 'FAILED', 'CANCELLED']),
-  PENDING: new Set(['AUTHORIZED', 'CAPTURED', 'FAILED', 'CANCELLED']),
-  AUTHORIZED: new Set(['CAPTURED', 'FAILED', 'CANCELLED']),
-  CAPTURED: new Set(['PARTIALLY_REFUNDED', 'REFUNDED']),
+  CREATED: new Set(['PENDING', 'PROCESSING', 'AUTHORIZED', 'CAPTURED', 'FAILED', 'CANCELLED', 'RECONCILIATION_REQUIRED']),
+  PENDING: new Set(['PROCESSING', 'AUTHORIZED', 'CAPTURED', 'FAILED', 'CANCELLED', 'RECONCILIATION_REQUIRED']),
+  PROCESSING: new Set(['AUTHORIZED', 'CAPTURED', 'FAILED', 'CANCELLED', 'RECONCILIATION_REQUIRED']),
+  AUTHORIZED: new Set(['CAPTURED', 'FAILED', 'CANCELLED', 'RECONCILIATION_REQUIRED']),
+  RECONCILIATION_REQUIRED: new Set(['CAPTURED', 'FAILED', 'CANCELLED', 'REFUND_PENDING']),
+  CAPTURED: new Set(['REFUND_PENDING', 'PARTIALLY_REFUNDED', 'REFUNDED']),
+  REFUND_PENDING: new Set(['PARTIALLY_REFUNDED', 'REFUNDED']),
+  PARTIALLY_REFUNDED: new Set(['PARTIALLY_REFUNDED', 'REFUNDED']),
   FAILED: new Set([]),
   CANCELLED: new Set([]),
-  PARTIALLY_REFUNDED: new Set(['PARTIALLY_REFUNDED', 'REFUNDED']),
   REFUNDED: new Set([]),
 };
 
@@ -76,7 +85,7 @@ export function validatePaymentTransition(
     };
   }
 
-  // 3. CAPTURED state special rule: Once CAPTURED, cannot revert to pending/authorized/failed/cancelled
+  // 3. CAPTURED state special rule: Once CAPTURED, cannot revert to pending/processing/failed/cancelled
   if (fromState === 'CAPTURED' && !ALLOWED_TRANSITIONS.CAPTURED.has(toState)) {
     return {
       valid: false,

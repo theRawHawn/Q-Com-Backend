@@ -13,6 +13,25 @@ export interface PaymentIntent {
   timestamp: string;
   providerPaymentId?: string;
   providerOrderId?: string;
+  activeProvider?: string;
+  idempotencyKey?: string;
+}
+
+export interface PaymentAttempt {
+  id: string;
+  orderId: string;
+  paymentIntentId: string;
+  attemptNumber: number;
+  providerId: string;
+  providerReference?: string;
+  status: 'INITIATED' | 'PROCESSING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'RECONCILIATION_REQUIRED';
+  amount: number;
+  currency: string;
+  idempotencyKey?: string;
+  errorCode?: string;
+  errorMessage?: string;
+  initiatedAt: string;
+  completedAt?: string;
 }
 
 export interface PaymentReceipt {
@@ -48,11 +67,22 @@ export interface PaymentStatusSummary {
     currency: string;
     status: PaymentState;
     createdAt: string;
+    activeProvider?: string;
   }[];
+  attempts?: PaymentAttempt[];
   receipt?: {
     transactionId: string;
     amount: number;
     status: string;
     verifiedAt: string;
   };
+}
+
+export interface ReconciliationResult {
+  orderId: string;
+  status: PaymentState;
+  reconciled: boolean;
+  action: 'CAPTURED' | 'FAILED' | 'ESCALATED' | 'ALREADY_FINAL' | 'RECONCILIATION_REQUIRED';
+  message: string;
+  providerPaymentId?: string;
 }
