@@ -226,12 +226,28 @@ export class CancellationService {
     // 1. Decouple Dispatch: cancel active assignments, offers, trips, and reset rider to AVAILABLE
     await dispatchService.cancelOrderDispatch(orderId, client);
 
-    // 2. Inventory Restoration:
-    // If order was paid / committed: restock committed stock
-    if (o.payment_status === 'PAID') {
-      await inventoryService.restockCommittedStock(orderId, client);
+    // 2. Inventory Restoration: Check reservation state and restore accurately
+    const resCheck = await client.query(`
+      SELECT status FROM inventory_reservations WHERE order_id = $1
+      FOR UPDATE
+    `, [orderId]);
+
+    if (resCheck.rows.length > 0) {
+      const hasCommitted = resCheck.rows.some((r: any) => r.status === 'COMMITTED');
+      const hasReserved = resCheck.rows.some((r: any) => r.status === 'RESERVED');
+
+      if (hasCommitted) {
+        await inventoryService.restockCommittedStock(orderId, client);
+      }
+      if (hasReserved) {
+        await inventoryService.releaseStock(orderId, client);
+      }
+      // If all rows are already 'RELEASED', no-op to prevent duplicate stock restoration
     } else {
-      await inventoryService.releaseStock(orderId, client);
+      // Fallback for legacy untracked orders only if order was paid or COD placed
+      if (o.payment_status === 'PAID' || o.payment_method === 'Pay on Delivery') {
+        await inventoryService.restockCommittedStock(orderId, client);
+      }
     }
 
     // 3. Process Refund & General Ledger Entry if paid
@@ -248,14 +264,14 @@ export class CancellationService {
         clientOverride: client,
       });
       refundRecord = refundRes.refund;
-
-      // Post General Ledger Batch Q: Dr 2010 Customer Escrow, Cr 1010 Cash at Gateway
-      await ledgerService.recordPreFulfillmentCancellationRefund({
-        orderId,
-        amount: totalAmount,
-        client,
-      });
     }
+
+    // 3b. Invalidate active payment intents to prevent delayed charges
+    await client.query(`
+      UPDATE payment_intents
+      SET status = 'CANCELLED', updated_at = NOW()
+      WHERE order_id = $1 AND status IN ('CREATED', 'PENDING', 'AUTHORIZED')
+    `, [orderId]);
 
     // 4. Update order status in PostgreSQL
     const finalReason = `[${cancelledBy}] ${reason}`;
