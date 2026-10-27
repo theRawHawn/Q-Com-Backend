@@ -17,28 +17,38 @@ export interface OrderItemInput {
   quantity: number;
 }
 
-export interface JobsiteAddress {
+export interface DeliveryLocationAddress {
   address: string;
   landmark?: string;
   floorUnit?: string;
   gateCode?: string;
+  contactName?: string;
+  contactPhone?: string;
   siteContactName?: string;
   sitePhone?: string;
   tradeType?: string;
   jobTag?: string;
   latitude: number;
   longitude: number;
+  coordinates?: {
+    lat: number;
+    lng: number;
+  };
   accessibleEntranceLatitude?: number;
   accessibleEntranceLongitude?: number;
   dropoffInstructions?: string;
 }
+
+export type JobsiteAddress = DeliveryLocationAddress;
 
 export interface CreateOrderInput {
   userId: string;
   merchantId?: string;
   storeId?: string;
   items: OrderItemInput[];
-  jobSite: JobsiteAddress;
+  deliveryLocation?: DeliveryLocationAddress;
+  deliveryAddress?: DeliveryLocationAddress;
+  jobSite?: DeliveryLocationAddress;
   paymentMethod: string;
   couponCode?: string;
   isGstEnabled?: boolean;

@@ -2,12 +2,37 @@ import crypto from 'crypto';
 import pg from 'pg';
 import { getPool, transaction } from '../../database/connection.js';
 import { ledgerService } from '../ledger/ledgerService.js';
-import { getPayoutProvider, PayoutProvider } from './payoutProvider.js';
+import { getPayoutProvider, PayoutProvider, PayoutDisbursementResult } from './payoutProvider.js';
 import { RiderEarningsStatement, PayoutResult } from './settlementTypes.js';
 import { settlementEventPublisher, SettlementDomainEvent } from './settlementEvents.js';
+import { isTransientFailure } from '../resilience/retryPolicy.js';
+
+export class AsyncKeyedMutex {
+  private queues = new Map<string, Promise<void>>();
+
+  public async runExclusive<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const current = this.queues.get(key) || Promise.resolve();
+    let release: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.queues.set(key, current.then(() => next));
+
+    await current;
+    try {
+      return await fn();
+    } finally {
+      release!();
+      if (this.queues.get(key) === next) {
+        this.queues.delete(key);
+      }
+    }
+  }
+}
 
 export class RiderPayoutService {
   private payoutProvider: PayoutProvider;
+  private mutex = new AsyncKeyedMutex();
 
   constructor() {
     this.payoutProvider = getPayoutProvider();
@@ -114,6 +139,13 @@ export class RiderPayoutService {
   /**
    * Executes instant or scheduled rider wallet payout
    */
+  /**
+   * Executes instant or scheduled rider wallet payout withdrawal.
+   * Decoupled into 3 distinct phases:
+   *   STEP A (Prepare): Short transaction locking rider, verifying wallet, deducting balance, inserting PROCESSING intent.
+   *   STEP B (Execute): External banking / UPI disbursement completely outside of database transactions.
+   *   STEP C (Reconcile): Short transaction posting General Ledger entries, setting status to PAID, and completing payout.
+   */
   public async executeRiderPayout(params: {
     riderId: string;
     amount?: number;
@@ -121,10 +153,47 @@ export class RiderPayoutService {
     idempotencyKey?: string;
   }): Promise<PayoutResult> {
     const { riderId, amount, method = 'UPI', idempotencyKey } = params;
-    const stagedEvents: SettlementDomainEvent[] = [];
 
-    const result = await transaction(async (client) => {
-      // 1. Idempotency Check
+    // -----------------------------------------------------------------
+    // STEP 0: Fast Idempotency Check
+    // -----------------------------------------------------------------
+    if (idempotencyKey) {
+      const pool = getPool();
+      const existingPayoutRes = await pool.query(`
+        SELECT * FROM rider_payouts
+        WHERE idempotency_key = $1
+        LIMIT 1
+      `, [idempotencyKey]);
+
+      if (existingPayoutRes.rows.length > 0) {
+        const row = existingPayoutRes.rows[0];
+        return {
+          payoutId: row.id,
+          payoutReference: row.payout_reference,
+          actorId: row.rider_id,
+          amount: parseFloat(row.amount),
+          status: row.status,
+          utrNumber: row.utr_number || undefined,
+          journalBatchId: row.journal_batch_id || undefined,
+          isDuplicate: true,
+        };
+      }
+    }
+
+    // -----------------------------------------------------------------
+    // STEP A: PREPARE INTENT (Short Database Transaction)
+    // -----------------------------------------------------------------
+    interface PreparedRiderPayout {
+      payoutId: string;
+      payoutReference: string;
+      payoutAmount: number;
+      rider: any;
+      isDuplicate: boolean;
+      existingRow?: any;
+    }
+
+    const prepareResult = await this.mutex.runExclusive(riderId, () => transaction(async (client): Promise<PreparedRiderPayout> => {
+      // Re-verify idempotency with row lock
       if (idempotencyKey) {
         const existingPayoutRes = await client.query(`
           SELECT * FROM rider_payouts
@@ -134,21 +203,18 @@ export class RiderPayoutService {
         `, [idempotencyKey]);
 
         if (existingPayoutRes.rows.length > 0) {
-          const row = existingPayoutRes.rows[0];
           return {
-            payoutId: row.id,
-            payoutReference: row.payout_reference,
-            actorId: row.rider_id,
-            amount: parseFloat(row.amount),
-            status: row.status,
-            utrNumber: row.utr_number || undefined,
-            journalBatchId: row.journal_batch_id || undefined,
+            payoutId: existingPayoutRes.rows[0].id,
+            payoutReference: existingPayoutRes.rows[0].payout_reference,
+            payoutAmount: parseFloat(existingPayoutRes.rows[0].amount),
+            rider: null,
             isDuplicate: true,
+            existingRow: existingPayoutRes.rows[0],
           };
         }
       }
 
-      // 2. Row-level lock on rider
+      // Row-level lock on rider
       const riderRes = await client.query(`
         SELECT * FROM riders
         WHERE id = $1
@@ -170,7 +236,10 @@ export class RiderPayoutService {
         throw new Error('ZERO_WALLET_BALANCE: Rider wallet balance is zero.');
       }
 
-      const payoutAmount = amount ? Math.min(amount, currentWallet) : currentWallet;
+      const payoutAmount = amount !== undefined ? amount : currentWallet;
+      if (payoutAmount > currentWallet) {
+        throw new Error(`INSUFFICIENT_WALLET_BALANCE: Requested payout amount ₹${payoutAmount} exceeds wallet balance ₹${currentWallet}`);
+      }
       if (payoutAmount <= 0) {
         throw new Error('INVALID_PAYOUT_AMOUNT: Payout amount must be greater than zero.');
       }
@@ -185,61 +254,36 @@ export class RiderPayoutService {
 
       const payoutReference = `PAYOUT_RIDER_${Date.now()}_${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 
-      // 3. Call external Payout Provider
-      const providerRes = await this.payoutProvider.disburseRiderPayout({
-        riderId,
-        amount: payoutAmount,
-        method,
-        vpa: rider.upi_vpa,
-        accountNumber: rider.bank_account_number,
-        ifsc: rider.bank_ifsc,
-        reference: payoutReference,
-      });
-
-      if (!providerRes.success) {
-        throw new Error(`PAYOUT_PROVIDER_REJECTED: ${providerRes.failureReason || 'Disbursement rejected by banking rail.'}`);
-      }
-
-      // 4. Post double-entry general ledger batch (Dr 2030 Rider Wallet, Cr 1020 Bank Account)
-      const journalBatchId = await ledgerService.recordRiderPayout({
-        riderId,
-        amount: payoutAmount,
-        payoutReference,
-        utrNumber: providerRes.utrNumber,
-        client,
-      });
-
-      // 5. Post subledger entry in rider_ledgers
+      // Deduct from wallet balance in DB immediately to prevent concurrent double-spend
       const updatedWallet = +(currentWallet - payoutAmount).toFixed(2);
       await client.query(`
+        UPDATE riders
+        SET wallet_balance = $1,
+            updated_at = NOW()
+        WHERE id = $2
+      `, [updatedWallet, riderId]);
+
+      // Post subledger entry in rider_ledgers
+      await client.query(`
         INSERT INTO rider_ledgers (
-          rider_id, entry_type, category, amount, running_balance, utr_number, description
+          rider_id, entry_type, category, amount, running_balance, description
         )
-        VALUES ($1, 'INSTANT_PAYOUT_DEBIT', 'DEBIT', $2, $3, $4, $5)
+        VALUES ($1, 'INSTANT_PAYOUT_DEBIT', 'DEBIT', $2, $3, $4)
       `, [
         riderId,
         payoutAmount,
         updatedWallet,
-        providerRes.utrNumber,
-        `Disbursement to ${method === 'UPI' ? rider.upi_vpa : rider.bank_account_number} (Ref: ${payoutReference}, UTR: ${providerRes.utrNumber})`,
+        `Disbursement to ${method === 'UPI' ? rider.upi_vpa : rider.bank_account_number} reserved (Ref: ${payoutReference})`,
       ]);
 
-      // 6. Deduct from rider's wallet balance
-      await client.query(`
-        UPDATE riders
-        SET wallet_balance = wallet_balance - $2,
-            updated_at = NOW()
-        WHERE id = $1
-      `, [riderId, payoutAmount]);
-
-      // 7. Record in rider_payouts table
+      // Insert into rider_payouts in status 'PROCESSING'
       const insRes = await client.query(`
         INSERT INTO rider_payouts (
           payout_reference, rider_id, amount, currency, payout_method,
           destination_vpa, destination_account, destination_ifsc,
-          status, utr_number, provider_payout_id, journal_batch_id, idempotency_key, processed_at
+          status, idempotency_key
         )
-        VALUES ($1, $2, $3, 'INR', $4, $5, $6, $7, 'PAID', $8, $9, $10, $11, NOW())
+        VALUES ($1, $2, $3, 'INR', $4, $5, $6, $7, 'PROCESSING', $8)
         RETURNING *
       `, [
         payoutReference,
@@ -249,48 +293,473 @@ export class RiderPayoutService {
         rider.upi_vpa || null,
         rider.bank_account_number || null,
         rider.bank_ifsc || null,
-        providerRes.utrNumber,
-        providerRes.providerPayoutId,
-        journalBatchId,
         idempotencyKey || null,
       ]);
 
-      const payoutRow = insRes.rows[0];
-
-      // 8. Stage Post-Commit Domain Event
-      stagedEvents.push(
-        settlementEventPublisher.createEvent('RiderPayoutCompleted', {
-          payoutId: payoutRow.id,
-          payoutReference,
-          riderId,
-          amount: payoutAmount,
-          method,
-          utrNumber: providerRes.utrNumber,
-          journalBatchId,
-        })
-      );
-
       return {
-        payoutId: payoutRow.id,
+        payoutId: insRes.rows[0].id,
         payoutReference,
-        actorId: riderId,
-        amount: payoutAmount,
-        status: 'PAID',
-        utrNumber: providerRes.utrNumber,
-        journalBatchId,
+        payoutAmount,
+        rider,
         isDuplicate: false,
       };
+    }));
+
+    if (prepareResult.isDuplicate && prepareResult.existingRow) {
+      const row = prepareResult.existingRow;
+      return {
+        payoutId: row.id,
+        payoutReference: row.payout_reference,
+        actorId: row.rider_id,
+        amount: parseFloat(row.amount),
+        status: row.status,
+        utrNumber: row.utr_number || undefined,
+        journalBatchId: row.journal_batch_id || undefined,
+        isDuplicate: true,
+      };
+    }
+
+    const { payoutId, payoutReference, payoutAmount, rider } = prepareResult;
+
+    // -----------------------------------------------------------------
+    // STEP B: EXECUTE (External Payout Provider - OUTSIDE ANY TRANSACTION)
+    // -----------------------------------------------------------------
+    // No database connection or row locks are held during external banking API call.
+    let providerRes: PayoutDisbursementResult;
+    let outcomeUnknown = false;
+
+    try {
+      providerRes = await this.payoutProvider.disburseRiderPayout({
+        riderId,
+        amount: payoutAmount,
+        method,
+        vpa: rider.upi_vpa,
+        accountNumber: rider.bank_account_number,
+        ifsc: rider.bank_ifsc,
+        reference: payoutReference,
+        idempotencyKey,
+      });
+    } catch (err: any) {
+      if (isTransientFailure(err) || (err.message && err.message.toLowerCase().includes('timeout'))) {
+        outcomeUnknown = true;
+        providerRes = {
+          success: false,
+          providerPayoutId: '',
+          utrNumber: '',
+          status: 'QUEUED',
+          failureReason: 'PROVIDER_TIMEOUT_OR_NETWORK_ERROR',
+        };
+      } else {
+        providerRes = {
+          success: false,
+          providerPayoutId: '',
+          utrNumber: '',
+          status: 'REJECTED',
+          failureReason: err.message || 'Disbursement rejected by banking rail.',
+        };
+      }
+    }
+
+    // -----------------------------------------------------------------
+    // STEP C: RECONCILE (Short Database Transaction)
+    // -----------------------------------------------------------------
+    const stagedEvents: SettlementDomainEvent[] = [];
+    const finalResult = await transaction(async (client): Promise<PayoutResult> => {
+      const lockRes = await client.query(`
+        SELECT * FROM rider_payouts WHERE id = $1 FOR UPDATE
+      `, [payoutId]);
+
+      const payoutRow = lockRes.rows[0];
+      if (payoutRow.status === 'PAID') {
+        return {
+          payoutId: payoutRow.id,
+          payoutReference: payoutRow.payout_reference,
+          actorId: payoutRow.rider_id,
+          amount: parseFloat(payoutRow.amount),
+          status: payoutRow.status,
+          utrNumber: payoutRow.utr_number || undefined,
+          journalBatchId: payoutRow.journal_batch_id || undefined,
+          isDuplicate: false,
+        };
+      }
+
+      if (providerRes.success) {
+        // 1. Post double-entry general ledger batch (Dr 2030 Rider Wallet, Cr 1020 Bank Account)
+        const journalBatchId = await ledgerService.recordRiderPayout({
+          riderId,
+          amount: payoutAmount,
+          payoutReference,
+          utrNumber: providerRes.utrNumber,
+          client,
+        });
+
+        // 2. Update rider_ledgers with confirmed UTR
+        await client.query(`
+          UPDATE rider_ledgers
+          SET utr_number = $1,
+              description = $2
+          WHERE rider_id = $3 AND description = $4
+        `, [
+          providerRes.utrNumber,
+          `Disbursement to ${method === 'UPI' ? rider.upi_vpa : rider.bank_account_number} (Ref: ${payoutReference}, UTR: ${providerRes.utrNumber})`,
+          riderId,
+          `Disbursement to ${method === 'UPI' ? rider.upi_vpa : rider.bank_account_number} reserved (Ref: ${payoutReference})`,
+        ]);
+
+        // 3. Mark rider_payouts as PAID
+        await client.query(`
+          UPDATE rider_payouts
+          SET status = 'PAID',
+              utr_number = $1,
+              provider_payout_id = $2,
+              journal_batch_id = $3,
+              processed_at = NOW(),
+              recovery_lease_id = NULL,
+              recovery_lease_expires_at = NULL,
+              updated_at = NOW()
+          WHERE id = $4
+        `, [providerRes.utrNumber, providerRes.providerPayoutId, journalBatchId, payoutId]);
+
+        stagedEvents.push(
+          settlementEventPublisher.createEvent('RiderPayoutCompleted', {
+            payoutId,
+            payoutReference,
+            riderId,
+            amount: payoutAmount,
+            method,
+            utrNumber: providerRes.utrNumber,
+            journalBatchId,
+          })
+        );
+
+        return {
+          payoutId,
+          payoutReference,
+          actorId: riderId,
+          amount: payoutAmount,
+          status: 'PAID',
+          utrNumber: providerRes.utrNumber,
+          journalBatchId,
+          isDuplicate: false,
+        };
+      } else if (outcomeUnknown) {
+        // Critical Ambiguous Outcome Rule: Preserve PROCESSING, do not restore funds without verification
+        await client.query(`
+          UPDATE rider_payouts
+          SET status = 'PROCESSING',
+              failure_reason = 'PROVIDER_OUTCOME_UNKNOWN: Awaiting settlement reconciliation.',
+              recovery_lease_id = NULL,
+              recovery_lease_expires_at = NULL,
+              updated_at = NOW()
+          WHERE id = $1
+        `, [payoutId]);
+
+        return {
+          payoutId,
+          payoutReference,
+          actorId: riderId,
+          amount: payoutAmount,
+          status: 'PROCESSING',
+          failureReason: 'PROVIDER_OUTCOME_UNKNOWN: Awaiting banking rail reconciliation.',
+          isDuplicate: false,
+        };
+      } else {
+        // Conclusive failure: lock rider first (F-10.1A-04 fix), mark FAILED, and restore rider wallet balance
+        await client.query(`
+          SELECT id FROM riders WHERE id = $1 FOR UPDATE
+        `, [riderId]);
+
+        await client.query(`
+          UPDATE rider_payouts
+          SET status = 'FAILED',
+              failure_reason = $1,
+              recovery_lease_id = NULL,
+              recovery_lease_expires_at = NULL,
+              updated_at = NOW()
+          WHERE id = $2
+        `, [providerRes.failureReason || 'Disbursement rejected by banking rail.', payoutId]);
+
+        await client.query(`
+          UPDATE riders
+          SET wallet_balance = wallet_balance + $1,
+              updated_at = NOW()
+          WHERE id = $2
+        `, [payoutAmount, riderId]);
+
+        const curBalRes = await client.query(`
+          SELECT wallet_balance FROM riders WHERE id = $1
+        `, [riderId]);
+        const restoredBal = parseFloat(curBalRes.rows[0].wallet_balance);
+
+        await client.query(`
+          INSERT INTO rider_ledgers (
+            rider_id, entry_type, category, amount, running_balance, description
+          )
+          VALUES ($1, 'ADJUSTMENT', 'CREDIT', $2, $3, $4)
+        `, [
+          riderId,
+          payoutAmount,
+          restoredBal,
+          `Restoration of rider wallet balance due to failed disbursement (Ref: ${payoutReference})`,
+        ]);
+
+        return {
+          payoutId,
+          payoutReference,
+          actorId: riderId,
+          amount: payoutAmount,
+          status: 'FAILED',
+          failureReason: providerRes.failureReason || 'Disbursement rejected by banking rail.',
+          isDuplicate: false,
+        };
+      }
     });
 
     if (stagedEvents.length > 0) {
       settlementEventPublisher.publishAll(stagedEvents);
     }
 
-    return result;
+    if (finalResult.status === 'FAILED') {
+      throw new Error(`PAYOUT_PROVIDER_REJECTED: ${finalResult.failureReason}`);
+    }
+
+    return finalResult;
   }
 
   /**
-   * Authoritative Floating Cash (COD) Remittance
+   * Reconciles a rider payout in PROCESSING state by querying the banking rail provider.
+   * Protects against duplicate payouts or premature balance restorations.
+   */
+  public async reconcileRiderPayout(payoutId: string, expectedLeaseOwner?: string): Promise<PayoutResult> {
+    const pool = getPool();
+    const lockRes = await pool.query(`
+      SELECT * FROM rider_payouts WHERE id = $1
+    `, [payoutId]);
+
+    if (lockRes.rows.length === 0) {
+      throw new Error(`PAYOUT_NOT_FOUND: Rider payout '${payoutId}' does not exist.`);
+    }
+
+    const payout = lockRes.rows[0];
+    if (payout.status === 'PAID' || payout.status === 'FAILED') {
+      return {
+        payoutId: payout.id,
+        payoutReference: payout.payout_reference,
+        actorId: payout.rider_id,
+        amount: parseFloat(payout.amount),
+        status: payout.status,
+        utrNumber: payout.utr_number || undefined,
+        journalBatchId: payout.journal_batch_id || undefined,
+        isDuplicate: false,
+      };
+    }
+
+    // Provider check OUTSIDE database transaction
+    let providerStatus: 'PROCESSED' | 'QUEUED' | 'REJECTED' = 'QUEUED';
+    let utrNumber: string | undefined = payout.utr_number || undefined;
+    let providerPayoutId: string | undefined = payout.provider_payout_id || undefined;
+    let failureReason: string | undefined = payout.failure_reason || undefined;
+
+    if (this.payoutProvider.getPayoutStatus) {
+      try {
+        const statusRes = await this.payoutProvider.getPayoutStatus({
+          reference: payout.payout_reference,
+          providerPayoutId: payout.provider_payout_id || undefined,
+        });
+        providerStatus = statusRes.status;
+        if (statusRes.utrNumber) utrNumber = statusRes.utrNumber;
+        if (statusRes.providerPayoutId) providerPayoutId = statusRes.providerPayoutId;
+        if (statusRes.failureReason) failureReason = statusRes.failureReason;
+      } catch {
+        providerStatus = 'QUEUED';
+      }
+    } else if (payout.idempotency_key && this.payoutProvider.getPayoutByIdempotencyKey) {
+      const match = await this.payoutProvider.getPayoutByIdempotencyKey(payout.idempotency_key);
+      if (match) {
+        providerStatus = match.status;
+        utrNumber = match.utrNumber;
+        providerPayoutId = match.providerPayoutId;
+      }
+    }
+
+    if (providerStatus === 'QUEUED') {
+      return {
+        payoutId: payout.id,
+        payoutReference: payout.payout_reference,
+        actorId: payout.rider_id,
+        amount: parseFloat(payout.amount),
+        status: 'PROCESSING',
+        failureReason: 'PROVIDER_OUTCOME_UNKNOWN: Awaiting settlement reconciliation.',
+        isDuplicate: false,
+      };
+    }
+
+    // Step C: Reconcile in short transaction
+    const stagedEvents: SettlementDomainEvent[] = [];
+    const finalResult = await transaction(async (client): Promise<PayoutResult> => {
+      const rowCheck = await client.query(`
+        SELECT * FROM rider_payouts WHERE id = $1 FOR UPDATE
+      `, [payoutId]);
+
+      if (rowCheck.rows.length === 0) {
+        throw new Error(`PAYOUT_NOT_FOUND: Rider payout '${payoutId}' missing during reconciliation.`);
+      }
+
+      const curPayout = rowCheck.rows[0];
+      if (curPayout.status === 'PAID' || curPayout.status === 'FAILED') {
+        return {
+          payoutId: curPayout.id,
+          payoutReference: curPayout.payout_reference,
+          actorId: curPayout.rider_id,
+          amount: parseFloat(curPayout.amount),
+          status: curPayout.status,
+          utrNumber: curPayout.utr_number || undefined,
+          journalBatchId: curPayout.journal_batch_id || undefined,
+          isDuplicate: false,
+        };
+      }
+
+      // Stale-worker fencing check: If an expected lease owner was specified, verify that the lease
+      // hasn't expired and been claimed by another active worker.
+      if (expectedLeaseOwner && curPayout.recovery_lease_id && curPayout.recovery_lease_id !== expectedLeaseOwner) {
+        const leaseExpiry = curPayout.recovery_lease_expires_at ? new Date(curPayout.recovery_lease_expires_at).getTime() : 0;
+        if (leaseExpiry > Date.now()) {
+          console.warn(`[riderPayoutService.reconcileRiderPayout] Stale worker commit aborted: Worker '${expectedLeaseOwner}' lost lease to '${curPayout.recovery_lease_id}'.`);
+          return {
+            payoutId: curPayout.id,
+            payoutReference: curPayout.payout_reference,
+            actorId: curPayout.rider_id,
+            amount: parseFloat(curPayout.amount),
+            status: curPayout.status,
+            utrNumber: curPayout.utr_number || undefined,
+            journalBatchId: curPayout.journal_batch_id || undefined,
+            isDuplicate: true,
+          };
+        }
+      }
+
+      const payoutAmount = parseFloat(curPayout.amount);
+      const riderId = curPayout.rider_id;
+      const payoutReference = curPayout.payout_reference;
+      const method = curPayout.payout_method || 'UPI';
+
+      if (providerStatus === 'PROCESSED') {
+        const confirmedUtr = utrNumber || `UTR_RIDER_${Date.now()}`;
+        const journalBatchId = await ledgerService.recordRiderPayout({
+          riderId,
+          amount: payoutAmount,
+          payoutReference,
+          utrNumber: confirmedUtr,
+          client,
+        });
+
+        await client.query(`
+          UPDATE rider_ledgers
+          SET utr_number = $1,
+              description = $2
+          WHERE rider_id = $3 AND description = $4
+        `, [
+          confirmedUtr,
+          `Disbursement to rider (Ref: ${payoutReference}, UTR: ${confirmedUtr})`,
+          riderId,
+          `Disbursement to ${method === 'UPI' ? curPayout.destination_vpa : curPayout.destination_account} reserved (Ref: ${payoutReference})`,
+        ]);
+
+        await client.query(`
+          UPDATE rider_payouts
+          SET status = 'PAID',
+              utr_number = $1,
+              provider_payout_id = COALESCE($2, provider_payout_id),
+              journal_batch_id = $3,
+              processed_at = NOW(),
+              recovery_lease_id = NULL,
+              recovery_lease_expires_at = NULL,
+              updated_at = NOW()
+          WHERE id = $4
+        `, [confirmedUtr, providerPayoutId || null, journalBatchId, payoutId]);
+
+        stagedEvents.push(
+          settlementEventPublisher.createEvent('RiderPayoutCompleted', {
+            payoutId,
+            payoutReference,
+            riderId,
+            amount: payoutAmount,
+            method,
+            utrNumber: confirmedUtr,
+            journalBatchId,
+          })
+        );
+
+        return {
+          payoutId,
+          payoutReference,
+          actorId: riderId,
+          amount: payoutAmount,
+          status: 'PAID',
+          utrNumber: confirmedUtr,
+          journalBatchId,
+          isDuplicate: false,
+        };
+      } else {
+        // Conclusive rejection: lock rider, mark FAILED, and restore wallet balance
+        await client.query(`
+          SELECT id FROM riders WHERE id = $1 FOR UPDATE
+        `, [riderId]);
+
+        await client.query(`
+          UPDATE rider_payouts
+          SET status = 'FAILED',
+              failure_reason = $1,
+              recovery_lease_id = NULL,
+              recovery_lease_expires_at = NULL,
+              updated_at = NOW()
+          WHERE id = $2
+        `, [failureReason || 'Disbursement rejected by banking rail.', payoutId]);
+
+        await client.query(`
+          UPDATE riders
+          SET wallet_balance = wallet_balance + $1,
+              updated_at = NOW()
+          WHERE id = $2
+        `, [payoutAmount, riderId]);
+
+        const curBalRes = await client.query(`
+          SELECT wallet_balance FROM riders WHERE id = $1
+        `, [riderId]);
+        const restoredBal = parseFloat(curBalRes.rows[0].wallet_balance);
+
+        await client.query(`
+          INSERT INTO rider_ledgers (
+            rider_id, entry_type, category, amount, running_balance, description
+          )
+          VALUES ($1, 'ADJUSTMENT', 'CREDIT', $2, $3, $4)
+        `, [
+          riderId,
+          payoutAmount,
+          restoredBal,
+          `Restoration of rider wallet balance due to failed disbursement (Ref: ${payoutReference})`,
+        ]);
+
+        return {
+          payoutId,
+          payoutReference,
+          actorId: riderId,
+          amount: payoutAmount,
+          status: 'FAILED',
+          failureReason: failureReason || 'Disbursement rejected by banking rail.',
+          isDuplicate: false,
+        };
+      }
+    });
+
+    if (stagedEvents.length > 0) {
+      settlementEventPublisher.publishAll(stagedEvents);
+    }
+
+    return finalResult;
+  }
+
+  /**
    * Deducts floating cash liability, records general ledger transfer, and unblocks suspended rider
    */
   public async remitCodCash(params: {

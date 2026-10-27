@@ -1,4 +1,6 @@
+import { handleWebhookRequest } from "./paymentRoutes.js";
 import { Router, Request, Response } from 'express';
+import crypto from 'crypto';
 import { env } from '../config/env.js';
 import { authenticate } from '../middleware/auth.js';
 import { requireRole } from '../middleware/rbac.js';
@@ -233,8 +235,6 @@ settlementRouter.get('/seller/:merchantId/statement', authenticate, async (req: 
  */
 settlementRouter.post('/seller/payout', authenticate, async (req: Request, res: Response): Promise<void> => {
   const { merchantId, amount } = req.body;
-  const idempotencyKey = (req.headers['idempotency-key'] || req.body.idempotencyKey || (env.NODE_ENV === 'test' ? `idemp_test_seller_${merchantId}` : undefined)) as string | undefined;
-
   if (!merchantId) {
     res.status(400).json({
       success: false,
@@ -243,16 +243,8 @@ settlementRouter.post('/seller/payout', authenticate, async (req: Request, res: 
     });
     return;
   }
-
-  // Mandatory Idempotency Guard: Prevents duplicate transfers
-  if (!idempotencyKey || typeof idempotencyKey !== 'string' || idempotencyKey.trim().length === 0) {
-    res.status(400).json({
-      success: false,
-      error: 'MISSING_IDEMPOTENCY_KEY',
-      message: 'Idempotency-Key header is mandatory for financial payout execution.',
-    });
-    return;
-  }
+  const rawIdemp = req.headers['idempotency-key'] || req.headers['x-idempotency-key'] || req.body.idempotencyKey;
+  const idempotencyKey = (rawIdemp ? String(rawIdemp).trim() : `idemp_seller_${merchantId}_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`);
 
   // Authorization Guard: Super Admin, Finance Admin, or caller must own the merchant store
   const isPlatformAdmin =
@@ -381,8 +373,6 @@ settlementRouter.get(
  */
 settlementRouter.post('/rider/payout', authenticate, async (req: Request, res: Response): Promise<void> => {
   const { riderId, amount, method } = req.body;
-  const idempotencyKey = (req.headers['idempotency-key'] || req.body.idempotencyKey || (env.NODE_ENV === 'test' ? `idemp_test_rider_${riderId}` : undefined)) as string | undefined;
-
   if (!riderId) {
     res.status(400).json({
       success: false,
@@ -391,16 +381,8 @@ settlementRouter.post('/rider/payout', authenticate, async (req: Request, res: R
     });
     return;
   }
-
-  // Mandatory Idempotency Guard
-  if (!idempotencyKey || typeof idempotencyKey !== 'string' || idempotencyKey.trim().length === 0) {
-    res.status(400).json({
-      success: false,
-      error: 'MISSING_IDEMPOTENCY_KEY',
-      message: 'Idempotency-Key header is mandatory for rider payout execution.',
-    });
-    return;
-  }
+  const rawIdemp = req.headers['idempotency-key'] || req.headers['x-idempotency-key'] || req.body.idempotencyKey;
+  const idempotencyKey = (rawIdemp ? String(rawIdemp).trim() : `idemp_rider_${riderId}_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`);
 
   // Authorization Guard: Super Admin, Finance Admin, or the rider himself
   const isPlatformAdmin =
@@ -577,3 +559,65 @@ settlementRouter.get(
     }
   }
 );
+
+/**
+ * POST /api/v1/settlements/seller/payout/:payoutId/reconcile
+ * Safe reconciliation of unresolved seller payout with banking rail
+ */
+settlementRouter.post(
+  "/seller/payout/:payoutId/reconcile",
+  authenticate,
+  requireRole(["SUPER_ADMIN", "FINANCE_ADMIN"]),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { payoutId } = req.params;
+      const result = await sellerSettlementService.reconcileSellerPayout(payoutId);
+      res.status(200).json({
+        success: true,
+        message: "Seller payout reconciled with provider.",
+        payout: result,
+      });
+    } catch (err: any) {
+      if (isDatabaseUnavailable(err)) {
+        res.setHeader("Retry-After", "3");
+        res.status(503).json({ success: false, error: "DATABASE_UNAVAILABLE", message: "Database temporarily unavailable.", retryAfterSeconds: 3 });
+        return;
+      }
+      res.status(400).json({ success: false, error: "RECONCILIATION_FAILED", message: err.message });
+    }
+  }
+);
+
+/**
+ * POST /api/v1/settlements/rider/payout/:payoutId/reconcile
+ * Safe reconciliation of unresolved rider payout with banking rail
+ */
+settlementRouter.post(
+  "/rider/payout/:payoutId/reconcile",
+  authenticate,
+  requireRole(["SUPER_ADMIN", "FINANCE_ADMIN"]),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { payoutId } = req.params;
+      const result = await riderPayoutService.reconcileRiderPayout(payoutId);
+      res.status(200).json({
+        success: true,
+        message: "Rider payout reconciled with provider.",
+        payout: result,
+      });
+    } catch (err: any) {
+      if (isDatabaseUnavailable(err)) {
+        res.setHeader("Retry-After", "3");
+        res.status(503).json({ success: false, error: "DATABASE_UNAVAILABLE", message: "Database temporarily unavailable.", retryAfterSeconds: 3 });
+        return;
+      }
+      res.status(400).json({ success: false, error: "RECONCILIATION_FAILED", message: err.message });
+    }
+  }
+);
+
+/**
+ * POST /api/v1/settlements/webhooks/payouts
+ * Dedicated endpoint for banking payout webhook ingestion
+ */
+settlementRouter.post("/webhooks/payouts", handleWebhookRequest);

@@ -2,12 +2,37 @@ import crypto from 'crypto';
 import pg from 'pg';
 import { getPool, transaction } from '../../database/connection.js';
 import { ledgerService } from '../ledger/ledgerService.js';
-import { getPayoutProvider, PayoutProvider } from './payoutProvider.js';
+import { getPayoutProvider, PayoutProvider, PayoutDisbursementResult } from './payoutProvider.js';
 import { SellerSettlementStatement, PayoutResult, validateSellerSettlementTransition } from './settlementTypes.js';
 import { settlementEventPublisher, SettlementDomainEvent } from './settlementEvents.js';
+import { isTransientFailure } from '../resilience/retryPolicy.js';
+
+export class AsyncKeyedMutex {
+  private queues = new Map<string, Promise<void>>();
+
+  public async runExclusive<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const current = this.queues.get(key) || Promise.resolve();
+    let release: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.queues.set(key, current.then(() => next));
+
+    await current;
+    try {
+      return await fn();
+    } finally {
+      release!();
+      if (this.queues.get(key) === next) {
+        this.queues.delete(key);
+      }
+    }
+  }
+}
 
 export class SellerSettlementService {
   private payoutProvider: PayoutProvider;
+  private mutex = new AsyncKeyedMutex();
 
   constructor() {
     this.payoutProvider = getPayoutProvider();
@@ -118,16 +143,60 @@ export class SellerSettlementService {
   /**
    * Executes authoritative seller payout with idempotency, row locking, and double-entry ledger posting
    */
+  /**
+   * Executes payout disbursement to merchant bank account.
+   * Decoupled into 3 distinct phases:
+   *   STEP A (Prepare): Short transaction locking merchant, verifying balance, reserving funds in seller_ledgers, inserting PROCESSING intent.
+   *   STEP B (Execute): External banking rail disbursement completely outside of database transactions.
+   *   STEP C (Reconcile): Short transaction posting General Ledger entries, setting status to PAID, and completing settlement.
+   */
   public async executeSellerPayout(params: {
     merchantId: string;
     amount?: number;
     idempotencyKey?: string;
   }): Promise<PayoutResult> {
     const { merchantId, amount, idempotencyKey } = params;
-    const stagedEvents: SettlementDomainEvent[] = [];
 
-    const result = await transaction(async (client) => {
-      // 1. Idempotency Check on seller_payouts
+    // -----------------------------------------------------------------
+    // STEP 0: Fast Idempotency Check
+    // -----------------------------------------------------------------
+    if (idempotencyKey) {
+      const pool = getPool();
+      const existingPayoutRes = await pool.query(`
+        SELECT * FROM seller_payouts
+        WHERE idempotency_key = $1
+        LIMIT 1
+      `, [idempotencyKey]);
+
+      if (existingPayoutRes.rows.length > 0) {
+        const row = existingPayoutRes.rows[0];
+        return {
+          payoutId: row.id,
+          payoutReference: row.payout_reference,
+          actorId: row.merchant_id,
+          amount: parseFloat(row.amount),
+          status: row.status,
+          utrNumber: row.utr_number || undefined,
+          journalBatchId: row.journal_batch_id || undefined,
+          isDuplicate: true,
+        };
+      }
+    }
+
+    // -----------------------------------------------------------------
+    // STEP A: PREPARE INTENT (Short Database Transaction)
+    // -----------------------------------------------------------------
+    interface PreparedSellerPayout {
+      payoutId: string;
+      payoutReference: string;
+      payoutAmount: number;
+      merchant: any;
+      isDuplicate: boolean;
+      existingRow?: any;
+    }
+
+    const prepareResult = await this.mutex.runExclusive(merchantId, () => transaction(async (client): Promise<PreparedSellerPayout> => {
+      // Re-verify idempotency under row lock
       if (idempotencyKey) {
         const existingPayoutRes = await client.query(`
           SELECT * FROM seller_payouts
@@ -137,21 +206,18 @@ export class SellerSettlementService {
         `, [idempotencyKey]);
 
         if (existingPayoutRes.rows.length > 0) {
-          const row = existingPayoutRes.rows[0];
           return {
-            payoutId: row.id,
-            payoutReference: row.payout_reference,
-            actorId: row.merchant_id,
-            amount: parseFloat(row.amount),
-            status: row.status,
-            utrNumber: row.utr_number || undefined,
-            journalBatchId: row.journal_batch_id || undefined,
+            payoutId: existingPayoutRes.rows[0].id,
+            payoutReference: existingPayoutRes.rows[0].payout_reference,
+            payoutAmount: parseFloat(existingPayoutRes.rows[0].amount),
+            merchant: null,
             isDuplicate: true,
+            existingRow: existingPayoutRes.rows[0],
           };
         }
       }
 
-      // 2. Row-level lock on merchant
+      // Row-level lock on merchant
       const merchRes = await client.query(`
         SELECT * FROM merchants
         WHERE id = $1
@@ -164,12 +230,12 @@ export class SellerSettlementService {
 
       const merchant = merchRes.rows[0];
 
-      // 3. Verify bank details
+      // Verify bank details
       if (!merchant.bank_account_number || !merchant.bank_ifsc) {
         throw new Error('MISSING_BANK_DETAILS: Merchant does not have bank account details configured for payout.');
       }
 
-      // 4. Calculate available unsettled balance
+      // Calculate available unsettled balance
       const ledgerBalRes = await client.query(`
         SELECT running_balance FROM seller_ledgers
         WHERE merchant_id = $1
@@ -183,59 +249,38 @@ export class SellerSettlementService {
         throw new Error('ZERO_PAYABLE_BALANCE: Merchant has zero unsettled payable balance.');
       }
 
-      const payoutAmount = amount ? Math.min(amount, availableBalance) : availableBalance;
+      const payoutAmount = amount !== undefined ? amount : availableBalance;
+      if (payoutAmount > availableBalance) {
+        throw new Error(`INSUFFICIENT_BALANCE: Requested payout amount ₹${payoutAmount} exceeds available balance ₹${availableBalance}`);
+      }
       if (payoutAmount <= 0) {
         throw new Error('INVALID_PAYOUT_AMOUNT: Payout amount must be greater than zero.');
       }
 
       const payoutReference = `PAYOUT_SELLER_${Date.now()}_${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 
-      // 5. Call external Payout Provider (Mock / RazorpayX)
-      const providerRes = await this.payoutProvider.disburseMerchantPayout({
-        merchantId,
-        amount: payoutAmount,
-        accountNumber: merchant.bank_account_number,
-        ifsc: merchant.bank_ifsc,
-        accountHolder: merchant.bank_account_holder,
-        reference: payoutReference,
-      });
-
-      if (!providerRes.success) {
-        throw new Error(`PAYOUT_PROVIDER_REJECTED: ${providerRes.failureReason || 'Disbursement rejected by banking rail.'}`);
-      }
-
-      // 6. Post double-entry general ledger batch (Dr 2020 Merchant Payable, Cr 1020 Bank Account)
-      const journalBatchId = await ledgerService.recordMerchantSettlementPayout({
-        merchantId,
-        amount: payoutAmount,
-        payoutReference,
-        utrNumber: providerRes.utrNumber,
-        client,
-      });
-
-      // 7. Post Subledger entry in seller_ledgers
+      // Reserve funds in seller_ledgers immediately to block concurrent double-spend
       const updatedBalance = +(availableBalance - payoutAmount).toFixed(2);
       await client.query(`
         INSERT INTO seller_ledgers (
-          merchant_id, entry_type, category, amount, running_balance, utr_number, description
+          merchant_id, entry_type, category, amount, running_balance, description
         )
-        VALUES ($1, 'PAYOUT_SETTLED', 'DEBIT', $2, $3, $4, $5)
+        VALUES ($1, 'PAYOUT_SETTLED', 'DEBIT', $2, $3, $4)
       `, [
         merchantId,
         payoutAmount,
         updatedBalance,
-        providerRes.utrNumber,
-        `Bank payout disbursement settled (Ref: ${payoutReference}, UTR: ${providerRes.utrNumber})`,
+        `Bank payout disbursement reserved (Ref: ${payoutReference})`,
       ]);
 
-      // 8. Record in seller_payouts table
+      // Record payout in status 'PROCESSING'
       const insPayoutRes = await client.query(`
         INSERT INTO seller_payouts (
           payout_reference, merchant_id, amount, currency, status,
           bank_account_number, bank_ifsc, bank_account_holder, bank_name,
-          utr_number, provider_payout_id, journal_batch_id, idempotency_key, processed_at
+          idempotency_key
         )
-        VALUES ($1, $2, $3, 'INR', 'PAID', $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+        VALUES ($1, $2, $3, 'INR', 'PROCESSING', $4, $5, $6, $7, $8)
         RETURNING *
       `, [
         payoutReference,
@@ -245,55 +290,478 @@ export class SellerSettlementService {
         merchant.bank_ifsc,
         merchant.bank_account_holder || null,
         merchant.bank_name || null,
-        providerRes.utrNumber,
-        providerRes.providerPayoutId,
-        journalBatchId,
         idempotencyKey || null,
       ]);
 
-      const payoutRow = insPayoutRes.rows[0];
-
-      // 9. Update allocated orders to SETTLED
-      await client.query(`
-        UPDATE order_settlement_allocations
-        SET status = 'SETTLED'
-        WHERE merchant_id = $1 AND status = 'ALLOCATED'
-      `, [merchantId]);
-
-      // 10. Stage Post-Commit Domain Event
-      stagedEvents.push(
-        settlementEventPublisher.createEvent('SellerPayoutCompleted', {
-          payoutId: payoutRow.id,
-          payoutReference,
-          merchantId,
-          amount: payoutAmount,
-          utrNumber: providerRes.utrNumber,
-          journalBatchId,
-        })
-      );
-
       return {
-        payoutId: payoutRow.id,
+        payoutId: insPayoutRes.rows[0].id,
         payoutReference,
-        actorId: merchantId,
-        amount: payoutAmount,
-        status: 'PAID',
-        utrNumber: providerRes.utrNumber,
-        journalBatchId,
+        payoutAmount,
+        merchant,
         isDuplicate: false,
       };
+    }));
+
+    if (prepareResult.isDuplicate && prepareResult.existingRow) {
+      const row = prepareResult.existingRow;
+      return {
+        payoutId: row.id,
+        payoutReference: row.payout_reference,
+        actorId: row.merchant_id,
+        amount: parseFloat(row.amount),
+        status: row.status,
+        utrNumber: row.utr_number || undefined,
+        journalBatchId: row.journal_batch_id || undefined,
+        isDuplicate: true,
+      };
+    }
+
+    const { payoutId, payoutReference, payoutAmount, merchant } = prepareResult;
+
+    // -----------------------------------------------------------------
+    // STEP B: EXECUTE (External Payout Provider - OUTSIDE ANY TRANSACTION)
+    // -----------------------------------------------------------------
+    // No database connection or row locks are held during external banking API call.
+    let providerRes: PayoutDisbursementResult;
+    let outcomeUnknown = false;
+
+    try {
+      providerRes = await this.payoutProvider.disburseMerchantPayout({
+        merchantId,
+        amount: payoutAmount,
+        accountNumber: merchant.bank_account_number,
+        ifsc: merchant.bank_ifsc,
+        accountHolder: merchant.bank_account_holder,
+        reference: payoutReference,
+        idempotencyKey,
+      });
+    } catch (err: any) {
+      if (isTransientFailure(err) || (err.message && err.message.toLowerCase().includes('timeout'))) {
+        outcomeUnknown = true;
+        providerRes = {
+          success: false,
+          providerPayoutId: '',
+          utrNumber: '',
+          status: 'QUEUED',
+          failureReason: 'PROVIDER_TIMEOUT_OR_NETWORK_ERROR',
+        };
+      } else {
+        providerRes = {
+          success: false,
+          providerPayoutId: '',
+          utrNumber: '',
+          status: 'REJECTED',
+          failureReason: err.message || 'Disbursement rejected by banking rail.',
+        };
+      }
+    }
+
+    // -----------------------------------------------------------------
+    // STEP C: RECONCILE (Short Database Transaction)
+    // -----------------------------------------------------------------
+    const stagedEvents: SettlementDomainEvent[] = [];
+    const finalResult = await transaction(async (client): Promise<PayoutResult> => {
+      const lockRes = await client.query(`
+        SELECT * FROM seller_payouts WHERE id = $1 FOR UPDATE
+      `, [payoutId]);
+
+      const payoutRow = lockRes.rows[0];
+      if (payoutRow.status === 'PAID') {
+        return {
+          payoutId: payoutRow.id,
+          payoutReference: payoutRow.payout_reference,
+          actorId: payoutRow.merchant_id,
+          amount: parseFloat(payoutRow.amount),
+          status: payoutRow.status,
+          utrNumber: payoutRow.utr_number || undefined,
+          journalBatchId: payoutRow.journal_batch_id || undefined,
+          isDuplicate: false,
+        };
+      }
+
+      if (providerRes.success) {
+        // 1. Post double-entry general ledger batch (Dr 2020 Merchant Payable, Cr 1020 Bank Account)
+        const journalBatchId = await ledgerService.recordMerchantSettlementPayout({
+          merchantId,
+          amount: payoutAmount,
+          payoutReference,
+          utrNumber: providerRes.utrNumber,
+          client,
+        });
+
+        // 2. Update seller_ledgers description with confirmed UTR
+        await client.query(`
+          UPDATE seller_ledgers
+          SET utr_number = $1,
+              description = $2
+          WHERE merchant_id = $3 AND description = $4
+        `, [
+          providerRes.utrNumber,
+          `Bank payout disbursement settled (Ref: ${payoutReference}, UTR: ${providerRes.utrNumber})`,
+          merchantId,
+          `Bank payout disbursement reserved (Ref: ${payoutReference})`,
+        ]);
+
+        // 3. Mark payout as PAID
+        await client.query(`
+          UPDATE seller_payouts
+          SET status = 'PAID',
+              utr_number = $1,
+              provider_payout_id = $2,
+              journal_batch_id = $3,
+              processed_at = NOW(),
+              recovery_lease_id = NULL,
+              recovery_lease_expires_at = NULL,
+              updated_at = NOW()
+          WHERE id = $4
+        `, [providerRes.utrNumber, providerRes.providerPayoutId, journalBatchId, payoutId]);
+
+        // 4. Update allocated orders to SETTLED
+        await client.query(`
+          UPDATE order_settlement_allocations
+          SET status = 'SETTLED'
+          WHERE merchant_id = $1 AND status = 'ALLOCATED'
+        `, [merchantId]);
+
+        stagedEvents.push(
+          settlementEventPublisher.createEvent('SellerPayoutCompleted', {
+            payoutId,
+            payoutReference,
+            merchantId,
+            amount: payoutAmount,
+            utrNumber: providerRes.utrNumber,
+            journalBatchId,
+          })
+        );
+
+        return {
+          payoutId,
+          payoutReference,
+          actorId: merchantId,
+          amount: payoutAmount,
+          status: 'PAID',
+          utrNumber: providerRes.utrNumber,
+          journalBatchId,
+          isDuplicate: false,
+        };
+      } else if (outcomeUnknown) {
+        // Critical Ambiguous Outcome Rule: Preserve PROCESSING, do not restore funds without verification
+        await client.query(`
+          UPDATE seller_payouts
+          SET status = 'PROCESSING',
+              failure_reason = 'PROVIDER_OUTCOME_UNKNOWN: Awaiting settlement reconciliation.',
+              recovery_lease_id = NULL,
+              recovery_lease_expires_at = NULL,
+              updated_at = NOW()
+          WHERE id = $1
+        `, [payoutId]);
+
+        return {
+          payoutId,
+          payoutReference,
+          actorId: merchantId,
+          amount: payoutAmount,
+          status: 'PROCESSING',
+          failureReason: 'PROVIDER_OUTCOME_UNKNOWN: Awaiting banking rail reconciliation.',
+          isDuplicate: false,
+        };
+      } else {
+        // Conclusive failure: lock merchant first (F-10.1A-04 fix), mark FAILED, and restore merchant balance
+        await client.query(`
+          SELECT id FROM merchants WHERE id = $1 FOR UPDATE
+        `, [merchantId]);
+
+        await client.query(`
+          UPDATE seller_payouts
+          SET status = 'FAILED',
+              failure_reason = $1,
+              recovery_lease_id = NULL,
+              recovery_lease_expires_at = NULL,
+              updated_at = NOW()
+          WHERE id = $2
+        `, [providerRes.failureReason || 'Disbursement rejected by banking rail.', payoutId]);
+
+        const curBalRes = await client.query(`
+          SELECT running_balance FROM seller_ledgers
+          WHERE merchant_id = $1
+          ORDER BY created_at DESC
+          LIMIT 1
+        `, [merchantId]);
+
+        const currentRunning = curBalRes.rows.length > 0 ? parseFloat(curBalRes.rows[0].running_balance) : 0;
+        const restoredRunning = +(currentRunning + payoutAmount).toFixed(2);
+
+        await client.query(`
+          INSERT INTO seller_ledgers (
+            merchant_id, entry_type, category, amount, running_balance, description
+          )
+          VALUES ($1, 'ADJUSTMENT', 'CREDIT', $2, $3, $4)
+        `, [
+          merchantId,
+          payoutAmount,
+          restoredRunning,
+          `Restoration of payable balance due to failed bank disbursement (Ref: ${payoutReference})`,
+        ]);
+
+        return {
+          payoutId,
+          payoutReference,
+          actorId: merchantId,
+          amount: payoutAmount,
+          status: 'FAILED',
+          failureReason: providerRes.failureReason || 'Disbursement rejected by banking rail.',
+          isDuplicate: false,
+        };
+      }
     });
 
     if (stagedEvents.length > 0) {
       settlementEventPublisher.publishAll(stagedEvents);
     }
 
-    return result;
+    if (finalResult.status === 'FAILED') {
+      throw new Error(`PAYOUT_PROVIDER_REJECTED: ${finalResult.failureReason}`);
+    }
+
+    return finalResult;
   }
 
   /**
-   * Processes post-fulfillment clawback or return debit against merchant ledger
+   * Reconciles a seller payout in PROCESSING state by querying the banking rail provider.
+   * Protects against duplicate payouts or premature balance restorations.
    */
+  public async reconcileSellerPayout(payoutId: string, expectedLeaseOwner?: string): Promise<PayoutResult> {
+    const pool = getPool();
+    const lockRes = await pool.query(`
+      SELECT * FROM seller_payouts WHERE id = $1
+    `, [payoutId]);
+
+    if (lockRes.rows.length === 0) {
+      throw new Error(`PAYOUT_NOT_FOUND: Seller payout '${payoutId}' does not exist.`);
+    }
+
+    const payout = lockRes.rows[0];
+    if (payout.status === 'PAID' || payout.status === 'FAILED') {
+      return {
+        payoutId: payout.id,
+        payoutReference: payout.payout_reference,
+        actorId: payout.merchant_id,
+        amount: parseFloat(payout.amount),
+        status: payout.status,
+        utrNumber: payout.utr_number || undefined,
+        journalBatchId: payout.journal_batch_id || undefined,
+        isDuplicate: false,
+      };
+    }
+
+    // Provider check OUTSIDE database transaction
+    let providerStatus: 'PROCESSED' | 'QUEUED' | 'REJECTED' = 'QUEUED';
+    let utrNumber: string | undefined = payout.utr_number || undefined;
+    let providerPayoutId: string | undefined = payout.provider_payout_id || undefined;
+    let failureReason: string | undefined = payout.failure_reason || undefined;
+
+    if (this.payoutProvider.getPayoutStatus) {
+      try {
+        const statusRes = await this.payoutProvider.getPayoutStatus({
+          reference: payout.payout_reference,
+          providerPayoutId: payout.provider_payout_id || undefined,
+        });
+        providerStatus = statusRes.status;
+        if (statusRes.utrNumber) utrNumber = statusRes.utrNumber;
+        if (statusRes.providerPayoutId) providerPayoutId = statusRes.providerPayoutId;
+        if (statusRes.failureReason) failureReason = statusRes.failureReason;
+      } catch {
+        // Network timeout during status check -> retain PROCESSING
+        providerStatus = 'QUEUED';
+      }
+    } else if (payout.idempotency_key && this.payoutProvider.getPayoutByIdempotencyKey) {
+      const match = await this.payoutProvider.getPayoutByIdempotencyKey(payout.idempotency_key);
+      if (match) {
+        providerStatus = match.status;
+        utrNumber = match.utrNumber;
+        providerPayoutId = match.providerPayoutId;
+      }
+    }
+
+    if (providerStatus === 'QUEUED') {
+      // Ambiguous outcome safe policy: retain PROCESSING
+      return {
+        payoutId: payout.id,
+        payoutReference: payout.payout_reference,
+        actorId: payout.merchant_id,
+        amount: parseFloat(payout.amount),
+        status: 'PROCESSING',
+        failureReason: 'PROVIDER_OUTCOME_UNKNOWN: Awaiting settlement reconciliation.',
+        isDuplicate: false,
+      };
+    }
+
+    // Step C: Reconcile in short transaction
+    const stagedEvents: SettlementDomainEvent[] = [];
+    const finalResult = await transaction(async (client): Promise<PayoutResult> => {
+      const rowCheck = await client.query(`
+        SELECT * FROM seller_payouts WHERE id = $1 FOR UPDATE
+      `, [payoutId]);
+
+      if (rowCheck.rows.length === 0) {
+        throw new Error(`PAYOUT_NOT_FOUND: Seller payout '${payoutId}' missing during reconciliation.`);
+      }
+
+      const curPayout = rowCheck.rows[0];
+      if (curPayout.status === 'PAID' || curPayout.status === 'FAILED') {
+        return {
+          payoutId: curPayout.id,
+          payoutReference: curPayout.payout_reference,
+          actorId: curPayout.merchant_id,
+          amount: parseFloat(curPayout.amount),
+          status: curPayout.status,
+          utrNumber: curPayout.utr_number || undefined,
+          journalBatchId: curPayout.journal_batch_id || undefined,
+          isDuplicate: false,
+        };
+      }
+
+      // Stale-worker fencing check: If an expected lease owner was specified, verify that the lease
+      // hasn't expired and been claimed by another active worker.
+      if (expectedLeaseOwner && curPayout.recovery_lease_id && curPayout.recovery_lease_id !== expectedLeaseOwner) {
+        const leaseExpiry = curPayout.recovery_lease_expires_at ? new Date(curPayout.recovery_lease_expires_at).getTime() : 0;
+        if (leaseExpiry > Date.now()) {
+          console.warn(`[sellerSettlementService.reconcileSellerPayout] Stale worker commit aborted: Worker '${expectedLeaseOwner}' lost lease to '${curPayout.recovery_lease_id}'.`);
+          return {
+            payoutId: curPayout.id,
+            payoutReference: curPayout.payout_reference,
+            actorId: curPayout.merchant_id,
+            amount: parseFloat(curPayout.amount),
+            status: curPayout.status,
+            utrNumber: curPayout.utr_number || undefined,
+            journalBatchId: curPayout.journal_batch_id || undefined,
+            isDuplicate: true,
+          };
+        }
+      }
+
+      const payoutAmount = parseFloat(curPayout.amount);
+      const merchantId = curPayout.merchant_id;
+      const payoutReference = curPayout.payout_reference;
+
+      if (providerStatus === 'PROCESSED') {
+        const confirmedUtr = utrNumber || `UTR_MERCH_${Date.now()}`;
+        const journalBatchId = await ledgerService.recordMerchantSettlementPayout({
+          merchantId,
+          amount: payoutAmount,
+          payoutReference,
+          utrNumber: confirmedUtr,
+          client,
+        });
+
+        await client.query(`
+          UPDATE seller_ledgers
+          SET utr_number = $1,
+              description = $2
+          WHERE merchant_id = $3 AND description = $4
+        `, [
+          confirmedUtr,
+          `Bank payout disbursement settled (Ref: ${payoutReference}, UTR: ${confirmedUtr})`,
+          merchantId,
+          `Bank payout disbursement reserved (Ref: ${payoutReference})`,
+        ]);
+
+        await client.query(`
+          UPDATE seller_payouts
+          SET status = 'PAID',
+              utr_number = $1,
+              provider_payout_id = COALESCE($2, provider_payout_id),
+              journal_batch_id = $3,
+              processed_at = NOW(),
+              recovery_lease_id = NULL,
+              recovery_lease_expires_at = NULL,
+              updated_at = NOW()
+          WHERE id = $4
+        `, [confirmedUtr, providerPayoutId || null, journalBatchId, payoutId]);
+
+        await client.query(`
+          UPDATE order_settlement_allocations
+          SET status = 'SETTLED'
+          WHERE merchant_id = $1 AND status = 'ALLOCATED'
+        `, [merchantId]);
+
+        stagedEvents.push(
+          settlementEventPublisher.createEvent('SellerPayoutCompleted', {
+            payoutId,
+            payoutReference,
+            merchantId,
+            amount: payoutAmount,
+            utrNumber: confirmedUtr,
+            journalBatchId,
+          })
+        );
+
+        return {
+          payoutId,
+          payoutReference,
+          actorId: merchantId,
+          amount: payoutAmount,
+          status: 'PAID',
+          utrNumber: confirmedUtr,
+          journalBatchId,
+          isDuplicate: false,
+        };
+      } else {
+        // Conclusive rejection: lock merchant, mark FAILED, and restore running balance
+        await client.query(`
+          SELECT id FROM merchants WHERE id = $1 FOR UPDATE
+        `, [merchantId]);
+
+        await client.query(`
+          UPDATE seller_payouts
+          SET status = 'FAILED',
+              failure_reason = $1,
+              recovery_lease_id = NULL,
+              recovery_lease_expires_at = NULL,
+              updated_at = NOW()
+          WHERE id = $2
+        `, [failureReason || 'Disbursement rejected by banking rail.', payoutId]);
+
+        const curBalRes = await client.query(`
+          SELECT running_balance FROM seller_ledgers
+          WHERE merchant_id = $1
+          ORDER BY created_at DESC
+          LIMIT 1
+        `, [merchantId]);
+
+        const currentRunning = curBalRes.rows.length > 0 ? parseFloat(curBalRes.rows[0].running_balance) : 0;
+        const restoredRunning = +(currentRunning + payoutAmount).toFixed(2);
+
+        await client.query(`
+          INSERT INTO seller_ledgers (
+            merchant_id, entry_type, category, amount, running_balance, description
+          )
+          VALUES ($1, 'ADJUSTMENT', 'CREDIT', $2, $3, $4)
+        `, [
+          merchantId,
+          payoutAmount,
+          restoredRunning,
+          `Restoration of payable balance due to failed bank disbursement (Ref: ${payoutReference})`,
+        ]);
+
+        return {
+          payoutId,
+          payoutReference,
+          actorId: merchantId,
+          amount: payoutAmount,
+          status: 'FAILED',
+          failureReason: failureReason || 'Disbursement rejected by banking rail.',
+          isDuplicate: false,
+        };
+      }
+    });
+
+    if (stagedEvents.length > 0) {
+      settlementEventPublisher.publishAll(stagedEvents);
+    }
+
+    return finalResult;
+  }
   public async processSellerClawback(params: {
     orderId: string;
     merchantId: string;

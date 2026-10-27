@@ -1,6 +1,6 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import { getPool } from '../database/connection.js';
-import { authenticate } from '../middleware/auth.js';
+import { authenticate, optionalAuthenticate } from '../middleware/auth.js';
 import { requirePermission } from '../middleware/rbac.js';
 import { pricingEngine, PricingEngineError } from '../modules/pricing/pricingEngine.js';
 import { taxEngine, TaxEngineError } from '../modules/pricing/taxEngine.js';
@@ -69,11 +69,12 @@ const handleCheckoutCalculation = async (req: Request, res: Response): Promise<v
       }
 
       // Insert PROCESSING state
+      const actorId = req.auth?.userId || 'guest';
       await pool.query(
         `INSERT INTO idempotency_keys (idempotency_key, actor_id, endpoint, status, created_at, expires_at)
          VALUES ($1, $2, $3, 'PROCESSING', NOW(), NOW() + interval '24 hours')
          ON CONFLICT (idempotency_key) DO UPDATE SET status = 'PROCESSING'`,
-        [cleanKey, req.auth!.userId, req.originalUrl]
+        [cleanKey, actorId, req.originalUrl]
       );
     }
   } catch (err: any) {
@@ -99,28 +100,59 @@ const handleCheckoutCalculation = async (req: Request, res: Response): Promise<v
     placeOfSupplyStateCode,
     customerGstin,
     customerLocation,
+    deliveryCoordinates,
+    delivery_coordinates,
     distanceKm,
     couponCode,
     transactionDate,
   } = req.body;
 
   try {
+    // Resolve merchantId automatically if not passed in guest or single-cart checkout
+    let effectiveMerchantId = merchantId;
+    if (!effectiveMerchantId && Array.isArray(items) && items.length > 0) {
+      const firstPid = items[0]?.productId || items[0]?.id;
+      if (firstPid) {
+        const itemMerchantRes = await pool.query(
+          `SELECT merchant_id FROM store_inventory WHERE product_id = $1 LIMIT 1`,
+          [firstPid]
+        );
+        if (itemMerchantRes.rows.length > 0) {
+          effectiveMerchantId = itemMerchantRes.rows[0].merchant_id;
+        }
+      }
+      if (!effectiveMerchantId) {
+        const defaultMerchantRes = await pool.query(
+          `SELECT id FROM merchants WHERE status = 'ACTIVE' LIMIT 1`
+        );
+        if (defaultMerchantRes.rows.length > 0) {
+          effectiveMerchantId = defaultMerchantRes.rows[0].id;
+        }
+      }
+    }
+
+    const rawCoords = customerLocation || deliveryCoordinates || delivery_coordinates;
+    const effectiveLoc = rawCoords ? {
+      latitude: rawCoords.latitude ?? rawCoords.lat ?? 12.9352,
+      longitude: rawCoords.longitude ?? rawCoords.lng ?? 77.6245,
+    } : undefined;
+
     const quote = await pricingEngine.calculate({
-      merchantId,
+      merchantId: effectiveMerchantId,
       storeId,
       items: Array.isArray(items)
         ? items.map((i: any) => ({
-            productId: String(i.productId || ''),
-            quantity: Number(i.quantity || 0),
+            productId: String(i.productId || i.id || ''),
+            quantity: Number(i.quantity || 1),
           }))
         : [],
-      placeOfSupplyStateCode,
+      placeOfSupplyStateCode: placeOfSupplyStateCode || '29',
       customerGstin,
-      customerLocation,
+      customerLocation: effectiveLoc,
       distanceKm,
       couponCode,
       transactionDate,
-      userId: req.auth!.userId,
+      userId: req.auth?.userId,
       idempotencyKey,
     });
 
@@ -203,9 +235,18 @@ const handleCheckoutCalculation = async (req: Request, res: Response): Promise<v
   }
 };
 
-pricingRouter.post('/quote', authenticate, handleCheckoutCalculation);
-pricingRouter.post('/calculate', authenticate, handleCheckoutCalculation);
-pricingRouter.post('/checkout-calculation', authenticate, handleCheckoutCalculation);
+const quoteAuthMiddleware = (req: Request, res: Response, next: NextFunction) => {
+  // Frontend customer app checkout calculation allows guest quote computation
+  if (req.baseUrl.includes('checkout')) {
+    return optionalAuthenticate(req, res, next);
+  }
+  // Authoritative server-side pricing engine route strictly requires authentication
+  return authenticate(req, res, next);
+};
+
+pricingRouter.post('/quote', quoteAuthMiddleware, handleCheckoutCalculation);
+pricingRouter.post('/calculate', optionalAuthenticate, handleCheckoutCalculation);
+pricingRouter.post('/checkout-calculation', optionalAuthenticate, handleCheckoutCalculation);
 
 /**
  * GET /api/v1/pricing/quote/:quoteId
@@ -700,6 +741,27 @@ pricingRouter.get('/sellers-geofence', async (req: Request, res: Response): Prom
       success: false,
       error: 'FETCH_FAILED',
       message: err.message || 'Failed to retrieve seller geofences.',
+    });
+  }
+});
+
+/**
+ * POST /sellers-geofence/:sellerId & POST /checkout/sellers-geofence/:sellerId
+ */
+pricingRouter.post('/sellers-geofence/:sellerId', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { sellerId } = req.params;
+    const updated = await sellerService.updateSellerGeofence(sellerId, req.body);
+    res.status(200).json({
+      success: true,
+      message: 'Seller geofence updated successfully.',
+      seller: updated,
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: 'UPDATE_FAILED',
+      message: err.message || 'Failed to update seller geofence.',
     });
   }
 });

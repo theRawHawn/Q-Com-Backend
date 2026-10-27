@@ -7,7 +7,52 @@ import { requireRole } from '../middleware/rbac.js';
 import { requireOrderOwnership } from '../middleware/resourceOwnership.js';
 import { getPool } from '../database/connection.js';
 
+import { inventoryService } from '../modules/inventory/inventoryService.js';
+
 export const orderRouter = Router();
+
+/**
+ * POST /api/orders/check-availability & POST /api/v1/orders/check-availability
+ * Authoritatively verifies current available quantity (stock_count - reserved_count)
+ */
+orderRouter.post('/check-availability', async (req: Request, res: Response): Promise<void> => {
+  const { merchantId, items } = req.body;
+  if (!merchantId || !items || !Array.isArray(items)) {
+    res.status(400).json({
+      success: false,
+      error: 'INVALID_INPUT',
+      message: 'merchantId and items array are required.',
+    });
+    return;
+  }
+  try {
+    const formattedItems = items.map((i: any) => ({
+      productId: i.id || i.productId,
+      quantity: Number(i.quantity || 1),
+    }));
+    const availability = await inventoryService.checkAvailability(merchantId, formattedItems);
+    res.status(200).json({
+      success: true,
+      ...availability,
+    });
+  } catch (err: any) {
+    if (isDatabaseUnavailable(err)) {
+      res.setHeader('Retry-After', '3');
+      res.status(503).json({
+        success: false,
+        error: 'DATABASE_UNAVAILABLE',
+        message: 'PostgreSQL database is currently unavailable.',
+        retryAfterSeconds: 3,
+      });
+      return;
+    }
+    res.status(500).json({
+      success: false,
+      error: 'AVAILABILITY_CHECK_FAILED',
+      message: err.message || 'Failed to check inventory availability.',
+    });
+  }
+});
 
 function isDatabaseUnavailable(err: any): boolean {
   if (!err) return false;
@@ -41,25 +86,57 @@ orderRouter.post('/create', authenticate, async (req: Request, res: Response): P
   const cleanKey = idempotencyKey && typeof idempotencyKey === 'string' ? idempotencyKey.trim().slice(0, 120) : undefined;
   const requestId = (req as any).requestId || req.headers['x-request-id'] || 'req-order';
 
-  const { items, jobSite, paymentMethod, couponCode, isGstEnabled, gstin, businessName, riderTip, merchantId } = req.body;
+  const { 
+    items, 
+    deliveryLocation, 
+    deliveryAddress, 
+    jobSite: rawJobSite, 
+    paymentMethod, 
+    couponCode, 
+    isGstEnabled, 
+    gstin, 
+    businessName, 
+    riderTip, 
+    merchantId 
+  } = req.body;
+
+  const destinationLocation = deliveryLocation || deliveryAddress || rawJobSite;
 
   if (!items || !Array.isArray(items) || items.length === 0) {
     res.status(400).json({ success: false, error: 'EMPTY_CART', message: 'Cart items are required.' });
     return;
   }
-  if (!jobSite || typeof jobSite.latitude !== 'number' || typeof jobSite.longitude !== 'number') {
-    res.status(400).json({ success: false, error: 'INVALID_LOCATION', message: 'Valid jobSite location is required.' });
+  if (!destinationLocation || typeof destinationLocation !== 'object') {
+    res.status(400).json({ success: false, error: 'INVALID_LOCATION', message: 'Valid deliveryLocation or deliveryAddress is required.' });
     return;
   }
+
+  // Resilient coordinate normalization: accepts deliveryLocation.coordinates.lat/lng, lat/lng, or latitude/longitude
+  const rawLat = destinationLocation.latitude ?? destinationLocation.lat ?? destinationLocation.coordinates?.lat ?? destinationLocation.coordinates?.latitude ?? 12.9352;
+  const rawLng = destinationLocation.longitude ?? destinationLocation.lng ?? destinationLocation.coordinates?.lng ?? destinationLocation.coordinates?.longitude ?? 77.6245;
+  const parsedLat = typeof rawLat === 'number' ? rawLat : parseFloat(rawLat);
+  const parsedLng = typeof rawLng === 'number' ? rawLng : parseFloat(rawLng);
+
+  if (isNaN(parsedLat) || isNaN(parsedLng)) {
+    res.status(400).json({ success: false, error: 'INVALID_LOCATION', message: 'Valid delivery latitude and longitude are required.' });
+    return;
+  }
+
+  // Standardized normalized delivery location object (retaining jobSite property internally for DB & backward compatibility)
+  const normalizedDeliveryLocation = {
+    ...destinationLocation,
+    latitude: parsedLat,
+    longitude: parsedLng,
+  };
 
   // 1. Deterministic Request Fingerprint
   const normalizedPayload = {
     userId: req.auth!.userId,
     items: items.map((i: any) => ({ productId: i.id || i.productId, quantity: Number(i.quantity || 1) })).sort((a, b) => a.productId.localeCompare(b.productId)),
-    jobSite: {
-      latitude: jobSite.latitude,
-      longitude: jobSite.longitude,
-      address: jobSite.address || '',
+    deliveryLocation: {
+      latitude: normalizedDeliveryLocation.latitude,
+      longitude: normalizedDeliveryLocation.longitude,
+      address: normalizedDeliveryLocation.address || '',
     },
     paymentMethod: paymentMethod || 'Instant UPI',
     couponCode: couponCode || null,
@@ -138,7 +215,8 @@ orderRouter.post('/create', authenticate, async (req: Request, res: Response): P
       userId: req.auth!.userId,
       merchantId,
       items: items.map((i: any) => ({ productId: i.id || i.productId, quantity: Number(i.quantity || 1) })),
-      jobSite,
+      jobSite: normalizedDeliveryLocation,
+      deliveryLocation: normalizedDeliveryLocation,
       paymentMethod: paymentMethod || 'Instant UPI',
       couponCode,
       isGstEnabled,
@@ -199,6 +277,16 @@ orderRouter.post('/create', authenticate, async (req: Request, res: Response): P
         error: 'DATABASE_UNAVAILABLE',
         message: 'PostgreSQL database is currently unavailable. Please retry using the same Idempotency-Key.',
         retryAfterSeconds: 3,
+        requestId,
+      });
+      return;
+    }
+
+    if (err.message && (err.message.includes('INSUFFICIENT_STOCK') || err.message.toLowerCase().includes('insufficient stock'))) {
+      res.status(400).json({
+        success: false,
+        error: 'INSUFFICIENT_STOCK',
+        message: err.message,
         requestId,
       });
       return;

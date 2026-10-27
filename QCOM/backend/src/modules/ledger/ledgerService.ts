@@ -64,6 +64,7 @@ export class LedgerService {
         order_id, merchant_id, narration
       )
       VALUES ($1, $2, 'CUSTOMER_PAYMENT', '1010', 'DEBIT', $3, 'INR', $4, $5, $6)
+      ON CONFLICT (transaction_reference, account_code, entry_side) DO NOTHING
     `, [
       journalBatchId,
       txRef,
@@ -81,6 +82,7 @@ export class LedgerService {
         order_id, merchant_id, narration
       )
       VALUES ($1, $2, 'CUSTOMER_PAYMENT', '2010', 'CREDIT', $3, 'INR', $4, $5, $6)
+      ON CONFLICT (transaction_reference, account_code, entry_side) DO NOTHING
     `, [
       journalBatchId,
       txRef,
@@ -374,6 +376,7 @@ export class LedgerService {
       VALUES 
       ($1, $2, 'MERCHANT_SETTLEMENT', '2020', 'DEBIT', $3, 'INR', $4, $5),
       ($1, $2, 'MERCHANT_SETTLEMENT', '1020', 'CREDIT', $3, 'INR', $4, $6)
+      ON CONFLICT (transaction_reference, account_code, entry_side) DO NOTHING
     `, [
       journalBatchId,
       txRef,
@@ -420,6 +423,7 @@ export class LedgerService {
       VALUES 
       ($1, $2, 'RIDER_PAYOUT', '2030', 'DEBIT', $3, 'INR', $4, $5),
       ($1, $2, 'RIDER_PAYOUT', '1020', 'CREDIT', $3, 'INR', $4, $6)
+      ON CONFLICT (transaction_reference, account_code, entry_side) DO NOTHING
     `, [
       journalBatchId,
       txRef,
@@ -515,14 +519,17 @@ export class LedgerService {
    */
   public async recordPreFulfillmentCancellationRefund(params: {
     orderId: string;
+    refundId?: string;
+    refundNumber?: string;
     amount: number;
     client?: pg.PoolClient;
   }): Promise<string> {
     const runner = params.client || getPool();
-    const txRef = `TX_CANCEL_REFUND_${params.orderId}`;
+    const refundKey = params.refundNumber || params.refundId || 'FULL';
+    const txRef = `TX_CANCEL_REFUND_${params.orderId}_${refundKey}`;
 
     const existing = await runner.query(`
-      SELECT journal_batch_id FROM general_ledger_entries
+      SELECT journal_batch_id, amount FROM general_ledger_entries
       WHERE transaction_reference = $1
       LIMIT 1
     `, [txRef]);
@@ -541,13 +548,14 @@ export class LedgerService {
       VALUES 
       ($1, $2, 'REFUND', '2010', 'DEBIT', $3, 'INR', $4, $5),
       ($1, $2, 'REFUND', '1010', 'CREDIT', $3, 'INR', $4, $6)
+      ON CONFLICT (transaction_reference, account_code, entry_side) DO NOTHING
     `, [
       journalBatchId,
       txRef,
       params.amount,
       params.orderId,
-      `Cancellation refund: release customer escrow liability for order ${params.orderId}`,
-      `Cancellation refund: gateway escrow cash returned for order ${params.orderId}`,
+      `Cancellation refund: release customer escrow liability for order ${params.orderId} (Ref: ${refundKey})`,
+      `Cancellation refund: gateway escrow cash returned for order ${params.orderId} (Ref: ${refundKey})`,
     ]);
 
     return journalBatchId;

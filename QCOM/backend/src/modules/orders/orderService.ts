@@ -7,14 +7,19 @@ import { inventoryService } from '../inventory/inventoryService.js';
 import { outboxService } from '../outbox/outboxService.js';
 import { cancellationService } from './cancellationService.js';
 import { bloomFilterService } from '../resilience/bloomFilterService.js';
+import { env } from '../../config/env.js';
 
 export class OrderService {
+  private static orderSequence: number = Math.floor(Math.random() * 10000);
+
   /**
-   * Generates human-readable order number (e.g. QC-2026-98124)
+   * Generates a collision-resistant unique order tracking number
    */
   private generateOrderNumber(): string {
-    const randomSuffix = Math.floor(10000 + Math.random() * 90000);
-    return `QC-${new Date().getFullYear()}-${randomSuffix}`;
+    OrderService.orderSequence = (OrderService.orderSequence + 1) % 900000;
+    const seq = (100000 + OrderService.orderSequence).toString();
+    const rand = Math.floor(10 + Math.random() * 90);
+    return `QC-${new Date().getFullYear()}-${seq}${rand}`;
   }
 
   /**
@@ -67,13 +72,15 @@ export class OrderService {
       }
     }
 
+    const deliveryDest = input.deliveryLocation || input.deliveryAddress || input.jobSite;
+
     // 2. Authoritative pricing & statutory tax calculation
     const pricingQuote = await pricingEngine.calculate({
       merchantId: merchantId!,
       items: input.items.map(i => ({ productId: i.productId, quantity: i.quantity })),
       customerLocation: {
-        latitude: input.jobSite.latitude,
-        longitude: input.jobSite.longitude,
+        latitude: deliveryDest.latitude,
+        longitude: deliveryDest.longitude,
       },
       customerGstin: input.gstin,
       placeOfSupplyStateCode: '29',
@@ -95,9 +102,16 @@ export class OrderService {
         orderId,
         merchantId!,
         input.items,
-        15,
+        env.RESERVATION_TTL_MINUTES,
         client
       );
+
+      // Only immediately commit stock upon order placement for Cash on Delivery (Pay on Delivery) orders.
+      // Online payment orders retain RESERVED status until payment verification / capture confirms payment.
+      const isCod = input.paymentMethod === 'Pay on Delivery' || input.paymentMethod === 'COD' || input.paymentMethod === 'Cash on Delivery';
+      if (isCod) {
+        await inventoryService.commitStock(orderId, client);
+      }
 
       // Insert Order row
       const insOrderRes = await client.query(`
@@ -145,7 +159,7 @@ export class OrderService {
         input.paymentMethod || 'Instant UPI',
         deliveryOtp,
         handoverToken,
-        JSON.stringify(input.jobSite),
+        JSON.stringify(deliveryDest),
         input.gstin || null,
         input.businessName || null,
         '29',

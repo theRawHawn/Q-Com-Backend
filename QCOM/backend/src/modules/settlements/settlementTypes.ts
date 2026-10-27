@@ -116,6 +116,7 @@ export interface PayoutResult {
   utrNumber?: string;
   journalBatchId?: string;
   isDuplicate?: boolean;
+  failureReason?: string;
 }
 
 const ALLOWED_SELLER_SETTLEMENT_TRANSITIONS: Record<SellerSettlementStatus, ReadonlySet<SellerSettlementStatus>> = {
