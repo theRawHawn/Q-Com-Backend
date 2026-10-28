@@ -83,13 +83,14 @@ export class FinancialWebhookService {
       LIMIT 1
     `, [eventId]);
 
-    if (existingEvt.rows.length > 0 && existingEvt.rows[0].status === 'PROCESSED') {
+    if (existingEvt.rows.length > 0 && ['PROCESSED', 'IGNORED', 'FAILED'].includes(existingEvt.rows[0].status)) {
       return {
         success: true,
         duplicate: true,
         eventId,
         eventType,
-        message: 'Webhook event already processed successfully (durable replay detected).',
+        status: existingEvt.rows[0].status,
+        message: 'Webhook event already processed (durable replay detected).',
       };
     }
 

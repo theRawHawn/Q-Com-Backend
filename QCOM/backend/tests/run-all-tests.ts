@@ -35,6 +35,7 @@ import { runSprint14_1RealPostgreSql16Tests } from './sprint14-1-real-postgresql
 import { runSprint14_2WorkflowClosureTests } from './sprint14-2-workflow-closure.test.js';
 import { runSprint14_3StagingReleaseCandidateTests } from './sprint14-3-staging-release-candidate.test.js';
 import { runSprint14_4AuthIdorSecurityGateTests } from './sprint14-4-auth-idor-security-gate.test.js';
+import { runSprint14_5PaymentIdempotencyTests } from './sprint14-5-payment-idempotency-and-integrity.test.js';
 
 async function runAllTests() {
   console.log('===========================================================');
@@ -134,6 +135,8 @@ async function runAllTests() {
     await runSprint14_3StagingReleaseCandidateTests();
     // Sprint 14.4 Authentication, IDOR & Browser Security Gate Tests
     await runSprint14_4AuthIdorSecurityGateTests();
+    // Sprint 14.5 Payment Idempotency & Financial Integrity Tests
+    await runSprint14_5PaymentIdempotencyTests();
 
     const duration = ((Date.now() - start) / 1000).toFixed(2);
     console.log('\n===========================================================');
