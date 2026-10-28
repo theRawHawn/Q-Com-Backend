@@ -34,6 +34,7 @@ import { runFourAppCompatibilityTests } from './four-app-compatibility.test.js';
 import { runSprint14_1RealPostgreSql16Tests } from './sprint14-1-real-postgresql16.test.js';
 import { runSprint14_2WorkflowClosureTests } from './sprint14-2-workflow-closure.test.js';
 import { runSprint14_3StagingReleaseCandidateTests } from './sprint14-3-staging-release-candidate.test.js';
+import { runSprint14_4AuthIdorSecurityGateTests } from './sprint14-4-auth-idor-security-gate.test.js';
 
 async function runAllTests() {
   console.log('===========================================================');
@@ -131,6 +132,8 @@ async function runAllTests() {
     await runSprint14_2WorkflowClosureTests();
     // Sprint 14.3 Four-Application Staging Integration & Release Candidate Tests
     await runSprint14_3StagingReleaseCandidateTests();
+    // Sprint 14.4 Authentication, IDOR & Browser Security Gate Tests
+    await runSprint14_4AuthIdorSecurityGateTests();
 
     const duration = ((Date.now() - start) / 1000).toFixed(2);
     console.log('\n===========================================================');
