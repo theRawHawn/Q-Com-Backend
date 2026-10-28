@@ -83,7 +83,7 @@ export class FinancialWebhookService {
       LIMIT 1
     `, [eventId]);
 
-    if (existingEvt.rows.length > 0 && ['PROCESSED', 'IGNORED', 'FAILED'].includes(existingEvt.rows[0].status)) {
+    if (existingEvt.rows.length > 0) {
       return {
         success: true,
         duplicate: true,
@@ -94,12 +94,24 @@ export class FinancialWebhookService {
       };
     }
 
-    // Record RECEIVED in webhook_events
-    await pool.query(`
+    // Record RECEIVED in webhook_events atomically
+    const insertRes = await pool.query(`
       INSERT INTO webhook_events (event_id, gateway, event_type, payload, status, received_at)
       VALUES ($1, $2, $3, $4, 'RECEIVED', NOW())
       ON CONFLICT (event_id) DO NOTHING
+      RETURNING id
     `, [eventId, gateway, eventType, JSON.stringify(body)]);
+
+    if (insertRes.rows.length === 0) {
+      // Event was concurrently inserted by another instance/worker
+      return {
+        success: true,
+        duplicate: true,
+        eventId,
+        eventType,
+        message: 'Concurrent duplicate webhook event detected and handled idempotently.',
+      };
+    }
 
     // Route event family
     if (eventType.startsWith('refund.')) {

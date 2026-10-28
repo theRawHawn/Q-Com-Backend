@@ -1,0 +1,81 @@
+# QCOM REST & Realtime API Contract Specification (API)
+
+**Base URL:** `http://localhost:3000/api` (Production: HTTPS)  
+**Realtime WebSocket URL:** `ws://localhost:3000/ws/v1`  
+**Authentication Scheme:** Bearer JWT (`Authorization: Bearer <accessToken>`)  
+
+---
+
+## 1. Authentication & Session Endpoints (`/api/auth`)
+
+| Path | Method | Auth Required | Description |
+| :--- | :--- | :--- | :--- |
+| `/request-otp` | POST | None | Dispatches 6-digit numeric OTP with rate limit checks |
+| `/verify-otp` | POST | None | Validates OTP and returns access token + session |
+| `/refresh-token`| POST | None | Exchanges refresh token for new access token |
+| `/logout` | POST | Bearer | Revokes current session record in `auth_sessions` |
+
+---
+
+## 2. Customer & Catalog Endpoints (`/api/catalog`, `/api/checkout`, `/api/orders`)
+
+| Path | Method | Auth Required | Description |
+| :--- | :--- | :--- | :--- |
+| `/catalog/products` | GET | None | Browse geofenced catalog products |
+| `/checkout/quote` | POST | Bearer | Calculates itemized quotation (delivery, handling, taxes) |
+| `/orders/create` | POST | Bearer | Places order with reserved inventory (Idempotency-Key support) |
+| `/orders` | GET | Bearer | Retrieves authenticated customer's order history |
+| `/orders/:id` | GET | Bearer | Retrieves single order details (IDOR protected) |
+| `/orders/:id/cancel` | POST | Bearer | Cancels unassigned/unpacked order with stock restitution |
+
+---
+
+## 3. Merchant & Store Endpoints (`/api/merchants`, `/api/seller`)
+
+| Path | Method | Roles Allowed | Description |
+| :--- | :--- | :--- | :--- |
+| `/merchants/:id/inventory` | GET | MERCHANT_ADMIN | Store inventory levels query |
+| `/merchants/:id/inventory/:productId/restock`| POST | MERCHANT_ADMIN | Restocks product and fires back-in-stock alerts |
+| `/merchants/:id/orders/:orderId/pack` | POST | MERCHANT_ADMIN | Marks order packed and ready for rider pickup |
+
+---
+
+## 4. Delivery Partner Endpoints (`/api/partner`, `/api/tasks`)
+
+| Path | Method | Roles Allowed | Description |
+| :--- | :--- | :--- | :--- |
+| `/partner/duty-status` | POST | DELIVERY_PARTNER | Toggles rider online/offline duty status |
+| `/tasks/:id/accept` | POST | DELIVERY_PARTNER | Atomically claims a broadcast trip leg |
+| `/tasks/:id/arrived-pickup`| POST | DELIVERY_PARTNER | Records arrival at merchant warehouse |
+| `/tasks/:id/pickup-confirm`| POST | DELIVERY_PARTNER | Confirms handover from merchant |
+| `/tasks/:id/verify-otp` | POST | DELIVERY_PARTNER | Completes delivery via customer OTP handshake |
+
+---
+
+## 5. Admin & Central Governance Endpoints (`/api/admin`)
+
+| Path | Method | Roles Allowed | Description |
+| :--- | :--- | :--- | :--- |
+| `/admin/me` | GET | ADMIN roles | Validates operational staff permissions |
+| `/admin/cities` | GET | ADMIN roles | Operational hub configurations |
+| `/admin/orders` | GET | ADMIN roles | Real-time global order monitor |
+| `/admin/riders` | GET | ADMIN roles | Fleet monitor and cash collection balances |
+| `/admin/sellers` | GET | ADMIN roles | Seller KYC and GSTIN compliance |
+| `/admin/settlements` | GET | ADMIN roles | Payout reconciliations and statutory withholding |
+| `/admin/audit-logs` | GET | SUPER_ADMIN | Immutable security and transaction audit trail |
+| `/admin/riders/:id/release-payout`| POST | FINANCE_ADMIN | Idempotently releases rider payout batch |
+
+---
+
+## 6. Financial Webhook Ingestion (`/api/payments/webhook`, `/api/webhooks/financial`)
+
+- **Method:** `POST`
+- **Headers:** `X-Razorpay-Signature: <hmac-sha256>`
+- **Behavior:** Validates cryptographic HMAC signature, performs durable deduplication, processes refunds/payouts in atomic database transactions, and returns HTTP 200 with `{ success: true, duplicate?: boolean }`.
+
+---
+
+## 7. Health & Telemetry Probes
+
+- `GET /health/live`: Process liveness probe (returns 200 OK).
+- `GET /health/ready`: Database connection and Redis cluster readiness check (returns 200 OK or 503 Service Unavailable).
