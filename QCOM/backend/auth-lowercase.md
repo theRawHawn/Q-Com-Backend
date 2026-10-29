@@ -1,7 +1,7 @@
 # QCOM Authentication, Authorization & Security Architecture (AUTH)
 
-**Compliance Standard:** High-Security Zero-Trust Architecture  
-**Verification Decision:** `SECURITY GATE PASSED WITH EVIDENCE` (Sprint 14.7)  
+**Compliance Standard:** High-Security Zero-Trust Architecture<br>
+**Verification Decision:** `SECURITY GATE PASSED WITH EVIDENCE` (Sprint 14.7)<br>
 **Last Audit:** Sprint 14.7 Credential Security & Password Hardening
 
 ---

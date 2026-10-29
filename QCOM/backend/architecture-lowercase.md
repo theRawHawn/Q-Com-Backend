@@ -1,10 +1,10 @@
 # QCOM Backend Architecture Specification
 
-**Architecture Style:** Modular Monolith (Single-Process, Multi-Domain Engine)  
-**Authoritative Store:** PostgreSQL 16  
-**Ephemeral / PubSub Cache:** Redis 7  
-**Gateway & Real-Time:** Express 4.x + `ws` WebSocket Server  
-**Target Environment:** Containerized Node.js (Docker / Cloud Run)  
+**Architecture Style:** Modular Monolith (Single-Process, Multi-Domain Engine)<br>
+**Authoritative Store:** PostgreSQL 16<br>
+**Ephemeral / PubSub Cache:** Redis 7<br>
+**Gateway & Real-Time:** Express 4.x + `ws` WebSocket Server<br>
+**Target Environment:** Containerized Node.js (Docker / Cloud Run)<br>
 
 ---
 
@@ -22,7 +22,7 @@ graph TD
     subgraph QCOM_Backend_Modular_Monolith [QCOM Backend Engine]
         API_GW[Express REST Router & Security Middleware]
         WS_GW[WebSocket Gateway /ws/v1]
-        
+
         subgraph Domain_Modules [Domain Modules]
             AUTH[Auth & RBAC Module]
             CAT[Catalog & Pricing]

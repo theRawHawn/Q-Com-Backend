@@ -1,8 +1,8 @@
 # QCOM Automated Testing Architecture & Suite Guide (TESTING)
 
-**Test Framework:** Node.js Native Test Runner / `tsx` Execution  
+**Test Framework:** Node.js Native Test Runner / `tsx` Execution<br>
 **Current Test Coverage:** Sprint 14.7 reports 39 passing suites; Sprint 14.8 adds rate-limit regression coverage.
-**Execution Runtime:** ~20–22 seconds for complete test battery  
+**Execution Runtime:** ~20–22 seconds for complete test battery<br>
 
 ---
 

@@ -1,8 +1,8 @@
 # QCOM REST & Realtime API Contract Specification (API)
 
-**Base URL:** `http://localhost:3000/api` (Production: HTTPS)  
-**Realtime WebSocket URL:** `ws://localhost:3000/ws/v1`  
-**Authentication Scheme:** Bearer JWT (`Authorization: Bearer <accessToken>`)  
+**Base URL:** `http://localhost:3000/api` (Production: HTTPS)<br>
+**Realtime WebSocket URL:** `ws://localhost:3000/ws/v1`<br>
+**Authentication Scheme:** Bearer JWT (`Authorization: Bearer <accessToken>`)<br>
 
 ---
 

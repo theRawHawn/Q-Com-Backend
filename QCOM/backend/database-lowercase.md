@@ -1,7 +1,7 @@
 # QCOM Database & Schema Architecture Specification (DATABASE)
 
-**Engine Requirement:** PostgreSQL 16+  
-**Migration Tool:** Custom Idempotent Advisory-Locked Migrator (`scripts/migrate.ts`)  
+**Engine Requirement:** PostgreSQL 16+<br>
+**Migration Tool:** Custom Idempotent Advisory-Locked Migrator (`scripts/migrate.ts`)<br>
 **Migrations Defined:** 001 through 025; deployed application of Migration 025 must be verified per environment.
 
 ---
@@ -40,16 +40,16 @@
 
 ## 2. Critical Database Invariants
 
-1. **Zero Oversell Invariant:**  
+1. **Zero Oversell Invariant:**<br>
    Store inventory quantity check: `CHECK (available_quantity >= 0)`. Concurrency is managed via `SELECT ... FOR UPDATE` row locks inside explicit transactions during checkout.
-2. **Double-Entry General Ledger Balance:**  
+2. **Double-Entry General Ledger Balance:**<br>
    Every `journal_batches` record must contain journal entries where:
    $$\sum \text{Debit Amounts} == \sum \text{Credit Amounts}$$
-3. **Idempotency Guarantees:**  
+3. **Idempotency Guarantees:**<br>
    - Webhook events: `UNIQUE (event_id)`.
    - Payment attempts: `UNIQUE (order_id, attempt_number)` and `UNIQUE (provider_id, provider_reference)`.
    - Payout releases: `UNIQUE (idempotency_key)`.
-4. **Advisory Lock Migrations:**  
+4. **Advisory Lock Migrations:**<br>
    Migrations use a serialized advisory lock (`SELECT pg_advisory_lock(42424242)`) to ensure multiple backend instances starting concurrently do not run race-conditioned migrations.
 5. **Outbox Worker Fencing:**
     Migration 025 leases pending events for five minutes without changing their business status. Expired claims are reclaimable; only the current, unexpired token may mark an event published or retry it. Event consumers must remain idempotent because delivery is at-least-once if a lease expires after an external side effect.
