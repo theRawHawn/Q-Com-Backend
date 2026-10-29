@@ -7,11 +7,12 @@ The backend TypeScript build and registered simulated-service test suite pass. A
 ## Environment and repository protection
 
 - Branch: `main`, tracking `origin/main`.
-- HEAD: `86669616c5cfbd4adbdb1ad18803fd00f91e680e` (unchanged).
+- Checkpoint commit: `13983e22597710607d598106dd3ebe6acb358167` (`Checkpoint Sprint 14.8 resilience and integration gate`).
+- Push: succeeded to `origin/main`; remote `refs/heads/main` was verified at the same commit.
 - Docker, Podman, PostgreSQL, Redis, and WSL executables were unavailable. Ports 5432, 55432, 6379, and 56379 had no listeners.
 - No `.github/workflows` files were found in the repository workspace.
 - The existing Compose configuration was left unchanged. A separate integration-only Compose file was added.
-- The repository had staged documentation and broad unstaged changes before this task. They were preserved; no files were staged, committed, pushed, reset, cleaned, or discarded.
+- Before checkpointing, the repository had staged documentation and broad unstaged changes. The sprint checkpoint used an explicit path list and did not include the existing staged lowercase documentation changes, `.env.example`, or the unrelated root `vite.config.ts`.
 - The staged lowercase documentation files (`api.md`, `architecture.md`, `database.md`, `testing.md`, and `auth.md`) are pre-existing staged work. Existing unstaged changes outside the Sprint 14.8.2 harness/report are not attributed to this task.
 
 ## Commands executed and results
@@ -92,11 +93,13 @@ Until these checks are completed, the PostgreSQL 16 and Redis 7 integration gate
 
 ## Final Git state
 
-Final snapshot after the report was created:
+The Sprint 14.8 checkpoint was committed as `13983e22597710607d598106dd3ebe6acb358167` and pushed successfully to `origin/main`. The remote branch was verified at that hash. The checkpoint contains 42 backend files (1,553 insertions and 233 deletions); its committed diff passes `git show --check`.
 
-- Branch: `main...origin/main`; HEAD: `86669616c5cfbd4adbdb1ad18803fd00f91e680e`.
-- Staged: 5 existing documentation files — `api.md`, `architecture.md`, `auth.md`, `database.md`, and `testing.md`; `git diff --cached --stat` reported 284 insertions and 697 deletions.
-- Unstaged tracked changes: 47 files, 915 insertions and 239 deletions. The paths are `.env.example`, `API.md`, `ARCHITECTURE.md`, `DATABASE.md`, `DEBUGGING.md`, `INTEGRATIONS.md`, `PLAN.md`, `README.md`, `TESTING.md`, `api.md`, `architecture.md`, `database.md`, `testing.md`, `package.json`, `src/app.ts`, `src/config/env.ts`, `src/database/redis.ts`, `src/middleware/rateLimiter.ts`, `src/modules/auth/authService.ts`, `src/modules/orders/orderService.ts`, `src/modules/outbox/outboxService.ts`, `src/modules/outbox/outboxTypes.ts`, `src/modules/payments/paymentProvider.ts`, `src/modules/payments/paymentService.ts`, `src/modules/payments/provider/DisabledPaymentProvider.ts`, `src/modules/payments/provider/MockPaymentProvider.ts`, `src/modules/payments/provider/PaymentProvider.ts`, `src/modules/payments/refundService.ts`, `src/routes/authRoutes.ts`, `src/routes/dispatchRoutes.ts`, `src/routes/orderRoutes.ts`, `src/routes/partnerCompatibilityRoutes.ts`, `src/routes/paymentRoutes.ts`, `src/routes/resourceDemoRoutes.ts`, `tests/app-health.test.ts`, `tests/middleware.test.ts`, `tests/sprint12-5-recovery-concurrency-and-provider-neutrality.test.ts`, `tests/sprint12-payment-provider-agnostic.test.ts`, `tests/sprint13-1-production-security-and-recovery.test.ts`, `tests/sprint13-cross-panel-integration.test.ts`, `tests/sprint14-1-real-postgresql16.test.ts`, `tests/sprint14-2-workflow-closure.test.ts`, `tests/sprint14-3-staging-release-candidate.test.ts`, `tests/sprint14-7-authentication-and-credential-security.test.ts`, `tests/sprint14-staging-validation.test.ts`, `tests/sprint8-realtime-notifications.test.ts`, and repository-root `vite.config.ts`.
-- Untracked: `SPRINT_14_8_1_BUILD_RECOVERY_REPORT.md`, `SPRINT_14_8_2_REAL_SERVICE_INTEGRATION_REPORT.md`, `SPRINT_14_8_PRODUCTION_RESILIENCE_AND_CAPACITY_REPORT.md`, `docker-compose.integration.yml`, `migrations/025_add_outbox_worker_leases.sql`, and `tests/integration/real-services.test.ts`.
-- No files were staged or committed during this task, and no push was performed. Existing modifications and untracked files were preserved.
-- `git diff --check` exited 2 for the pre-existing trailing blank line at root `vite.config.ts:23`; no new whitespace issue was observed in the Sprint 14.8.2 files.
+The follow-up update to this report records the final repository state; it will be included in a separate documentation commit and pushed after this report is corrected. At the final snapshot before that follow-up:
+
+- Branch: `main...origin/main`, at `13983e22597710607d598106dd3ebe6acb358167`.
+- Existing staged lowercase documentation remains staged: `api.md`, `architecture.md`, `auth.md`, `database.md`, and `testing.md` (284 insertions, 697 deletions). These were not included in the checkpoint.
+- Unstaged tracked changes remain in `.env.example`, uppercase `API.md`, `ARCHITECTURE.md`, `DATABASE.md`, `TESTING.md`, and root `vite.config.ts` (67 insertions, 3 deletions). They were not included in the checkpoint; in particular, the existing documentation path/case overlap was left untouched.
+- `SPRINT_14_8_PRODUCTION_RESILIENCE_AND_CAPACITY_REPORT.md` remains untracked. It was excluded from the checkpoint because its historical diff contains trailing whitespace.
+- No production deployment was performed. The real PostgreSQL 16 and Redis 7 integration gates remain open.
+- `git diff --check` reports only the pre-existing trailing blank line at root `vite.config.ts:23`; the committed checkpoint itself passes `git show --check`.
