@@ -93,9 +93,9 @@ Until these checks are completed, the PostgreSQL 16 and Redis 7 integration gate
 
 ## Final Git state
 
-The Sprint 14.8 checkpoint was committed as `13983e22597710607d598106dd3ebe6acb358167` and pushed successfully to `origin/main`. The remote branch was verified at that hash. The checkpoint contains 42 backend files (1,553 insertions and 233 deletions); its committed diff passes `git show --check`.
+The Sprint 14.8 checkpoint was committed as `13983e22597710607d598106dd3ebe6acb358167` and pushed successfully to `origin/main`. The checkpoint contains 42 backend files (1,553 insertions and 233 deletions); its committed diff passes `git show --check`. This report's repository-status update was committed separately as `02d4a215f2f53d5e06175276a7878e853133190a` and pushed to `origin/main`; the remote was verified at that hash. The local branch tracks `origin/main`.
 
-The follow-up update to this report records the final repository state; it will be included in a separate documentation commit and pushed after this report is corrected. At the final snapshot before that follow-up:
+The status details below were captured after the payload push and before the report-only update. The report-only update changed no other files:
 
 - Branch: `main...origin/main`, at `13983e22597710607d598106dd3ebe6acb358167`.
 - Existing staged lowercase documentation remains staged: `api.md`, `architecture.md`, `auth.md`, `database.md`, and `testing.md` (284 insertions, 697 deletions). These were not included in the checkpoint.
