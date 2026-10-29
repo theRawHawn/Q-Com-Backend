@@ -76,22 +76,25 @@ export class FinancialWebhookService {
 
     const pool = getPool();
 
-    // 3. Durable deduplication check: only return duplicate if event was already PROCESSED
+    // 3. Durable deduplication check: return duplicate if event was already handled (PROCESSED, IGNORED, or FAILED)
     const existingEvt = await pool.query(`
       SELECT status FROM webhook_events
       WHERE event_id = $1
       LIMIT 1
     `, [eventId]);
 
-    if (existingEvt.rows.length > 0 && existingEvt.rows[0].status === 'PROCESSED') {
-      return {
-        success: true,
-        duplicate: true,
-        eventId,
-        eventType,
-        status: existingEvt.rows[0].status,
-        message: 'Webhook event already processed (durable replay detected).',
-      };
+    if (existingEvt.rows.length > 0) {
+      const st = existingEvt.rows[0].status;
+      if (st === 'PROCESSED' || st === 'IGNORED' || st === 'FAILED') {
+        return {
+          success: true,
+          duplicate: true,
+          eventId,
+          eventType,
+          status: st,
+          message: 'Webhook event already processed (durable replay detected).',
+        };
+      }
     }
 
     // Record RECEIVED in webhook_events atomically if not present
@@ -144,14 +147,18 @@ export class FinancialWebhookService {
         FOR UPDATE
       `, [eventId]);
 
-      if (evtLock.rows.length > 0 && evtLock.rows[0].status === 'PROCESSED') {
-        return {
-          success: true,
-          duplicate: true,
-          eventId,
-          eventType,
-          message: 'Webhook event already processed (durable replay detected).',
-        };
+      if (evtLock.rows.length > 0) {
+        const st = evtLock.rows[0].status;
+        if (st === 'PROCESSED' || st === 'IGNORED' || st === 'FAILED') {
+          return {
+            success: true,
+            duplicate: true,
+            eventId,
+            eventType,
+            status: st,
+            message: 'Webhook event already processed (durable replay detected).',
+          };
+        }
       }
 
       // Correlate to persisted refund record
@@ -358,14 +365,18 @@ export class FinancialWebhookService {
         FOR UPDATE
       `, [eventId]);
 
-      if (evtLock.rows.length > 0 && evtLock.rows[0].status === 'PROCESSED') {
-        return {
-          success: true,
-          duplicate: true,
-          eventId,
-          eventType,
-          message: 'Payout webhook event already processed (durable replay detected).',
-        };
+      if (evtLock.rows.length > 0) {
+        const st = evtLock.rows[0].status;
+        if (st === 'PROCESSED' || st === 'IGNORED' || st === 'FAILED') {
+          return {
+            success: true,
+            duplicate: true,
+            eventId,
+            eventType,
+            status: st,
+            message: 'Payout webhook event already processed (durable replay detected).',
+          };
+        }
       }
 
       // 1. Correlate with seller_payouts
