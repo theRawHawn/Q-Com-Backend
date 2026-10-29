@@ -10,10 +10,13 @@
 
 | Path | Method | Auth Required | Description |
 | :--- | :--- | :--- | :--- |
-| `/request-otp` | POST | None | Dispatches 6-digit numeric OTP with rate limit checks |
-| `/verify-otp` | POST | None | Validates OTP and returns access token + session |
+| `/request-otp` | POST | None | Dispatches 6-digit numeric OTP with per-challenge salt & rate limit checks |
+| `/verify-otp` | POST | None | Validates OTP atomically (`FOR UPDATE`) and returns access token + session |
 | `/refresh-token`| POST | None | Exchanges refresh token for new access token |
 | `/logout` | POST | Bearer | Revokes current session record in `auth_sessions` |
+| `/admin/auth/login` | POST | None | Operations login with employee code & Scrypt password (5-fail lockout) |
+| `/admin/auth/set-password` | POST | Bearer (Admin) | Sets Scrypt password and revokes all active sessions for the user |
+| `/admin/auth/change-password` | POST | Bearer (Admin) | Updates Scrypt password and revokes active sessions across cluster |
 
 ---
 

@@ -1,3 +1,5 @@
+process.env.NODE_ENV = 'test';
+
 import { testMigrations } from './migrations.test.js';
 import { testSeeds } from './seeds.test.js';
 import { testConstraints } from './constraints.test.js';
@@ -37,6 +39,7 @@ import { runSprint14_3StagingReleaseCandidateTests } from './sprint14-3-staging-
 import { runSprint14_4AuthIdorSecurityGateTests } from './sprint14-4-auth-idor-security-gate.test.js';
 import { runSprint14_5PaymentIdempotencyTests } from './sprint14-5-payment-idempotency-and-integrity.test.js';
 import { runSprint14_6ScalabilityAndMultiInstanceTests } from './sprint14-6-scalability-and-multi-instance.test.js';
+import { runSprint14_7AuthenticationSecurityTests } from './sprint14-7-authentication-and-credential-security.test.js';
 
 async function runAllTests() {
   console.log('===========================================================');
@@ -140,6 +143,8 @@ async function runAllTests() {
     await runSprint14_5PaymentIdempotencyTests();
     // Sprint 14.6 Scalability, Multi-Instance Safety & Performance Baseline Tests
     await runSprint14_6ScalabilityAndMultiInstanceTests();
+    // Sprint 14.7 Authentication, Password Hashing & Credential Security Tests
+    await runSprint14_7AuthenticationSecurityTests();
 
     const duration = ((Date.now() - start) / 1000).toFixed(2);
     console.log('\n===========================================================');

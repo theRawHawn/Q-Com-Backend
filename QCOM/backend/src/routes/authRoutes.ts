@@ -26,7 +26,7 @@ const handleOtpRequest = async (req: Request, res: Response): Promise<void> => {
       success: true,
       message: 'OTP sent successfully.',
       resendAvailableAt: result.resendAvailableAt,
-      ...(result.debugOtp ? { debugOtp: result.debugOtp } : {}),
+      ...(process.env.NODE_ENV !== 'production' && result.debugOtp ? { debugOtp: result.debugOtp } : {}),
     });
   } catch (err: any) {
     res.status(400).json({
@@ -271,3 +271,37 @@ const handleAdminLogin = async (req: Request, res: Response): Promise<void> => {
 
 adminAuthRouter.post('/login', authRateLimiter, handleAdminLogin);
 adminAuthRouter.post('/session', authRateLimiter, handleAdminLogin);
+
+/**
+ * POST /auth/admin/set-password & POST /auth/admin/change-password
+ * Sets or updates admin password, validates strength, and revokes active sessions.
+ */
+adminAuthRouter.post('/set-password', authenticate, authRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  const { newPassword } = req.body;
+  if (!newPassword) {
+    res.status(400).json({ success: false, error: 'MISSING_PASSWORD', message: 'New password is required.' });
+    return;
+  }
+  try {
+    const result = await authService.adminSetPassword(req.auth!.userId, newPassword);
+    res.status(200).json(result);
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: 'PASSWORD_UPDATE_FAILED', message: err.message || 'Failed to update password.' });
+  }
+});
+adminAuthRouter.post('/change-password', authenticate, authRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  const { newPassword } = req.body;
+  if (!newPassword) {
+    res.status(400).json({ success: false, error: 'MISSING_PASSWORD', message: 'New password is required.' });
+    return;
+  }
+  try {
+    const result = await authService.adminSetPassword(req.auth!.userId, newPassword);
+    res.status(200).json(result);
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: 'PASSWORD_UPDATE_FAILED', message: err.message || 'Failed to update password.' });
+  }
+});
+
+// Also mount adminAuthRouter on authRouter for /api/auth/admin/* compatibility
+authRouter.use('/admin', adminAuthRouter);

@@ -2,7 +2,7 @@
 
 **Engine Requirement:** PostgreSQL 16+  
 **Migration Tool:** Custom Idempotent Advisory-Locked Migrator (`scripts/migrate.ts`)  
-**Migrations Applied:** 001 through 023 (Verified & Tested)  
+**Migrations Applied:** 001 through 024 (Verified & Tested)  
 
 ---
 
@@ -33,6 +33,7 @@
 | **021** | `021_create_selective_reservations_and_stock_alerts.sql` | `inventory_reservations`, `stock_alerts` |
 | **022** | `022_create_payment_attempts_and_provider_agnostic_schema.sql`| `payment_attempts` with `UNIQUE (order_id, attempt_number)` |
 | **023** | `023_add_payment_intent_recovery_leases.sql`| `payment_intent_recovery_leases` for distributed worker fencing |
+| **024** | `024_add_password_hash_and_otp_salt.sql`| `salt` on `otp_challenges`; `password_hash`, `password_updated_at`, `failed_password_attempts`, `password_locked_until` on `users` |
 
 ---
 

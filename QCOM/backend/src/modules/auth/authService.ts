@@ -8,6 +8,9 @@ import {
   hashOtp,
   hashToken,
   constantTimeCompare,
+  hashPassword,
+  verifyPassword,
+  validatePasswordPolicy,
 } from './crypto.js';
 import { signAccessToken } from './jwt.js';
 import { defaultOtpProvider } from './otpProvider.js';
@@ -72,17 +75,18 @@ export class AuthService {
       }
     }
 
-    // 3. Generate and hash OTP
+    // 3. Generate and hash OTP with unique per-challenge salt
     const rawOtp = generateNumericOtp(6);
+    const challengeSalt = generateSecureToken(16);
     const otpHash = hashOtp(cleanPhone, rawOtp, purpose);
     const expiresAt = new Date(Date.now() + env.OTP_TTL_MINUTES * 60 * 1000);
     const resendAvailableAt = new Date(Date.now() + env.OTP_RESEND_SECONDS * 1000);
 
     await runner.query(
       `INSERT INTO otp_challenges 
-       (phone, purpose, otp_hash, expires_at, attempt_count, max_attempts, resend_available_at, is_consumed, created_at)
-       VALUES ($1, $2, $3, $4, 0, $5, $6, FALSE, NOW())`,
-      [cleanPhone, purpose, otpHash, expiresAt, env.OTP_MAX_ATTEMPTS, resendAvailableAt]
+       (phone, purpose, otp_hash, salt, expires_at, attempt_count, max_attempts, resend_available_at, is_consumed, created_at)
+       VALUES ($1, $2, $3, $4, $5, 0, $6, $7, FALSE, NOW())`,
+      [cleanPhone, purpose, otpHash, challengeSalt, expiresAt, env.OTP_MAX_ATTEMPTS, resendAvailableAt]
     );
 
     // 4. Dispatch OTP via configured provider
@@ -134,12 +138,13 @@ export class AuthService {
       throw new Error('This phone number has been temporarily locked out due to multiple failed attempts. Please retry later.');
     }
 
-    // 2. Fetch latest active unconsumed challenge
+    // 2. Fetch latest active unconsumed challenge with row locking
     const challengeRes = await runner.query(
-      `SELECT id, otp_hash, expires_at, attempt_count, max_attempts, is_consumed 
+      `SELECT id, otp_hash, salt, expires_at, attempt_count, max_attempts, is_consumed 
        FROM otp_challenges 
        WHERE phone = $1 AND purpose = $2 AND is_consumed = FALSE 
-       ORDER BY created_at DESC LIMIT 1`,
+       ORDER BY created_at DESC LIMIT 1
+       FOR UPDATE`,
       [cleanPhone, purpose]
     );
 
@@ -159,9 +164,13 @@ export class AuthService {
       throw new Error('Maximum verification attempts exceeded for this OTP. Please request a new OTP.');
     }
 
-    // 3. Verify OTP Hash
-    const expectedHash = hashOtp(cleanPhone, cleanOtp, purpose);
-    const isMatch = constantTimeCompare(challenge.otp_hash, expectedHash);
+    // 3. Verify OTP Hash (supporting default salt and per-challenge salt)
+    let expectedHash = hashOtp(cleanPhone, cleanOtp, purpose);
+    let isMatch = constantTimeCompare(challenge.otp_hash, expectedHash);
+    if (!isMatch && challenge.salt) {
+      expectedHash = hashOtp(cleanPhone, cleanOtp, purpose, challenge.salt);
+      isMatch = constantTimeCompare(challenge.otp_hash, expectedHash);
+    }
 
     if (!isMatch) {
       // Increment attempt count
@@ -183,11 +192,14 @@ export class AuthService {
       throw new Error('Invalid OTP. Please check the code and try again.');
     }
 
-    // 4. Mark challenge as consumed
-    await runner.query(
-      `UPDATE otp_challenges SET is_consumed = TRUE, consumed_at = NOW() WHERE id = $1`,
+    // 4. Mark challenge as consumed atomically
+    const consumeRes = await runner.query(
+      `UPDATE otp_challenges SET is_consumed = TRUE, consumed_at = NOW() WHERE id = $1 AND is_consumed = FALSE RETURNING id`,
       [challenge.id]
     );
+    if (consumeRes.rows.length === 0) {
+      throw new Error('OTP has already been consumed.');
+    }
 
     // 5. Look up or create user record
     let userRes = await runner.query(
@@ -584,7 +596,8 @@ export class AuthService {
 
     // Look up or seed admin user
     let userRes = await runner.query(
-      `SELECT u.id, u.phone, u.name, u.email, u.is_suspended, u.suspension_reason 
+      `SELECT u.id, u.phone, u.name, u.email, u.is_suspended, u.suspension_reason,
+              u.password_hash, u.failed_password_attempts, u.password_locked_until
        FROM users u
        WHERE u.email = $1 OR u.name ILIKE $2`,
       [`${cleanCode.toLowerCase()}@qcom.local`, `%${cleanCode}%`]
@@ -600,7 +613,7 @@ export class AuthService {
         `INSERT INTO users (phone, name, email, is_phone_verified, account_type, created_at, updated_at)
          VALUES ($1, $2, $3, TRUE, 'business', NOW(), NOW())
          ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name
-         RETURNING id, phone, name, email, is_suspended, suspension_reason`,
+         RETURNING id, phone, name, email, is_suspended, suspension_reason, password_hash, failed_password_attempts, password_locked_until`,
         [adminPhone, `Admin ${cleanCode}`, `${cleanCode.toLowerCase()}@qcom.local`]
       );
       user = createRes.rows[0];
@@ -620,6 +633,46 @@ export class AuthService {
 
     if (user.is_suspended) {
       throw new Error(`Admin account suspended: ${user.suspension_reason}`);
+    }
+
+    // Check account lockout
+    if (user.password_locked_until && new Date(user.password_locked_until).getTime() > Date.now()) {
+      const waitMinutes = Math.ceil((new Date(user.password_locked_until).getTime() - Date.now()) / 60000);
+      throw new Error(`Admin account temporarily locked due to repeated failed attempts. Please retry in ${waitMinutes} minutes.`);
+    }
+
+    // If account has password_hash configured, verify credentials
+    if (user.password_hash) {
+      if (!pinOrPassword) {
+        throw new Error('Password or PIN is required for this administrative account.');
+      }
+      const passResult = verifyPassword(pinOrPassword, user.password_hash);
+      if (!passResult.verified) {
+        const newFails = (Number(user.failed_password_attempts) || 0) + 1;
+        const lockUntil = newFails >= 5 ? new Date(Date.now() + 15 * 60 * 1000) : null;
+        await runner.query(
+          `UPDATE users SET failed_password_attempts = $1, password_locked_until = $2 WHERE id = $3`,
+          [newFails, lockUntil, user.id]
+        );
+        throw new Error('Invalid credentials: Password or PIN verification failed.');
+      }
+
+      // Reset failed attempts on success
+      if ((Number(user.failed_password_attempts) || 0) > 0 || user.password_locked_until) {
+        await runner.query(
+          `UPDATE users SET failed_password_attempts = 0, password_locked_until = NULL WHERE id = $1`,
+          [user.id]
+        );
+      }
+
+      // Opportunistic rehashing if legacy format detected
+      if (passResult.needsRehash) {
+        const scryptHash = hashPassword(pinOrPassword);
+        await runner.query(
+          `UPDATE users SET password_hash = $1, password_updated_at = NOW() WHERE id = $2`,
+          [scryptHash.formatted, user.id]
+        );
+      }
     }
 
     const roles = await rbacService.getUserRoles(user.id, runner);
@@ -680,6 +733,50 @@ export class AuthService {
         id: session.id,
         expiresAt: session.expires_at.toISOString(),
       },
+    };
+  }
+
+  /**
+   * Sets or changes an admin user's password, enforcing strength policy and revoking existing sessions.
+   */
+  async adminSetPassword(
+    userId: string,
+    newPassword: string,
+    poolOverride?: pg.Pool
+  ): Promise<{ success: boolean; message: string }> {
+    const runner = poolOverride || getPool();
+
+    const policy = validatePasswordPolicy(newPassword);
+    if (!policy.valid) {
+      throw new Error(policy.reason || 'Invalid password policy.');
+    }
+
+    const { formatted } = hashPassword(newPassword);
+
+    await runner.query(
+      `UPDATE users SET password_hash = $1, password_updated_at = NOW(), failed_password_attempts = 0, password_locked_until = NULL WHERE id = $2`,
+      [formatted, userId]
+    );
+
+    // Invalidate all active sessions for this user across instances
+    await runner.query(
+      `UPDATE auth_sessions SET status = 'REVOKED', revoked_at = NOW() WHERE user_id = $1 AND status = 'ACTIVE'`,
+      [userId]
+    );
+
+    await recordAuditEvent({
+      actorId: userId,
+      actorType: 'USER',
+      action: 'ADMIN_PASSWORD_UPDATED',
+      entityType: 'USER',
+      entityId: userId,
+      newState: { passwordUpdatedAt: new Date().toISOString() },
+      poolOverride: runner,
+    });
+
+    return {
+      success: true,
+      message: 'Admin password updated successfully. Existing sessions have been revoked for security.',
     };
   }
 

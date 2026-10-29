@@ -1,6 +1,6 @@
 # QCOM Platform — Engineering Roadmap & Milestone Plan (PLAN)
 
-**Current Milestone:** Sprint 14.6 Completed  
+**Current Milestone:** Sprint 14.7 Completed  
 **Release Candidate Target:** v1.0.0-rc1  
 
 ---
@@ -17,6 +17,7 @@
 - **Sprint 14.4:** High-security authentication gate, password hashing audit, OTP rate-limiting, IDOR and object-level authorization across Customer, Seller, Rider, and Admin.
 - **Sprint 14.5:** Payment idempotency, duplicate webhook deduplication across terminal states (`PROCESSED`, `IGNORED`, `FAILED`), and financial integrity validation.
 - **Sprint 14.6:** Architecture readiness, 15 canonical Markdown specifications, multi-instance safety verification, and evidence-based performance baseline.
+- **Sprint 14.7:** Authentication, password hashing & credential security hardening: Scrypt memory-hard hashing (`$scrypt$N=16384,r=8,p=1$...`), password DoS bounds [8, 128], opportunistic legacy rehashing, admin account lockout (5 fails = 15m), cross-instance session revocation on password changes, uniform numeric OTP generation without modulo bias, per-challenge unique salts (Migration 024), atomic `FOR UPDATE` single-use OTP verification, and preserved IDOR/RBAC isolation across 39 passing test suites (100% pass rate).
 
 ---
 

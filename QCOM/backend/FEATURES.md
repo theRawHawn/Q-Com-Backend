@@ -4,6 +4,9 @@
 | :--- | :--- | :--- | :--- |
 | **Authentication** | Phone OTP Authentication | **IMPLEMENTED** | `src/modules/auth/authService.ts`, `src/routes/authRoutes.ts` |
 | **Authentication** | Session Management & Logout | **IMPLEMENTED** | `auth_sessions` table, active revocation endpoint |
+| **Authentication** | Scrypt Password Hashing & DoS Bounds | **IMPLEMENTED** | `src/modules/auth/crypto.ts`, standard crypt `$scrypt$N=16384,r=8,p=1$` |
+| **Authentication** | Account Lockout Protection | **IMPLEMENTED** | 5 failed attempts = 15m lockout on `users.password_locked_until` |
+| **Authentication** | Per-Challenge OTP Salt & Concurrency | **IMPLEMENTED** | Migration 024 (`otp_challenges.salt`), `FOR UPDATE` single-use consumption |
 | **RBAC** | Multi-Role & Tenant Isolation | **IMPLEMENTED** | `src/modules/rbac/rbacService.ts`, permission guards |
 | **Catalog** | Geofenced Product Browsing | **IMPLEMENTED** | `src/routes/pricingRoutes.ts`, coordinate bounding |
 | **Pricing Engine** | Statutory GST Tax Rules | **IMPLEMENTED** | `src/modules/pricing/pricingEngine.ts`, CGST/SGST/IGST |

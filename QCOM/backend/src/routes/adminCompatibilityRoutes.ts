@@ -307,7 +307,19 @@ adminCompatibilityRouter.get('/settlements', optionalAuthenticate, async (_req: 
  * GET /api/admin/audit-logs & GET /api/v1/admin/audit-logs
  * Immutable audit logs viewer for compliance and regulatory inspection
  */
-adminCompatibilityRouter.get('/audit-logs', optionalAuthenticate, async (_req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.get('/audit-logs', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+  if (req.auth) {
+    const hasAdminRole = req.auth.roles?.some((r: string) => ['SUPER_ADMIN', 'ADMIN', 'OPERATIONS_MANAGER', 'STAFF'].includes(r)) || req.auth.isSuperAdmin;
+    if (!hasAdminRole) {
+      res.status(403).json({
+        success: false,
+        error: 'FORBIDDEN',
+        message: 'Administrative privileges required to access audit logs.',
+      });
+      return;
+    }
+  }
+
   const pool = getPool();
   try {
     const logsRes = await pool.query(`

@@ -79,11 +79,17 @@ export const otpRateLimiter = createSlidingWindowRateLimiter({
   errorMessage: 'Too many OTP requests. Please wait 10 minutes before requesting again.',
 });
 
-// Auth endpoint rate limiter: 30 attempts per minute
+// Auth endpoint rate limiter: 30 attempts per minute per identity/IP
 export const authRateLimiter = createSlidingWindowRateLimiter({
   limit: 30,
   windowSec: 60,
+  keyGenerator: (req: Request) => {
+    const ident = req.body?.phone || req.body?.employeeCode || req.query?.phone;
+    const ip = req.ip || req.socket.remoteAddress || '127.0.0.1';
+    return ident ? `auth:${ident}` : `ip:${ip}`;
+  },
   errorMessage: 'Authentication rate limit reached. Please wait before retrying.',
+  skipInTest: true,
 });
 
 // Checkout Rate Limiter: 10 order attempts per minute
