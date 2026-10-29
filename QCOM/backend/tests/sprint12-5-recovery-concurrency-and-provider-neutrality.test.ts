@@ -65,11 +65,9 @@ export async function runSprint12_5RecoveryConcurrencyAndProviderNeutralityTests
     console.log('[Test 1] Testing Recovery Worker Candidate Selection Query (SKIP LOCKED)...');
     {
       const workerA = new FinancialRecoveryWorker({
-        workerId: 'worker_alpha_test_1',
         staleThresholdSec: 10,
         leaseDurationSec: 30,
         batchSize: 5,
-        scanIntervalMs: 60000,
       });
 
       // Insert 2 stale PROCESSING refunds
@@ -115,19 +113,15 @@ export async function runSprint12_5RecoveryConcurrencyAndProviderNeutralityTests
       `, [refundId2, `RFND_T2_${Date.now()}`, orderTest2, `IDEMP_T2_${Date.now()}`]);
 
       const worker1 = new FinancialRecoveryWorker({
-        workerId: 'worker_instance_1',
         staleThresholdSec: 5,
         leaseDurationSec: 60,
         batchSize: 10,
-        scanIntervalMs: 60000,
       });
 
       const worker2 = new FinancialRecoveryWorker({
-        workerId: 'worker_instance_2',
         staleThresholdSec: 5,
         leaseDurationSec: 60,
         batchSize: 10,
-        scanIntervalMs: 60000,
       });
 
       // Worker 1 holds active lease
@@ -153,8 +147,8 @@ export async function runSprint12_5RecoveryConcurrencyAndProviderNeutralityTests
     // -------------------------------------------------------------
     console.log('[Test 3] Testing Concurrent Payment Intent Recovery (SKIP LOCKED Order Discovery)...');
     {
-      const workerA = new FinancialRecoveryWorker({ workerId: 'worker_pay_A', staleThresholdSec: 5, batchSize: 10 });
-      const workerB = new FinancialRecoveryWorker({ workerId: 'worker_pay_B', staleThresholdSec: 5, batchSize: 10 });
+      const workerA = new FinancialRecoveryWorker({ staleThresholdSec: 5, batchSize: 10 });
+      const workerB = new FinancialRecoveryWorker({ staleThresholdSec: 5, batchSize: 10 });
 
       const testOrderId = await createTestOrder('placed', 'PENDING', 650.00);
 
@@ -199,8 +193,8 @@ export async function runSprint12_5RecoveryConcurrencyAndProviderNeutralityTests
     {
       const orderStuck = await createTestOrder('cancelled', 'REFUND_PENDING', 890.00);
 
-      const worker1 = new FinancialRecoveryWorker({ workerId: 'worker_c_1', staleThresholdSec: 5 });
-      const worker2 = new FinancialRecoveryWorker({ workerId: 'worker_c_2', staleThresholdSec: 5 });
+      const worker1 = new FinancialRecoveryWorker({ staleThresholdSec: 5 });
+      const worker2 = new FinancialRecoveryWorker({ staleThresholdSec: 5 });
 
       // Run both cycles concurrently
       await Promise.all([

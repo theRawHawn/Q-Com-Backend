@@ -73,6 +73,9 @@ export class OrderService {
     }
 
     const deliveryDest = input.deliveryLocation || input.deliveryAddress || input.jobSite;
+    if (!deliveryDest) {
+      throw new Error('DELIVERY_LOCATION_REQUIRED: A delivery location is required to place this order.');
+    }
 
     // 2. Authoritative pricing & statutory tax calculation
     const pricingQuote = await pricingEngine.calculate({

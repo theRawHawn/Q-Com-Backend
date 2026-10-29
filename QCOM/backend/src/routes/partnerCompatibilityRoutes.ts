@@ -1,7 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { getPool } from '../database/connection.js';
 import { optionalAuthenticate } from '../middleware/auth.js';
-import { deliveryTaskService } from '../modules/delivery/deliveryTaskService.js';
 import { deliveryEconomicsService } from '../modules/delivery/deliveryEconomicsService.js';
 
 export const partnerCompatibilityRouter = Router();

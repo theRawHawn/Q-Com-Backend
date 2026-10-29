@@ -9,6 +9,7 @@ import {
   sanitizationMiddleware,
   requestLoggerMiddleware,
   generalRateLimiter,
+  paymentWebhookRateLimiter,
   notFoundHandler,
   errorHandler,
 } from './middleware/index.js';
@@ -35,8 +36,11 @@ import { partnerCompatibilityRouter, tasksCompatibilityRouter } from './routes/p
 export function createApp(): Express {
   const app = express();
 
-  // 1. Trust proxy headers when deployed behind reverse proxy / load balancer
-  app.set('trust proxy', 1);
+  // Trust forwarded client addresses only from explicitly configured proxy networks.
+  const trustedProxyCidrs = env.TRUST_PROXY_CIDRS.split(',')
+    .map((cidr) => cidr.trim())
+    .filter(Boolean);
+  app.set('trust proxy', trustedProxyCidrs);
 
   // 2. Request ID & Security Headers
   app.use(requestIdMiddleware);
@@ -63,7 +67,11 @@ export function createApp(): Express {
     ],
   }));
 
-  // 4. Request Body Parsing with strict limits & rawBody retention for webhook HMAC signature validation
+  // Log admission rejections and enforce the IP guard before parsing request bodies.
+  app.use(requestLoggerMiddleware);
+  app.use(generalRateLimiter);
+
+  // Request Body Parsing with strict limits & rawBody retention for webhook HMAC signature validation
   app.use(express.json({
     limit: '2mb',
     verify: (req: any, _res, buf) => {
@@ -78,10 +86,8 @@ export function createApp(): Express {
     },
   }));
 
-  // 5. Input Sanitization, Rate Limiting & Logging
+  // Input Sanitization
   app.use(sanitizationMiddleware);
-  app.use(generalRateLimiter);
-  app.use(requestLoggerMiddleware);
 
   // 6. Base Health Check (Process Liveness Probe)
   app.get(['/health', '/health/live'], (req: Request, res: Response) => {
@@ -182,7 +188,7 @@ export function createApp(): Express {
   apiRouter.use('/orders', orderRouter);
   apiRouter.use('/payment', paymentRouter);
   apiRouter.use('/payments', paymentRouter);
-  apiRouter.post('/webhooks/razorpay', handleWebhookRequest);
+  apiRouter.post('/webhooks/razorpay', paymentWebhookRateLimiter, handleWebhookRequest);
   apiRouter.use('/invoices', invoiceRouter);
   apiRouter.use('/settlement', settlementRouter);
   apiRouter.use('/settlements', settlementRouter);

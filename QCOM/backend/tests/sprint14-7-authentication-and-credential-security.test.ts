@@ -151,6 +151,52 @@ export async function runSprint14_7AuthenticationSecurityTests(): Promise<void> 
   // Reset lockout for test cleanup
   await testDb.pool.query('UPDATE users SET failed_password_attempts = 0, password_locked_until = NULL WHERE id = $1', [adminUserId]);
 
+  const adminPasswordBeforeChange = (await testDb.pool.query(
+    'SELECT password_hash FROM users WHERE id = $1',
+    [adminUserId]
+  )).rows[0].password_hash;
+  const activeAdminSessionsBeforeChange = Number((await testDb.pool.query(
+    `SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = $1 AND status = 'ACTIVE'`,
+    [adminUserId]
+  )).rows[0].count);
+
+  const rejectedPasswordChange = await apiCall(baseUrl1, '/api/auth/admin/change-password', {
+    method: 'POST',
+    token: newAdminToken,
+    body: {
+      currentPassword: 'IncorrectCurrentPassword2026!',
+      newPassword: 'UpdatedSecurityAdminPass2026!',
+    },
+  });
+  assert.strictEqual(rejectedPasswordChange.status, 400, 'Incorrect current password must be rejected');
+  const adminAfterRejectedChange = (await testDb.pool.query(
+    'SELECT password_hash FROM users WHERE id = $1',
+    [adminUserId]
+  )).rows[0].password_hash;
+  const activeAdminSessionsAfterRejectedChange = Number((await testDb.pool.query(
+    `SELECT COUNT(*) AS count FROM auth_sessions WHERE user_id = $1 AND status = 'ACTIVE'`,
+    [adminUserId]
+  )).rows[0].count);
+  assert.strictEqual(adminAfterRejectedChange, adminPasswordBeforeChange, 'Rejected password change must not update the password hash');
+  assert.strictEqual(activeAdminSessionsAfterRejectedChange, activeAdminSessionsBeforeChange, 'Rejected password change must not revoke sessions');
+
+  const changedPassword = await apiCall(baseUrl1, '/api/auth/admin/change-password', {
+    method: 'POST',
+    token: newAdminToken,
+    body: {
+      currentPassword: 'MasterSecurityAdminPass2026!',
+      newPassword: 'UpdatedSecurityAdminPass2026!',
+    },
+  });
+  assert.strictEqual(changedPassword.status, 200, 'Authorized administrator may change password with the correct current password');
+  const revokedAfterChange = await apiCall(baseUrl1, '/api/admin/me', { token: newAdminToken });
+  assert.strictEqual(revokedAfterChange.status, 401, 'Changing password must revoke active administrator sessions');
+  const updatedAdminLogin = await apiCall(baseUrl1, '/api/auth/admin/login', {
+    method: 'POST',
+    body: { employeeCode: 'EMP-001', password: 'UpdatedSecurityAdminPass2026!' },
+  });
+  assert.strictEqual(updatedAdminLogin.status, 200, 'Updated administrator password must authenticate');
+
   console.log('✓ Section 2 Passed: Admin password lifecycle, session revocation, and lockout protection verified.');
 
   // ---------------------------------------------------------------------------
@@ -167,6 +213,17 @@ export async function runSprint14_7AuthenticationSecurityTests(): Promise<void> 
 
   // 3.2 Request OTP with Unique Salt
   const testPhone = '+91-9876543219';
+  for (const endpoint of [
+    '/api/auth/admin/set-password',
+    '/api/auth/admin/change-password',
+  ]) {
+    const unauthenticated = await apiCall(baseUrl1, endpoint, {
+      method: 'POST',
+      body: { currentPassword: 'CurrentPassword2026!', newPassword: 'NewPassword2026!' },
+    });
+    assert.strictEqual(unauthenticated.status, 401, `${endpoint} must reject unauthenticated requests`);
+  }
+
   const reqOtp = await apiCall(baseUrl1, '/api/auth/request-otp', {
     method: 'POST',
     body: { phone: testPhone, role: 'CUSTOMER' },
@@ -185,6 +242,74 @@ export async function runSprint14_7AuthenticationSecurityTests(): Promise<void> 
   });
   assert.strictEqual(verifyRes.status, 200, 'Valid OTP must verify');
   const customerToken = verifyRes.data.accessToken;
+
+  const customerRecord = (await testDb.pool.query(
+    'SELECT id, password_hash FROM users WHERE phone = $1',
+    [testPhone]
+  )).rows[0];
+  for (const endpoint of [
+    '/api/auth/admin/set-password',
+    '/api/auth/admin/change-password',
+  ]) {
+    const customerDenied = await apiCall(baseUrl1, endpoint, {
+      method: 'POST',
+      token: customerToken,
+      body: {
+        currentPassword: 'CurrentPassword2026!',
+        newPassword: 'UnauthorizedAdminPassword2026!',
+      },
+    });
+    assert.strictEqual(customerDenied.status, 403, `Customer role must not access ${endpoint}`);
+  }
+  const customerAfterDeniedChanges = (await testDb.pool.query(
+    'SELECT password_hash FROM users WHERE id = $1',
+    [customerRecord.id]
+  )).rows[0].password_hash;
+  assert.strictEqual(customerAfterDeniedChanges, customerRecord.password_hash, 'Rejected customer requests must not change password state');
+
+  const deliveryPhone = '+91-9876543288';
+  const deliveryOtpRequest = await apiCall(baseUrl1, '/api/auth/request-otp', {
+    method: 'POST',
+    body: { phone: deliveryPhone },
+  });
+  const deliveryOtpVerify = await apiCall(baseUrl1, '/api/auth/verify-otp', {
+    method: 'POST',
+    body: { phone: deliveryPhone, otp: deliveryOtpRequest.data.debugOtp || '123456' },
+  });
+  assert.strictEqual(deliveryOtpVerify.status, 200, 'Delivery partner test identity must authenticate');
+  const deliveryToken = deliveryOtpVerify.data.accessToken;
+  const deliveryRecord = (await testDb.pool.query(
+    'SELECT id, password_hash FROM users WHERE phone = $1',
+    [deliveryPhone]
+  )).rows[0];
+  const riderRole = (await testDb.pool.query(
+    `SELECT id FROM roles WHERE code = 'RIDER'`
+  )).rows[0];
+  await testDb.pool.query(
+    `INSERT INTO user_roles (user_id, role_id, assigned_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (user_id, role_id) DO NOTHING`,
+    [deliveryRecord.id, riderRole.id]
+  );
+  for (const endpoint of [
+    '/api/auth/admin/set-password',
+    '/api/auth/admin/change-password',
+  ]) {
+    const deliveryDenied = await apiCall(baseUrl1, endpoint, {
+      method: 'POST',
+      token: deliveryToken,
+      body: {
+        currentPassword: 'CurrentPassword2026!',
+        newPassword: 'UnauthorizedAdminPassword2026!',
+      },
+    });
+    assert.strictEqual(deliveryDenied.status, 403, `Delivery partner role must not access ${endpoint}`);
+  }
+  const deliveryAfterDeniedChanges = (await testDb.pool.query(
+    'SELECT password_hash FROM users WHERE id = $1',
+    [deliveryRecord.id]
+  )).rows[0].password_hash;
+  assert.strictEqual(deliveryAfterDeniedChanges, deliveryRecord.password_hash, 'Rejected delivery partner requests must not change password state');
 
   // 3.4 Replay attack on consumed OTP must fail
   const replayRes = await apiCall(baseUrl1, '/api/auth/verify-otp', {

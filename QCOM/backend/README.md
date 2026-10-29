@@ -11,7 +11,7 @@ QCOM is an enterprise-grade backend platform powering a 10-to-20 minute quick-co
 | [PRD.md](./PRD.md) | Product requirements, business domain, and applications |
 | [DESIGN.md](./DESIGN.md) | Architectural choices, trade-offs, and domain design |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | Component inventory, topology, and scaling strategy |
-| [DATABASE.md](./DATABASE.md) | PostgreSQL 16 schema, migrations (001-023), and invariants |
+| [DATABASE.md](./DATABASE.md) | PostgreSQL 16 schema, migrations (001-025), and invariants |
 | [API.md](./API.md) | HTTP and WebSocket API contracts and error schemas |
 | [AUTH.md](./AUTH.md) | Authentication flows, session lifecycle, and IDOR protection |
 | [PLAN.md](./PLAN.md) | Engineering milestones and forward roadmap |
@@ -30,13 +30,14 @@ QCOM is an enterprise-grade backend platform powering a 10-to-20 minute quick-co
 ### 1. Prerequisites
 - Node.js v20+ / v22+
 - PostgreSQL 16
-- Redis 7 (optional for local dev, fallback to in-memory)
+- Redis 7 (optional for local development; production security-sensitive rate limits require distributed Redis)
 
 ### 2. Environment Configuration
 Copy `.env.example` to `.env` and configure your database target:
 ```bash
 cp .env.example .env
 ```
+When running behind a reverse proxy, set `TRUST_PROXY_CIDRS` to a comma-separated list of the proxy's exact IPs/CIDRs. Leave it empty for direct connections; arbitrary `X-Forwarded-For` headers are not trusted.
 
 ### 3. Database Migration & Seeding
 ```bash

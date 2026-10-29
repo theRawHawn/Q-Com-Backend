@@ -78,35 +78,46 @@ export class OutboxService {
     clientOverride?: pg.PoolClient
   ): Promise<OutboxEvent[]> {
     const execute = async (client: pg.PoolClient) => {
-      // Use FOR UPDATE to prevent race conditions across parallel relayer workers
-      let query = `
-        SELECT id, event_type, aggregate_type, aggregate_id, payload,
-               status, attempt_count, next_attempt_at, created_at, published_at, last_error
+      const baseQuery = `
+        SELECT id
         FROM outbox_events
-        WHERE status = 'PENDING' AND next_attempt_at <= NOW()
+        WHERE status = 'PENDING'
+          AND next_attempt_at <= NOW()
+          AND (lease_token IS NULL OR lease_expires_at <= NOW())
         ORDER BY created_at ASC
         LIMIT $1
-        FOR UPDATE
       `;
 
-      // Try FOR UPDATE SKIP LOCKED for high-throughput concurrency
+      let candidates;
       try {
-        const testRes = await client.query(
-          `SELECT id, event_type, aggregate_type, aggregate_id, payload,
-                  status, attempt_count, next_attempt_at, created_at, published_at, last_error
-           FROM outbox_events
-           WHERE status = 'PENDING' AND next_attempt_at <= NOW()
-           ORDER BY created_at ASC
-           LIMIT $1
-           FOR UPDATE SKIP LOCKED`,
-          [batchSize]
-        );
-        return this.mapRowsToEvents(testRes.rows);
-      } catch {
-        // Fallback to standard FOR UPDATE if SKIP LOCKED not supported by dialect/mock
-        const fallbackRes = await client.query(query, [batchSize]);
-        return this.mapRowsToEvents(fallbackRes.rows);
+        candidates = await client.query(`${baseQuery} FOR UPDATE SKIP LOCKED`, [batchSize]);
+      } catch (err: any) {
+        const message = (err?.message || '').toLowerCase();
+        if (!message.includes('skip locked') && !message.includes('syntax error')) {
+          throw err;
+        }
+        candidates = await client.query(`${baseQuery} FOR UPDATE`, [batchSize]);
       }
+
+      const claimed: OutboxEvent[] = [];
+      for (const candidate of candidates.rows) {
+        const leaseToken = crypto.randomUUID();
+        const claim = await client.query(
+          `UPDATE outbox_events
+           SET lease_token = $1,
+               lease_expires_at = NOW() + interval '5 minutes'
+           WHERE id = $2
+             AND status = 'PENDING'
+             AND next_attempt_at <= NOW()
+             AND (lease_token IS NULL OR lease_expires_at <= NOW())
+           RETURNING id, event_type, aggregate_type, aggregate_id, payload,
+                     status, attempt_count, next_attempt_at, created_at,
+                     published_at, last_error, lease_token`,
+          [leaseToken, candidate.id]
+        );
+        claimed.push(...this.mapRowsToEvents(claim.rows));
+      }
+      return claimed;
     };
 
     if (clientOverride) {
@@ -118,14 +129,23 @@ export class OutboxService {
   /**
    * Marks an outbox event as PUBLISHED after successful delivery to consumers.
    */
-  public async markPublished(eventId: string, clientOverride?: pg.PoolClient): Promise<void> {
+  public async markPublished(
+    eventId: string,
+    leaseToken: string,
+    clientOverride?: pg.PoolClient
+  ): Promise<void> {
     const runner = clientOverride || getPool();
-    await runner.query(
+    const result = await runner.query(
       `UPDATE outbox_events
-       SET status = 'PUBLISHED', published_at = NOW(), last_error = NULL
-       WHERE id = $1`,
-      [eventId]
+       SET status = 'PUBLISHED', published_at = NOW(), last_error = NULL,
+           lease_token = NULL, lease_expires_at = NULL
+       WHERE id = $1 AND status = 'PENDING' AND lease_token = $2
+         AND lease_expires_at > NOW()`,
+      [eventId, leaseToken]
     );
+    if (result.rowCount !== 1) {
+      throw new Error('OUTBOX_LEASE_LOST');
+    }
   }
 
   /**
@@ -135,37 +155,52 @@ export class OutboxService {
   public async markFailed(
     eventId: string,
     error: string,
-    clientOverride?: pg.PoolClient
+    clientOverride?: pg.PoolClient,
+    leaseToken?: string
   ): Promise<void> {
     const runner = clientOverride || getPool();
     const eventRes = await runner.query(
-      `SELECT attempt_count FROM outbox_events WHERE id = $1`,
-      [eventId]
+      leaseToken
+        ? `SELECT attempt_count FROM outbox_events
+           WHERE id = $1 AND status = 'PENDING' AND lease_token = $2
+             AND lease_expires_at > NOW()`
+        : `SELECT attempt_count FROM outbox_events WHERE id = $1`,
+      leaseToken ? [eventId, leaseToken] : [eventId]
     );
 
-    if (eventRes.rows.length === 0) return;
+    if (eventRes.rows.length === 0) {
+      if (leaseToken) throw new Error('OUTBOX_LEASE_LOST');
+      return;
+    }
 
     const currentAttempts = (eventRes.rows[0].attempt_count || 0) + 1;
     if (currentAttempts >= this.maxAttempts) {
-      await runner.query(
+      const result = await runner.query(
         `UPDATE outbox_events
-         SET status = 'DEAD_LETTER', attempt_count = $1, last_error = $2
-         WHERE id = $3`,
-        [currentAttempts, error, eventId]
+         SET status = 'DEAD_LETTER', attempt_count = $1, last_error = $2,
+             lease_token = NULL, lease_expires_at = NULL
+         WHERE id = $3${leaseToken ? ' AND lease_token = $4 AND lease_expires_at > NOW()' : ''}`,
+        leaseToken ? [currentAttempts, error, eventId, leaseToken] : [currentAttempts, error, eventId]
       );
+      if (leaseToken && result.rowCount !== 1) throw new Error('OUTBOX_LEASE_LOST');
     } else {
       // Exponential backoff with FULL JITTER: random(0, min(300s, 1s * 2^attempts))
       const delayMs = Math.max(1000, calculateFullJitterDelay(currentAttempts, 1000, 300000));
       const nextAttemptAt = new Date(Date.now() + delayMs);
-      await runner.query(
+      const result = await runner.query(
         `UPDATE outbox_events
          SET status = 'PENDING',
              attempt_count = $1,
              last_error = $2,
-             next_attempt_at = $3
-         WHERE id = $4`,
-        [currentAttempts, error, nextAttemptAt, eventId]
+             next_attempt_at = $3,
+             lease_token = NULL,
+             lease_expires_at = NULL
+         WHERE id = $4${leaseToken ? ' AND lease_token = $5 AND lease_expires_at > NOW()' : ''}`,
+        leaseToken
+          ? [currentAttempts, error, nextAttemptAt, eventId, leaseToken]
+          : [currentAttempts, error, nextAttemptAt, eventId]
       );
+      if (leaseToken && result.rowCount !== 1) throw new Error('OUTBOX_LEASE_LOST');
     }
   }
 
@@ -223,10 +258,18 @@ export class OutboxService {
           await handler(evt);
         }
 
-        await this.markPublished(evt.id);
+        if (!evt.leaseToken) {
+          throw new Error('OUTBOX_LEASE_MISSING');
+        }
+        await this.markPublished(evt.id, evt.leaseToken);
         succeeded++;
       } catch (err: any) {
-        await this.markFailed(evt.id, err.message || 'Unknown handler execution error');
+        await this.markFailed(
+          evt.id,
+          err.message || 'Unknown handler execution error',
+          undefined,
+          evt.leaseToken
+        );
         failed++;
       }
     }
@@ -273,6 +316,7 @@ export class OutboxService {
       publishedAt: row.published_at ? (row.published_at instanceof Date ? row.published_at.toISOString() : row.published_at) : undefined,
       attemptCount: row.attempt_count,
       nextAttemptAt: row.next_attempt_at instanceof Date ? row.next_attempt_at.toISOString() : row.next_attempt_at,
+      leaseToken: row.lease_token || undefined,
       lastError: row.last_error || undefined,
       status: row.status,
     }));
@@ -350,4 +394,3 @@ export function registerCoreOutboxConsumers(options?: {
     await stockNotificationConsumer.handleStockAlert(event.payload);
   });
 }
-

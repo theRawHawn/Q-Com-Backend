@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { dispatchService } from '../modules/dispatch/dispatchService.js';
 import { getPool } from '../database/connection.js';
 import { authenticate } from '../middleware/auth.js';
+import { dispatchActionRateLimiter } from '../middleware/rateLimiter.js';
 
 export const dispatchRouter = Router();
 
@@ -115,7 +116,7 @@ function requireExpireAuthorized(req: Request, res: Response, next: NextFunction
 /**
  * POST /api/v1/dispatch/assign & POST /api/dispatch/assign
  */
-dispatchRouter.post('/assign', authenticate, requireDispatchManagement, async (req: Request, res: Response): Promise<void> => {
+dispatchRouter.post('/assign', authenticate, dispatchActionRateLimiter, requireDispatchManagement, async (req: Request, res: Response): Promise<void> => {
   const pool = getPool();
   const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
   const cleanKey = idempotencyKey && typeof idempotencyKey === 'string' ? idempotencyKey.trim().slice(0, 120) : undefined;
@@ -279,7 +280,7 @@ dispatchRouter.get('/assignments/:assignmentId', authenticate, async (req: Reque
 /**
  * POST /api/v1/dispatch/offers/:offerId/accept
  */
-dispatchRouter.post('/offers/:offerId/accept', authenticate, requireRiderOrDispatchAdmin, async (req: Request, res: Response): Promise<void> => {
+dispatchRouter.post('/offers/:offerId/accept', authenticate, dispatchActionRateLimiter, requireRiderOrDispatchAdmin, async (req: Request, res: Response): Promise<void> => {
   try {
     const { offerId } = req.params;
     const riderId = req.body?.riderId || req.auth?.riderId;
@@ -370,7 +371,7 @@ dispatchRouter.post('/offers/:offerId/expire', authenticate, requireExpireAuthor
 /**
  * POST /api/v1/dispatch/assignments/:assignmentId/rematch
  */
-dispatchRouter.post('/assignments/:assignmentId/rematch', authenticate, requireDispatchManagement, async (req: Request, res: Response): Promise<void> => {
+dispatchRouter.post('/assignments/:assignmentId/rematch', authenticate, dispatchActionRateLimiter, requireDispatchManagement, async (req: Request, res: Response): Promise<void> => {
   try {
     const { assignmentId } = req.params;
     const result = await dispatchService.rematchOrder(assignmentId);

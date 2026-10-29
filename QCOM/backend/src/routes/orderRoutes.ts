@@ -6,6 +6,7 @@ import { authenticate } from '../middleware/auth.js';
 import { requireRole } from '../middleware/rbac.js';
 import { requireOrderOwnership } from '../middleware/resourceOwnership.js';
 import { getPool } from '../database/connection.js';
+import { checkoutRateLimiter } from '../middleware/rateLimiter.js';
 
 import { inventoryService } from '../modules/inventory/inventoryService.js';
 
@@ -80,7 +81,7 @@ function isDatabaseUnavailable(err: any): boolean {
 /**
  * POST /api/orders/create & POST /api/v1/orders/create
  */
-orderRouter.post('/create', authenticate, async (req: Request, res: Response): Promise<void> => {
+orderRouter.post('/create', authenticate, checkoutRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const pool = getPool();
   const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
   const cleanKey = idempotencyKey && typeof idempotencyKey === 'string' ? idempotencyKey.trim().slice(0, 120) : undefined;

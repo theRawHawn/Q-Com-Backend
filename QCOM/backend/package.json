@@ -9,6 +9,7 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc --noEmit",
     "test": "tsx tests/run-all-tests.ts",
+    "test:integration:real-services": "tsx tests/integration/real-services.test.ts",
     "db:migrate": "tsx scripts/migrate.ts",
     "db:seed": "tsx scripts/seed.ts"
   },

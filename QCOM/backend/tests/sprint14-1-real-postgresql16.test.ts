@@ -10,7 +10,7 @@ import { createApp } from '../src/app.js';
 import { setPool, getPool, query, transaction, checkDatabaseHealth, closePool } from '../src/database/connection.js';
 import { runMigrations, ensureMigrationTable, getMigrationFiles } from '../src/database/migrator.js';
 import { runSeeds } from '../seeds/seedData.js';
-import { validateProductionSecurity } from '../src/config/production-security.js';
+import { validateProductionSecurity } from '../src/config/env.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

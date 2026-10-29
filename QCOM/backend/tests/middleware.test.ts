@@ -11,6 +11,18 @@ import { inMemoryStore } from '../src/database/redis.js';
 
 export async function testMiddleware() {
   console.log('\n--- Running Core Middleware Test Suite ---');
+  const createMockReqRes = () => {
+    const req: any = { baseUrl: '/api', path: '/test', ip: '127.0.0.1', socket: {} };
+    const res: any = {
+      statusCode: 200,
+      headers: {},
+      setHeader(k: string, v: string) { this.headers[k] = v; },
+      status(code: number) { this.statusCode = code; return this; },
+      body: null,
+      json(payload: any) { this.body = payload; return this; },
+    };
+    return { req, res };
+  };
 
   // 1. Request ID Middleware
   {
@@ -91,19 +103,6 @@ export async function testMiddleware() {
       errorMessage: 'Rate limit exceeded in test',
     });
 
-    const createMockReqRes = () => {
-      const req: any = { baseUrl: '/api', path: '/test', ip: '127.0.0.1', socket: {} };
-      const res: any = {
-        statusCode: 200,
-        headers: {},
-        setHeader(k: string, v: string) { this.headers[k] = v; },
-        status(code: number) { this.statusCode = code; return this; },
-        body: null,
-        json(payload: any) { this.body = payload; return this; },
-      };
-      return { req, res };
-    };
-
     // Requests 1, 2, 3 should succeed
     for (let i = 1; i <= 3; i++) {
       const { req, res } = createMockReqRes();
@@ -123,6 +122,59 @@ export async function testMiddleware() {
     assert.equal(blockedRes.body.error.code, 'RATE_LIMIT_EXCEEDED');
     assert.ok(blockedRes.headers['Retry-After']);
     console.log('✓ Sliding-window rate limiter (allowing up to limit, rejecting at 429) verified');
+  }
+
+  // 5. Concurrent requests share both identity and source-IP limits.
+  {
+    inMemoryStore.clear();
+    const concurrentLimiter = createSlidingWindowRateLimiter({
+      limit: 30,
+      windowSec: 60,
+      keyGenerator: (req: any) => [
+        { key: `identity:${req.identity}` },
+        { key: 'ip:shared', limit: 7 },
+      ],
+      scope: 'test:concurrent',
+    });
+
+    const attempts = await Promise.all(Array.from({ length: 20 }, async (_, index) => {
+      const { req, res } = createMockReqRes();
+      req.identity = `identity-${index}`;
+      let nextCalled = false;
+      await concurrentLimiter(req, res, () => { nextCalled = true; });
+      return { nextCalled, statusCode: res.statusCode };
+    }));
+
+    assert.equal(attempts.filter((attempt) => attempt.nextCalled).length, 7);
+    assert.equal(attempts.filter((attempt) => attempt.statusCode === 429).length, 13);
+    console.log('✓ Concurrent identity/IP limits reject requests at the shared-IP threshold');
+  }
+
+  // 6. Critical limiters fail closed with a safe response when coordination is unavailable.
+  {
+    const unavailableLimiter = createSlidingWindowRateLimiter(
+      { limit: 1, windowSec: 60 },
+      async () => { throw new Error('private Redis connection details'); }
+    );
+    const { req, res } = createMockReqRes();
+    let nextCalled = false;
+    await unavailableLimiter(req, res, () => { nextCalled = true; });
+
+    assert.equal(nextCalled, false);
+    assert.equal(res.statusCode, 503);
+    assert.equal(res.body.error.code, 'RATE_LIMIT_UNAVAILABLE');
+    assert.equal(JSON.stringify(res.body).includes('private Redis connection details'), false);
+
+    const availabilityLimiter = createSlidingWindowRateLimiter(
+      { limit: 120, windowSec: 60, failureMode: 'open' },
+      async () => { throw new Error('private Redis connection details'); }
+    );
+    const openResult = createMockReqRes();
+    let openNextCalled = false;
+    await availabilityLimiter(openResult.req, openResult.res, () => { openNextCalled = true; });
+    assert.equal(openNextCalled, true);
+    assert.equal(openResult.res.headers['X-RateLimit-Status'], 'unavailable');
+    console.log('✓ Limiter outages fail closed for critical routes and are explicitly surfaced for general admission');
   }
 
   // 5. Error Handler

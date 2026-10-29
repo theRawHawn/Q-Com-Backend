@@ -62,11 +62,16 @@ export interface PaymentProvider {
    * Initiates a refund through the provider with idempotency protection
    */
   createRefund(params: ProviderRefundRequest): Promise<ProviderRefundResult>;
+  getRefundByIdempotencyKey?(idempotencyKey: string): Promise<ProviderRefundResult | null>;
 
   /**
    * Inquires refund status from provider
    */
-  getRefundStatus(providerRefundId: string): Promise<ProviderRefundResult>;
+  getRefundStatus(providerRefundId: string): Promise<{
+    providerRefundId: string;
+    status: 'PROCESSED' | 'PENDING' | 'FAILED' | 'RECONCILIATION_REQUIRED';
+    amount: number;
+  }>;
 
   /**
    * Normalizes provider-specific error codes into standardized QCOM categories

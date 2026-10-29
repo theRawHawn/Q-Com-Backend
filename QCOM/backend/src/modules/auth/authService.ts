@@ -742,7 +742,8 @@ export class AuthService {
   async adminSetPassword(
     userId: string,
     newPassword: string,
-    poolOverride?: pg.Pool
+    poolOverride?: pg.Pool,
+    expectedCurrentHash?: string
   ): Promise<{ success: boolean; message: string }> {
     const runner = poolOverride || getPool();
 
@@ -753,10 +754,18 @@ export class AuthService {
 
     const { formatted } = hashPassword(newPassword);
 
-    await runner.query(
-      `UPDATE users SET password_hash = $1, password_updated_at = NOW(), failed_password_attempts = 0, password_locked_until = NULL WHERE id = $2`,
-      [formatted, userId]
+    const updateResult = await runner.query(
+      `UPDATE users
+       SET password_hash = $1, password_updated_at = NOW(),
+           failed_password_attempts = 0, password_locked_until = NULL
+       WHERE id = $2${expectedCurrentHash !== undefined ? ' AND password_hash = $3' : ''}`,
+      expectedCurrentHash !== undefined
+        ? [formatted, userId, expectedCurrentHash]
+        : [formatted, userId]
     );
+    if (expectedCurrentHash !== undefined && updateResult.rowCount !== 1) {
+      throw new Error('Current password is incorrect.');
+    }
 
     // Invalidate all active sessions for this user across instances
     await runner.query(
@@ -778,6 +787,29 @@ export class AuthService {
       success: true,
       message: 'Admin password updated successfully. Existing sessions have been revoked for security.',
     };
+  }
+
+  async adminChangePassword(
+    userId: string,
+    currentPassword: string,
+    newPassword: string,
+    poolOverride?: pg.Pool
+  ): Promise<{ success: boolean; message: string }> {
+    const runner = poolOverride || getPool();
+    const userRes = await runner.query(
+      `SELECT password_hash FROM users WHERE id = $1`,
+      [userId]
+    );
+    const currentHash = userRes.rows[0]?.password_hash;
+    if (
+      typeof currentPassword !== 'string'
+      || typeof currentHash !== 'string'
+      || !verifyPassword(currentPassword, currentHash).verified
+    ) {
+      throw new Error('Current password is incorrect.');
+    }
+
+    return this.adminSetPassword(userId, newPassword, runner, currentHash);
   }
 
   /**

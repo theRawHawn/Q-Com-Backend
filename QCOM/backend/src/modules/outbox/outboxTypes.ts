@@ -10,6 +10,7 @@ export interface OutboxEvent {
   publishedAt?: string;
   attemptCount: number;
   nextAttemptAt: string;
+  leaseToken?: string;
   lastError?: string;
   status: OutboxStatus;
 }

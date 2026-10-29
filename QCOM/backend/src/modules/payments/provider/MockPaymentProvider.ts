@@ -457,6 +457,10 @@ export class MockPaymentProvider implements PaymentProvider {
     };
   }
 
+  public async getRefundByIdempotencyKey(idempotencyKey: string): Promise<ProviderRefundResult | null> {
+    return this.refundsByIdempotency.get(idempotencyKey) || null;
+  }
+
   public normalizeError(error: any): NormalizedProviderError {
     const msg = (error?.message || '').toLowerCase();
     const code = (error?.code || '').toUpperCase();

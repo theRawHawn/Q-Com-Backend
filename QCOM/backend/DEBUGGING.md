@@ -45,3 +45,10 @@
 
 **Never log raw passwords, OTP codes, bearer tokens, session keys, or payment gateway secrets.**  
 All system logs must sanitize authorization headers and sensitive payload fields before writing to output streams.
+
+## 4. Rate-Limiter Degradation
+
+- `429 RATE_LIMIT_EXCEEDED`: inspect the route's `Retry-After` header and verify whether the client is retrying across equivalent aliases, which share a policy scope.
+- `503 RATE_LIMIT_UNAVAILABLE`: Redis could not enforce a security-sensitive distributed limit. Check Redis connectivity and latency; do not disable the fail-closed route policy to restore traffic.
+- `X-RateLimit-Status: unavailable`: Redis is unavailable for the general availability guard, which is intentionally fail-open. Sensitive endpoint guards still reject requests if their distributed check fails.
+- Check `TRUST_PROXY_CIDRS` against the actual ingress peer addresses. If unset, `X-Forwarded-For` is ignored and rate limiting uses the direct peer address.

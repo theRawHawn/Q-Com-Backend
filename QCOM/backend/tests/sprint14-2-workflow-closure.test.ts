@@ -377,14 +377,19 @@ export async function runSprint14_2WorkflowClosureTests(): Promise<void> {
 
   // Test that simulated connection failure is handled safely
   const deadPool = new pg.Pool({ connectionString: 'postgres://qcom_user:wrong_pass@localhost:5432/non_existent_db', connectionTimeoutMillis: 500 });
+  let connectionFailed = false;
   try {
     await deadPool.query('SELECT 1');
-    assert.fail('Dead pool query must throw');
   } catch (err: any) {
-    assert.ok(err.message, 'Database connection failure correctly raised observable exception');
+    connectionFailed = true;
+    assert.ok(
+      typeof err?.message === 'string' || typeof err?.code === 'string',
+      'Database connection failure must expose an error message or code'
+    );
   } finally {
     await deadPool.end();
   }
+  assert.equal(connectionFailed, true, 'Dead pool query must throw');
   console.log('✓ Workflow H (Database Outage & Health Fail-Safe) verified.');
 
   await new Promise<void>((resolve) => server.close(() => resolve()));

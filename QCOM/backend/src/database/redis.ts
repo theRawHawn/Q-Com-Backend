@@ -1,4 +1,5 @@
 import { Redis } from 'ioredis';
+import { randomUUID } from 'node:crypto';
 import { env } from '../config/env.js';
 
 let redisClient: Redis | null = null;
@@ -106,7 +107,7 @@ class InMemoryCacheStore {
 
     timestamps.push(now);
     this.requestLogs.set(key, timestamps);
-    const resetSec = windowSec;
+    const resetSec = Math.max(1, Math.ceil((timestamps[0] + windowMs - now) / 1000));
     return { allowed: true, remaining: limit - timestamps.length, resetSec };
   }
 
@@ -406,27 +407,47 @@ export async function slidingWindowRateLimit(
   if (client && isRedisConnected) {
     try {
       const now = Date.now();
-      const clearBefore = now - windowSec * 1000;
+      const script = `
+        local now = tonumber(ARGV[1])
+        local window_ms = tonumber(ARGV[2])
+        local limit = tonumber(ARGV[3])
+        redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - window_ms)
+        local count = redis.call('ZCARD', KEYS[1])
+        if count >= limit then
+          local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+          local reset_sec = math.max(1, math.ceil((tonumber(oldest[2]) + window_ms - now) / 1000))
+          return {0, 0, reset_sec}
+        end
+        redis.call('ZADD', KEYS[1], now, ARGV[4])
+        redis.call('PEXPIRE', KEYS[1], window_ms)
+        return {1, limit - count - 1, tonumber(ARGV[5])}
+      `;
+      const result = await client.eval(
+        script,
+        1,
+        fullKey,
+        now.toString(),
+        (windowSec * 1000).toString(),
+        limit.toString(),
+        randomUUID(),
+        windowSec.toString()
+      ) as number[];
 
-      const pipeline = client.pipeline();
-      pipeline.zremrangebyscore(fullKey, 0, clearBefore);
-      pipeline.zadd(fullKey, now.toString(), `${now}-${Math.random()}`);
-      pipeline.zcard(fullKey);
-      pipeline.expire(fullKey, windowSec);
-
-      const results = await pipeline.exec();
-      const currentCount = (results?.[2]?.[1] as number) || 0;
-
-      if (currentCount > limit) {
-        return { allowed: false, remaining: 0, resetSec: windowSec };
-      }
-      return { allowed: true, remaining: Math.max(0, limit - currentCount), resetSec: windowSec };
-    } catch {
+      return {
+        allowed: Number(result[0]) === 1,
+        remaining: Number(result[1]),
+        resetSec: Number(result[2]),
+      };
+    } catch (err) {
+      console.error('[RateLimit Error] Redis sliding-window check failed.');
       if (env.NODE_ENV === 'production') {
-        console.warn(`[RateLimit Warning] Redis rate limit check failed for '${key}'. Failing open in production.`);
-        return { allowed: true, remaining: 1, resetSec: windowSec };
+        throw new Error('DISTRIBUTED_RATE_LIMIT_UNAVAILABLE', { cause: err });
       }
     }
+  }
+
+  if (env.NODE_ENV === 'production') {
+    throw new Error('DISTRIBUTED_RATE_LIMIT_UNAVAILABLE');
   }
 
   return inMemoryStore.slidingWindowRateLimit(fullKey, limit, windowSec);

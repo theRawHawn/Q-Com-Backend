@@ -7,6 +7,7 @@ import {
   requireRiderOwnership,
 } from '../middleware/resourceOwnership.js';
 import { inventoryService } from '../modules/inventory/inventoryService.js';
+import { inventoryMutationRateLimiter } from '../middleware/rateLimiter.js';
 
 export const resourceRouter = Router();
 
@@ -171,7 +172,7 @@ resourceRouter.patch('/merchants/:merchantId/threshold-defaults', authenticate, 
  * POST /merchants/:merchantId/inventory/:productId/restock
  * Adds stock to seller inventory and triggers episode reset evaluation.
  */
-resourceRouter.post('/merchants/:merchantId/inventory/:productId/restock', authenticate, requireMerchantOwnership('merchantId'), async (req: Request, res: Response): Promise<void> => {
+resourceRouter.post('/merchants/:merchantId/inventory/:productId/restock', authenticate, inventoryMutationRateLimiter, requireMerchantOwnership('merchantId'), async (req: Request, res: Response): Promise<void> => {
   const { merchantId, productId } = req.params;
   const { quantity } = req.body;
 

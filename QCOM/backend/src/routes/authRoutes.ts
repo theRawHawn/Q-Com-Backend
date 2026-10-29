@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { authService } from '../modules/auth/authService.js';
 import { authenticate } from '../middleware/auth.js';
+import { requireRole } from '../middleware/rbac.js';
 import { authRateLimiter, otpRateLimiter } from '../middleware/rateLimiter.js';
 
 export const authRouter = Router();
@@ -276,32 +277,52 @@ adminAuthRouter.post('/session', authRateLimiter, handleAdminLogin);
  * POST /auth/admin/set-password & POST /auth/admin/change-password
  * Sets or updates admin password, validates strength, and revokes active sessions.
  */
-adminAuthRouter.post('/set-password', authenticate, authRateLimiter, async (req: Request, res: Response): Promise<void> => {
-  const { newPassword } = req.body;
-  if (!newPassword) {
-    res.status(400).json({ success: false, error: 'MISSING_PASSWORD', message: 'New password is required.' });
-    return;
+adminAuthRouter.post(
+  '/set-password',
+  authenticate,
+  authRateLimiter,
+  requireRole(['ADMIN', 'SUPER_ADMIN', 'OPERATIONS', 'FINANCE_ADMIN']),
+  async (req: Request, res: Response): Promise<void> => {
+    const { newPassword } = req.body;
+    if (!newPassword) {
+      res.status(400).json({ success: false, error: 'MISSING_PASSWORD', message: 'New password is required.' });
+      return;
+    }
+    try {
+      const result = await authService.adminSetPassword(req.auth!.userId, newPassword);
+      res.status(200).json(result);
+    } catch (err: any) {
+      res.status(400).json({ success: false, error: 'PASSWORD_UPDATE_FAILED', message: err.message || 'Failed to update password.' });
+    }
   }
-  try {
-    const result = await authService.adminSetPassword(req.auth!.userId, newPassword);
-    res.status(200).json(result);
-  } catch (err: any) {
-    res.status(400).json({ success: false, error: 'PASSWORD_UPDATE_FAILED', message: err.message || 'Failed to update password.' });
+);
+adminAuthRouter.post(
+  '/change-password',
+  authenticate,
+  authRateLimiter,
+  requireRole(['ADMIN', 'SUPER_ADMIN', 'OPERATIONS', 'FINANCE_ADMIN']),
+  async (req: Request, res: Response): Promise<void> => {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) {
+      res.status(400).json({
+        success: false,
+        error: 'MISSING_PASSWORD',
+        message: 'Current and new passwords are required.',
+      });
+      return;
+    }
+    try {
+      const result = await authService.adminChangePassword(
+        req.auth!.userId,
+        currentPassword,
+        newPassword
+      );
+      res.status(200).json(result);
+    } catch (err: any) {
+      res.status(400).json({ success: false, error: 'PASSWORD_UPDATE_FAILED', message: err.message || 'Failed to update password.' });
+    }
   }
-});
-adminAuthRouter.post('/change-password', authenticate, authRateLimiter, async (req: Request, res: Response): Promise<void> => {
-  const { newPassword } = req.body;
-  if (!newPassword) {
-    res.status(400).json({ success: false, error: 'MISSING_PASSWORD', message: 'New password is required.' });
-    return;
-  }
-  try {
-    const result = await authService.adminSetPassword(req.auth!.userId, newPassword);
-    res.status(200).json(result);
-  } catch (err: any) {
-    res.status(400).json({ success: false, error: 'PASSWORD_UPDATE_FAILED', message: err.message || 'Failed to update password.' });
-  }
-});
+);
 
 // Also mount adminAuthRouter on authRouter for /api/auth/admin/* compatibility
 authRouter.use('/admin', adminAuthRouter);

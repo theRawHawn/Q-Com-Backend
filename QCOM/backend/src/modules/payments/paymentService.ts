@@ -129,11 +129,16 @@ export class PaymentService {
 
     const authoritativeAmount = parseFloat(o.total_amount);
     const timestamp = Date.now();
-
-    // Generate provider order and signature
-    const providerResult = await this.provider.createOrder(orderId, authoritativeAmount, timestamp);
-    const signature = providerResult.signature || this.generatePaymentSignature(orderId, authoritativeAmount, timestamp);
-    const paymentOrderId = providerResult.providerOrderId;
+    const session = await this.provider.createPaymentSession({
+      orderId,
+      attemptId: crypto.randomUUID(),
+      amount: authoritativeAmount,
+      currency: 'INR',
+      customer: { id: userId },
+      idempotencyKey: `payment_${orderId}_${timestamp}`,
+    });
+    const signature = session.signature || this.generatePaymentSignature(orderId, authoritativeAmount, timestamp);
+    const paymentOrderId = session.providerReference;
 
     const intentRes = await runner.query(`
       INSERT INTO payment_intents (
@@ -336,12 +341,22 @@ export class PaymentService {
     isDuplicate?: boolean;
     isReconciliationRequired?: boolean;
     status?: string;
+    needsRefund?: boolean;
+    authoritativeAmount?: number;
   }> {
     const { orderId, transactionId, timestamp, signature, amount, userId, razorpayOrderId, evidence } = params;
 
     const stagedEvents: PaymentDomainEvent[] = [];
 
-    const result = await transaction(async (client) => {
+    const result = await transaction<{
+      receipt: PaymentReceipt;
+      order: any;
+      isDuplicate?: boolean;
+      isReconciliationRequired?: boolean;
+      status?: string;
+      needsRefund?: boolean;
+      authoritativeAmount?: number;
+    }>(async (client) => {
       // 1. Fetch & lock authoritative order row
       const orderRes = await client.query(`
         SELECT * FROM orders
@@ -450,40 +465,27 @@ export class PaymentService {
       let isReconciliationRequired = false;
       let isSigValid = false;
 
-      if (typeof (this.provider as any).verifyPayment === 'function') {
-        try {
-          const provRes = await (this.provider as any).verifyPayment({
-            orderId,
-            amount: authoritativeAmount,
-            currency: 'INR',
-            providerReference: razorpayOrderId || currentIntent?.payment_order_id || transactionId,
-            providerPaymentId: transactionId,
-            evidence: evidence || {
-              signature,
-              timestamp,
-              transactionId,
-              razorpayOrderId: razorpayOrderId || currentIntent?.payment_order_id,
-              simulatedTimeout: evidence?.simulatedTimeout,
-            },
-          });
-
-          if (provRes.status === 'RECONCILIATION_REQUIRED') {
-            isReconciliationRequired = true;
-          } else {
-            isSigValid = provRes.verified === true;
-          }
-        } catch (provErr: any) {
-          isReconciliationRequired = true;
-        }
-      } else if (typeof this.provider.verifyPaymentSignature === 'function') {
-        isSigValid = this.provider.verifyPaymentSignature({
+      try {
+        const provRes = await this.provider.verifyPayment({
           orderId,
-          transactionId,
           amount: authoritativeAmount,
-          timestamp,
-          signature,
-          razorpayOrderId: razorpayOrderId || currentIntent?.payment_order_id,
+          currency: 'INR',
+          providerReference: razorpayOrderId || currentIntent?.payment_order_id || transactionId,
+          providerPaymentId: transactionId,
+          evidence: evidence || {
+            signature,
+            timestamp,
+            transactionId,
+            razorpayOrderId: razorpayOrderId || currentIntent?.payment_order_id,
+          },
         });
+        if (provRes.status === 'RECONCILIATION_REQUIRED') {
+          isReconciliationRequired = true;
+        } else {
+          isSigValid = provRes.verified;
+        }
+      } catch {
+        isReconciliationRequired = true;
       }
 
       if (!isSigValid && currentIntent?.signature && currentIntent.signature === signature) {
@@ -767,7 +769,7 @@ export class PaymentService {
     if (eventType.startsWith('refund.') || eventType.startsWith('payout.')) {
       const finRes = await financialWebhookService.processFinancialWebhook({
         rawBody,
-        signature,
+        signature: effectiveSignature,
         gateway,
       });
       return {
@@ -1509,4 +1511,3 @@ export class PaymentService {
 }
 
 export const paymentService = new PaymentService();
-

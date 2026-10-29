@@ -269,6 +269,7 @@ export class RefundService {
             return await this.provider.createRefund({
               paymentId: prepared.paymentId,
               amount: prepared.requestedAmount,
+              currency: 'INR',
               reason: params.reasonCode,
               idempotencyKey: prepared.durableIdempotencyKey,
             });
@@ -283,7 +284,14 @@ export class RefundService {
       });
 
       providerRefundId = providerRes.providerRefundId;
-      providerStatus = providerRes.status === 'FAILED' ? 'FAILED' : 'COMPLETED';
+      if (providerRes.status === 'PROCESSED') {
+        providerStatus = 'COMPLETED';
+      } else if (providerRes.status === 'FAILED') {
+        providerStatus = 'FAILED';
+      } else {
+        providerStatus = 'PROCESSING';
+        outcomeUnknown = true;
+      }
     } catch (provErr: any) {
       // Critical Ambiguous Outcome Rule:
       // If the gateway timed out or failed with a transient error after dispatch,
@@ -436,7 +444,7 @@ export class RefundService {
     }
 
     let providerRefundId = refund.provider_refund_id;
-    let providerStatus: 'PROCESSED' | 'PENDING' | 'FAILED' = 'PROCESSED';
+    let providerStatus: 'COMPLETED' | 'FAILED' | 'PROCESSING' = 'PROCESSING';
 
     if (!providerRefundId && refund.idempotency_key && this.provider.getRefundByIdempotencyKey) {
       let match = await this.provider.getRefundByIdempotencyKey(refund.idempotency_key);
@@ -446,6 +454,7 @@ export class RefundService {
           match = await this.provider.createRefund({
             paymentId: refund.payment_id,
             amount: parseFloat(refund.amount),
+            currency: 'INR',
             reason: refund.reason_code,
             idempotencyKey: refund.idempotency_key,
           });
@@ -455,18 +464,26 @@ export class RefundService {
       }
       if (match) {
         providerRefundId = match.providerRefundId;
-        providerStatus = match.status;
+        providerStatus = match.status === 'PROCESSED'
+          ? 'COMPLETED'
+          : match.status === 'FAILED'
+            ? 'FAILED'
+            : 'PROCESSING';
       } else {
         return this.mapRow(refund);
       }
     } else if (providerRefundId) {
       const statusRes = await this.provider.getRefundStatus(providerRefundId);
-      providerStatus = statusRes.status;
+      providerStatus = statusRes.status === 'PROCESSED'
+        ? 'COMPLETED'
+        : statusRes.status === 'FAILED'
+          ? 'FAILED'
+          : 'PROCESSING';
     } else {
       return this.mapRow(refund);
     }
 
-    const updatedStatus = providerStatus === 'PROCESSED' ? 'COMPLETED' : providerStatus;
+    const updatedStatus = providerStatus;
 
     const finalRow = await transaction(async (client) => {
       const lockRes = await client.query(`SELECT * FROM refunds WHERE id = $1 FOR UPDATE`, [refundId]);

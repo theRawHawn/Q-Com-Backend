@@ -21,6 +21,7 @@ import {
   ProviderWebhookEvent,
   ProviderRefundRequest,
   ProviderRefundResult,
+  NormalizedProviderError,
 } from './types.js';
 
 export class DisabledPaymentProvider implements PaymentProvider {
@@ -73,9 +74,21 @@ export class DisabledPaymentProvider implements PaymentProvider {
 
   public verifyWebhookSignature(_params: {
     rawBody: Buffer | string;
-    headers: Record<string, string | string[] | undefined>;
+    headers?: Record<string, string | string[] | undefined>;
+    signature?: string;
   }): boolean {
     return false;
+  }
+
+  public normalizeError(error: unknown): NormalizedProviderError {
+    const message = error instanceof Error ? error.message : 'Payment gateway is not configured.';
+    return {
+      category: 'UNSUPPORTED_OPERATION',
+      code: 'PAYMENT_GATEWAY_NOT_CONFIGURED',
+      message,
+      retryable: false,
+      rawError: error,
+    };
   }
 
   public parseWebhookEvent(_params: {

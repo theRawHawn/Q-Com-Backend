@@ -795,13 +795,11 @@ export async function runSprint13CrossPanelIntegrationTests(): Promise<void> {
     console.log('[Scenario 11] Testing Recovery Worker Lease Integrity & Fencing...');
     {
       const workerA = new FinancialRecoveryWorker({
-        workerId: 'worker_alpha',
         leaseDurationSec: 5,
         staleThresholdSec: 1,
       });
 
       const workerB = new FinancialRecoveryWorker({
-        workerId: 'worker_beta',
         leaseDurationSec: 10,
         staleThresholdSec: 1,
       });

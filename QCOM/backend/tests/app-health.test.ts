@@ -9,6 +9,8 @@ export async function testAppHealth() {
   setPool(pool);
 
   const app = createApp();
+  const trustProxy = app.get('trust proxy fn') as (address: string, hop: number) => boolean;
+  assert.equal(trustProxy('203.0.113.7', 0), false, 'Forwarded IP headers must not be trusted without configured proxy CIDRs');
 
   // Helper to simulate request through Express app
   const simulateRequest = (

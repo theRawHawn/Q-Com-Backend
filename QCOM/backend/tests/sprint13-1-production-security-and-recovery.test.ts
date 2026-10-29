@@ -444,7 +444,7 @@ export async function runSprint13_1ProductionSecurityAndRecoveryTests(): Promise
 
     // Scenario B.4: Worker crash during lease & expired lease recovery
     {
-      const workerB = new FinancialRecoveryWorker({ workerId: 'worker_recovery', leaseDurationSec: 30 });
+      const workerB = new FinancialRecoveryWorker({ leaseDurationSec: 30 });
 
       const staleRefundId = crypto.randomUUID();
       await pool.query(`
@@ -720,7 +720,6 @@ export async function runSprint13_1ProductionSecurityAndRecoveryTests(): Promise
 
       // Re-instantiate worker as if server restarted
       const newWorkerInstance = new FinancialRecoveryWorker({
-        workerId: 'worker_after_restart',
         staleThresholdSec: 5,
         leaseDurationSec: 30,
       });

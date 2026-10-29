@@ -387,6 +387,7 @@ export async function runSprint14StagingValidationTests(): Promise<void> {
         PAYMENT_MODE: 'mock', // Insecure in production!
         TELEPHONY_MODE: 'mock', // Insecure in production!
         CORS_ALLOWED_ORIGINS: '*', // Insecure in production!
+        TRUST_PROXY_CIDRS: '',
         JWT_SECRET: 'short',
         JWT_ACCESS_SECRET: 'short', // Too short!
         JWT_REFRESH_SECRET: 'short',
@@ -402,6 +403,7 @@ export async function runSprint14StagingValidationTests(): Promise<void> {
         ADMIN_SESSION_TTL_HOURS: 24,
         OSRM_BASE_URL: 'https://router.project-osrm.org',
         PAYMENT_WEBHOOK_SECRET: 'secret',
+        RAZORPAY_WEBHOOK_SECRET: 'secret',
         PAYMENT_SECRET: 'qcom_secure_payment_secret_2026_isolated_key',
         RESERVATION_TTL_MINUTES: 15,
       };

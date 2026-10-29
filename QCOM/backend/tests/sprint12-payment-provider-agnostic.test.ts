@@ -261,7 +261,7 @@ export async function runSprint12PaymentProviderAgnosticTests(): Promise<void> {
     // -------------------------------------------------------------
     console.log('[Test D] Testing Durable Multi-Attempt Tracking & Database Uniqueness...');
     {
-      const orderId = await createTestOrder(customer1UserId, 500.00);
+      const orderId = await createTestOrder(customer1UserId);
 
       // Attempt 1
       const attempt1 = await paymentService.createPaymentAttempt({
@@ -442,7 +442,7 @@ export async function runSprint12PaymentProviderAgnosticTests(): Promise<void> {
     // -------------------------------------------------------------
     console.log('[Test G] Testing Gateway Timeout Handling & Zero Blind Failure...');
     {
-      const orderId = await createTestOrder(customer1UserId, 350.00);
+      const orderId = await createTestOrder(customer1UserId);
       await paymentService.createPaymentOrder(orderId, customer1UserId);
 
       // Configure provider to simulate gateway timeout during verification
@@ -482,7 +482,7 @@ export async function runSprint12PaymentProviderAgnosticTests(): Promise<void> {
     // -------------------------------------------------------------
     console.log('[Test H] Testing Payment Reconciliation Workflow for Ambiguous Outcomes...');
     {
-      const orderId = await createTestOrder(customer1UserId, 600.00);
+      const orderId = await createTestOrder(customer1UserId);
       const attempt = await paymentService.createPaymentAttempt({
         orderId,
         userId: customer1UserId,
@@ -532,7 +532,7 @@ export async function runSprint12PaymentProviderAgnosticTests(): Promise<void> {
     // -------------------------------------------------------------
     console.log('[Test I] Testing Late Payment on Expired Order (Escrow Capture & Refund)...');
     {
-      const orderId = await createTestOrder(customer1UserId, 800.00);
+      const orderId = await createTestOrder(customer1UserId);
       const attempt = await paymentService.createPaymentAttempt({
         orderId,
         userId: customer1UserId,
@@ -619,7 +619,7 @@ export async function runSprint12PaymentProviderAgnosticTests(): Promise<void> {
       assert.ok(provData.providers.some((p: any) => p.providerId === 'mock'));
 
       // 2. POST /api/v1/payments/attempt
-      const orderId = await createTestOrder(customer1UserId, 450.00);
+      const orderId = await createTestOrder(customer1UserId);
       const attRes = await fetch(`${baseUrl}/api/v1/payments/attempt`, {
         method: 'POST',
         headers: {

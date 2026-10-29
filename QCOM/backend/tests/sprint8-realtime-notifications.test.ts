@@ -211,6 +211,86 @@ export async function runSprint8RealtimeNotificationsTests() {
   assert.ok(publishedCheck.rows[0].published_at !== null);
   console.log('✓ Test 3 passed: Outbox events claimed and marked PUBLISHED after successful consumer handling');
 
+  const leaseStage = await transaction(async (txClient: any) => outboxService.stageEvent(txClient, {
+    eventType: 'LEASE_TEST',
+    aggregateType: 'TEST',
+    aggregateId: crypto.randomUUID(),
+    payload: { lease: true },
+  }), pool);
+  const concurrentClaims = await Promise.all([
+    outboxService.claimPendingEvents(1),
+    outboxService.claimPendingEvents(1),
+  ]);
+  const claimedLeaseEvents = concurrentClaims.flat().filter((event) => event.id === leaseStage.id);
+  assert.equal(claimedLeaseEvents.length, 1, 'Only one worker may retain an outbox event claim');
+  assert.ok(claimedLeaseEvents[0].leaseToken, 'Claim must carry a fencing token');
+  assert.equal(claimedLeaseEvents[0].status, 'PENDING');
+  const firstLeaseToken = claimedLeaseEvents[0].leaseToken!;
+  await pool.query(
+    `UPDATE outbox_events SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`,
+    [leaseStage.id]
+  );
+  const recoveredLease = (await outboxService.claimPendingEvents(1))
+    .find((event) => event.id === leaseStage.id);
+  assert.ok(recoveredLease?.leaseToken, 'Expired claims must be reclaimable after a worker crash');
+  assert.notEqual(recoveredLease.leaseToken, firstLeaseToken, 'A reclaimed event must receive a fresh fencing token');
+  await assert.rejects(
+    () => outboxService.markPublished(leaseStage.id, firstLeaseToken, pool as any),
+    /OUTBOX_LEASE_LOST/
+  );
+  await outboxService.markPublished(leaseStage.id, recoveredLease.leaseToken);
+  console.log('✓ Persisted claims, concurrent exclusion, expired-lease recovery, and stale-token fencing verified');
+
+  let ambiguousDeliveries = 0;
+  outboxService.registerConsumer('OUTBOX_AMBIGUOUS_TEST', async () => {
+    ambiguousDeliveries++;
+    if (ambiguousDeliveries === 1) {
+      throw new Error('Simulated acknowledgement loss after handler side effect');
+    }
+  });
+  const ambiguousEvent = await transaction(async (txClient: any) => outboxService.stageEvent(txClient, {
+    eventType: 'OUTBOX_AMBIGUOUS_TEST',
+    aggregateType: 'TEST',
+    aggregateId: crypto.randomUUID(),
+    payload: { retry: true },
+  }), pool);
+  const ambiguousFirstAttempt = await outboxService.processOutboxBatch(1);
+  assert.equal(ambiguousFirstAttempt.failed, 1, 'Ambiguous handler outcome must schedule a retry');
+  await pool.query(
+    `UPDATE outbox_events SET next_attempt_at = NOW() WHERE id = $1`,
+    [ambiguousEvent.id]
+  );
+  const ambiguousRetry = await outboxService.processOutboxBatch(1);
+  assert.equal(ambiguousRetry.succeeded, 1, 'A retried ambiguous delivery must complete');
+  assert.equal(ambiguousDeliveries, 2, 'Outbox delivery is at-least-once and handlers may observe duplicates');
+
+  let longHandlerRuns = 0;
+  outboxService.registerConsumer('OUTBOX_LONG_HANDLER_TEST', async (event) => {
+    longHandlerRuns++;
+    if (longHandlerRuns === 1) {
+      await pool.query(
+        `UPDATE outbox_events
+         SET lease_expires_at = NOW() - INTERVAL '1 second'
+         WHERE id = $1`,
+        [event.id]
+      );
+    }
+  });
+  await transaction(async (txClient: any) => outboxService.stageEvent(txClient, {
+    eventType: 'OUTBOX_LONG_HANDLER_TEST',
+    aggregateType: 'TEST',
+    aggregateId: crypto.randomUUID(),
+    payload: { exceedsLease: true },
+  }), pool);
+  await assert.rejects(
+    () => outboxService.processOutboxBatch(1),
+    /OUTBOX_LEASE_LOST/
+  );
+  const longHandlerRetry = await outboxService.processOutboxBatch(1);
+  assert.equal(longHandlerRetry.succeeded, 1, 'An event whose handler outlives its lease must be recoverable');
+  assert.equal(longHandlerRuns, 2, 'A handler exceeding its lease can be delivered again');
+  console.log('✓ Ambiguous and over-lease handler outcomes recover safely with documented at-least-once delivery');
+
   // -------------------------------------------------------------
   // Test 4: Outbox Bounded Exponential Backoff & Dead-Letter Handling
   // -------------------------------------------------------------
@@ -706,4 +786,3 @@ if (process.argv[1]?.includes('sprint8-realtime-notifications')) {
     process.exit(1);
   });
 }
-

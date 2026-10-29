@@ -7,12 +7,12 @@
 ### 1.1 PostgreSQL 16 (Authoritative Database)
 - **Status:** **REAL INTEGRATION (ACTIVE)**
 - **Role:** Authoritative ACID storage for financial ledgers, catalog, inventory, orders, auth sessions, and idempotency records.
-- **Connection Management:** Connection pool (`pg.Pool`) with 25 maximum clients, 5000ms idle timeout, and serialized advisory locking for migrations (`scripts/migrate.ts`).
+- **Connection Management:** `pg.Pool` defaults to 10 maximum clients per process, a 30,000ms idle timeout, and a 5,000ms connection-acquisition timeout. Configure `DATABASE_MAX_POOL_SIZE` against the total deployment connection budget; all in-process workers share this pool.
 
 ### 1.2 Redis 7 (Caching & Pub/Sub)
-- **Status:** **REAL INTEGRATION (WITH RESILIENT IN-MEMORY FALLBACK)**
-- **Role:** Ephemeral rider GPS coordinates, real-time WebSocket room broadcasting, and transient session caching.
-- **Fail-Safe:** If Redis is partitioned or unconfigured, the system automatically falls back to an internal in-memory event bus without failing HTTP requests.
+- **Status:** **REAL INTEGRATION (EPHEMERAL DATA AND DISTRIBUTED ADMISSION)**
+- **Role:** Caching, WebSocket pub/sub, and distributed rate-limit counters.
+- **Fail-Safe:** Development/test may use in-memory fallbacks. Production rate-limit counters never fall back to process-local state: sensitive route policies return 503 when Redis is unavailable. The general request guard logs and marks its fail-open behavior. Cache reads may still fall back to PostgreSQL; PostgreSQL remains authoritative.
 
 ---
 

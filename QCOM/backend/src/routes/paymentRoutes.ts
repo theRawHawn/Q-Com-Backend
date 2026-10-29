@@ -4,6 +4,7 @@ import { paymentService } from '../modules/payments/paymentService.js';
 import { paymentProviderRegistry } from '../modules/payments/paymentProvider.js';
 import { authenticate } from '../middleware/auth.js';
 import { getPool } from '../database/connection.js';
+import { paymentInitiationRateLimiter, paymentWebhookRateLimiter } from '../middleware/rateLimiter.js';
 
 export const paymentRouter = Router();
 
@@ -87,7 +88,7 @@ export async function handleWebhookRequest(req: Request, res: Response): Promise
  * POST /api/payment/create-order & POST /api/v1/payments/create-order
  * Protected by customer authentication and Idempotency-Key
  */
-paymentRouter.post('/create-order', authenticate, async (req: Request, res: Response): Promise<void> => {
+paymentRouter.post('/create-order', authenticate, paymentInitiationRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const pool = getPool();
   const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
   const cleanKey = idempotencyKey && typeof idempotencyKey === 'string' ? idempotencyKey.trim().slice(0, 120) : undefined;
@@ -463,8 +464,8 @@ paymentRouter.post('/verify', authenticate, async (req: Request, res: Response):
 /**
  * POST /api/payment/webhook & POST /api/v1/payments/webhook
  */
-paymentRouter.post('/webhook', handleWebhookRequest);
-paymentRouter.post('/razorpay-webhook', handleWebhookRequest);
+paymentRouter.post('/webhook', paymentWebhookRateLimiter, handleWebhookRequest);
+paymentRouter.post('/razorpay-webhook', paymentWebhookRateLimiter, handleWebhookRequest);
 
 /**
  * GET /api/payment/providers & GET /api/v1/payments/providers
@@ -606,4 +607,3 @@ paymentRouter.post('/reconcile/:orderId', authenticate, async (req: Request, res
     });
   }
 });
-

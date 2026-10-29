@@ -28,6 +28,7 @@ const envSchema = z.object({
 
   // CORS
   CORS_ALLOWED_ORIGINS: z.string().default('*'),
+  TRUST_PROXY_CIDRS: z.string().default(''),
 
   // Sprint 2: Centralized Authentication & JWT Security Settings
   JWT_SECRET: z.string().default('qcom_dev_access_secret_2026_super_secure_key'),

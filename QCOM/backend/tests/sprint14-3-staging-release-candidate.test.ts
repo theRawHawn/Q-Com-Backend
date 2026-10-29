@@ -134,11 +134,9 @@ export async function runSprint14_3StagingReleaseCandidateTests(): Promise<void>
 
     const token = signAccessToken({
       sub: userId,
-      role: params.roleCode,
+      roles: [params.roleCode],
       session_id: sessionId,
       phone: params.phone,
-      merchant_id: params.merchantId,
-      rider_id: params.riderId,
     });
 
     return { token, userId, sessionId };

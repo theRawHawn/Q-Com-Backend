@@ -9,12 +9,12 @@ import {
   ProviderPaymentStatus,
   ProviderWebhookEvent,
   ProviderRefundRequest,
-  ProviderRefundResult as AgnosticRefundResult,
   NormalizedProviderError,
 } from './provider/types.js';
 import { PaymentProvider as AgnosticPaymentProvider } from './provider/PaymentProvider.js';
 
 export * from './provider/types.js';
+export type { PaymentProvider } from './provider/PaymentProvider.js';
 import { PaymentProviderRegistry, paymentProviderRegistry } from './provider/paymentProviderRegistry.js';
 export { PaymentProviderRegistry, paymentProviderRegistry };
 export { DisabledPaymentProvider } from './provider/DisabledPaymentProvider.js';
@@ -66,24 +66,17 @@ export interface ProviderRefundStatusResult {
   amount: number;
 }
 
-/**
- * Unified PaymentProvider interface meeting both legacy and Sprint 12.0 provider-agnostic standards.
- */
-export interface PaymentProvider extends AgnosticPaymentProvider {
+export interface LegacyPaymentOperations {
   readonly mode: string;
   createOrder(orderId: string, amount: number, timestamp: number): Promise<ProviderPaymentOrderResult>;
   verifyPaymentSignature(params: ProviderVerifyParams): boolean;
-  verifyWebhookSignature(params: ProviderWebhookVerifyParams | { rawBody: Buffer | string; headers: Record<string, string | string[] | undefined> }): boolean;
   mapProviderStatus(providerStatus: string): string;
-  createRefund(params: ProviderRefundParams | ProviderRefundRequest): Promise<ProviderRefundResult>;
-  getRefundStatus(providerRefundId: string): Promise<ProviderRefundStatusResult>;
-  getRefundByIdempotencyKey?(idempotencyKey: string): Promise<ProviderRefundResult | null>;
 }
 
 /**
  * Mock payment provider for deterministic testing and offline sandbox
  */
-export class MockPaymentProvider implements PaymentProvider {
+export class MockPaymentProvider implements AgnosticPaymentProvider, LegacyPaymentOperations {
   public readonly providerId: string;
   public readonly displayName: string;
   public readonly mode: string;
@@ -354,7 +347,11 @@ export class MockPaymentProvider implements PaymentProvider {
     }
   }
 
-  public verifyWebhookSignature(params: ProviderWebhookVerifyParams | { rawBody: Buffer | string; headers: Record<string, string | string[] | undefined> }): boolean {
+  public verifyWebhookSignature(params: {
+    rawBody: Buffer | string;
+    headers?: Record<string, string | string[] | undefined>;
+    signature?: string;
+  }): boolean {
     const rawBody = params.rawBody;
     let signature = (params as any).signature;
 
@@ -440,7 +437,7 @@ export class MockPaymentProvider implements PaymentProvider {
 /**
  * Razorpay Payment Provider adapter for razorpay_test and production modes
  */
-export class RazorpayPaymentProvider implements PaymentProvider {
+export class RazorpayPaymentProvider implements AgnosticPaymentProvider, LegacyPaymentOperations {
   public readonly providerId: string;
   public readonly displayName: string;
   public readonly mode: string;
@@ -651,7 +648,11 @@ export class RazorpayPaymentProvider implements PaymentProvider {
     }
   }
 
-  public verifyWebhookSignature(params: ProviderWebhookVerifyParams | { rawBody: Buffer | string; headers: Record<string, string | string[] | undefined> }): boolean {
+  public verifyWebhookSignature(params: {
+    rawBody: Buffer | string;
+    headers?: Record<string, string | string[] | undefined>;
+    signature?: string;
+  }): boolean {
     const rawBody = params.rawBody;
     let signature = (params as any).signature;
 
@@ -737,7 +738,7 @@ export class RazorpayPaymentProvider implements PaymentProvider {
 /**
  * Returns provider instance according to PAYMENT_MODE setting
  */
-export function getPaymentProvider(): PaymentProvider {
+export function getPaymentProvider(): AgnosticPaymentProvider {
   if (env.PAYMENT_MODE === 'none') {
     return paymentProviderRegistry.getProvider('none');
   }
