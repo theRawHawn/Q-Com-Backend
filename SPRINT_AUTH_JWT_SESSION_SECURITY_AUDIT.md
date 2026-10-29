@@ -560,7 +560,7 @@ The backend contains dedicated security and authentication test suites in `QCOM/
 
 ## 24. DOCUMENTATION VS CODE AUDIT
 
-- **Discrepancy in `QCOM/backend/auth.md`:**
+- **Discrepancy in `QCOM/backend/auth-lowercase.md`:**
   - Section 1.1 states: *"30-Day JWT"*.
   - Section 1.4 states: *"High-Entropy Session Strings (`qcom_adm_<64_hex_chars>`)"*.
   - **Actual Code Truth:**
@@ -841,8 +841,8 @@ When approved, the subsequent implementation sprint should address the following
      ```
 3. **Tune Access Token TTL (AUTH-03):**
    - Update `ACCESS_TOKEN_TTL_MINUTES` in `env.ts` from 60 minutes to 15 minutes for enhanced token theft defense.
-4. **Synchronize Documentation (`auth.md`):**
-   - Update `auth.md` to reflect the actual 60-minute access token TTL and JWT-based admin session tokens.
+4. **Synchronize Documentation (`auth-lowercase.md`):**
+   - Update `auth-lowercase.md` to reflect the actual 60-minute access token TTL and JWT-based admin session tokens.
 
 ---
 

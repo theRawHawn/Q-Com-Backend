@@ -23,6 +23,18 @@ QCOM is an enterprise-grade backend platform powering a 10-to-20 minute quick-co
 | [AGENTS.md](./AGENTS.md) | Instructions and rules for AI coding assistants |
 | [MCP.md](./MCP.md) | Model Context Protocol implementation status (Not Implemented) |
 
+### Preserved documentation variants
+
+The repository previously tracked lowercase and uppercase versions of several documentation paths. Those names collide on case-insensitive worktrees such as Windows. The uppercase files linked above remain canonical; the lowercase contents were preserved at unique paths for later review:
+
+- `api-lowercase.md`
+- `architecture-lowercase.md`
+- `auth-lowercase.md`
+- `database-lowercase.md`
+- `testing-lowercase.md`
+
+Keep these paths distinct until their contents are deliberately reconciled.
+
 ---
 
 ## Quick Start
