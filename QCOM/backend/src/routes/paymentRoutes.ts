@@ -67,6 +67,24 @@ export async function handleWebhookRequest(req: Request, res: Response): Promise
       return;
     }
 
+    if (msg.includes('invalid_webhook_payload') || msg.includes('failed to parse raw body json')) {
+      res.status(400).json({
+        success: false,
+        error: 'INVALID_WEBHOOK_PAYLOAD',
+        message: err.message || 'Invalid webhook JSON payload.',
+      });
+      return;
+    }
+
+    if (msg.includes('missing_event_metadata')) {
+      res.status(400).json({
+        success: false,
+        error: 'MISSING_EVENT_METADATA',
+        message: err.message || 'Missing eventId or eventType in webhook payload.',
+      });
+      return;
+    }
+
     if (msg.includes('payment_amount_mismatch')) {
       res.status(400).json({
         success: false,
@@ -76,10 +94,10 @@ export async function handleWebhookRequest(req: Request, res: Response): Promise
       return;
     }
 
-    res.status(400).json({
+    res.status(500).json({
       success: false,
-      error: 'WEBHOOK_PROCESSING_FAILED',
-      message: err.message || 'Webhook processing failed.',
+      error: 'WEBHOOK_INTERNAL_ERROR',
+      message: err.message || 'Webhook processing failed due to internal server error.',
     });
   }
 }
@@ -154,7 +172,7 @@ async function claimIdempotencyKey(params: {
       }
     }
 
-    // Failed or stale state: Allow retry / reclamation
+    // Stale PROCESSING (> 2 minutes) or FAILED state: Reclamation
     await pool.query(
       `UPDATE idempotency_keys
        SET status = 'PROCESSING', request_fingerprint = $1, created_at = NOW()
@@ -164,16 +182,40 @@ async function claimIdempotencyKey(params: {
     return { claimed: true };
   }
 
-  // 2. New key: Insert initial PROCESSING state
-  await pool.query(
-    `INSERT INTO idempotency_keys (idempotency_key, actor_id, endpoint, status, request_fingerprint, created_at, expires_at)
-     VALUES ($1, $2, $3, 'PROCESSING', $4, NOW(), NOW() + interval '24 hours')
-     ON CONFLICT (idempotency_key) DO UPDATE
-     SET status = 'PROCESSING', request_fingerprint = EXCLUDED.request_fingerprint`,
-    [idempotencyKey, actorId, endpoint, requestFingerprint]
-  );
-
-  return { claimed: true };
+  // 2. Insert initial PROCESSING state
+  try {
+    await pool.query(
+      `INSERT INTO idempotency_keys (idempotency_key, actor_id, endpoint, status, request_fingerprint, created_at, expires_at)
+       VALUES ($1, $2, $3, 'PROCESSING', $4, NOW(), NOW() + interval '24 hours')`,
+      [idempotencyKey, actorId, endpoint, requestFingerprint]
+    );
+    return { claimed: true };
+  } catch (err: any) {
+    if (err.code === '23505' || err.message?.includes('unique') || err.message?.includes('duplicate')) {
+      const reCheck = await pool.query(
+        `SELECT status, status_code, response_body, request_fingerprint, actor_id, created_at
+         FROM idempotency_keys WHERE idempotency_key = $1`,
+        [idempotencyKey]
+      );
+      if (reCheck.rows.length > 0) {
+        const existing = reCheck.rows[0];
+        if (existing.status === 'COMPLETED') {
+          return {
+            claimed: false,
+            status: 'COMPLETED',
+            statusCode: existing.status_code || 200,
+            responseBody: existing.response_body,
+          };
+        }
+        return {
+          claimed: false,
+          status: 'PROCESSING',
+          conflictError: 'An operation with this Idempotency-Key is currently in progress.',
+        };
+      }
+    }
+    throw err;
+  }
 }
 
 async function markIdempotencyCompleted(pool: any, key: string, statusCode: number, responseBody: any): Promise<void> {

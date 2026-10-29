@@ -76,14 +76,14 @@ export class FinancialWebhookService {
 
     const pool = getPool();
 
-    // 3. Durable deduplication check
+    // 3. Durable deduplication check: only return duplicate if event was already PROCESSED
     const existingEvt = await pool.query(`
       SELECT status FROM webhook_events
       WHERE event_id = $1
       LIMIT 1
     `, [eventId]);
 
-    if (existingEvt.rows.length > 0) {
+    if (existingEvt.rows.length > 0 && existingEvt.rows[0].status === 'PROCESSED') {
       return {
         success: true,
         duplicate: true,
@@ -94,24 +94,12 @@ export class FinancialWebhookService {
       };
     }
 
-    // Record RECEIVED in webhook_events atomically
-    const insertRes = await pool.query(`
+    // Record RECEIVED in webhook_events atomically if not present
+    await pool.query(`
       INSERT INTO webhook_events (event_id, gateway, event_type, payload, status, received_at)
       VALUES ($1, $2, $3, $4, 'RECEIVED', NOW())
       ON CONFLICT (event_id) DO NOTHING
-      RETURNING id
     `, [eventId, gateway, eventType, JSON.stringify(body)]);
-
-    if (insertRes.rows.length === 0) {
-      // Event was concurrently inserted by another instance/worker
-      return {
-        success: true,
-        duplicate: true,
-        eventId,
-        eventType,
-        message: 'Concurrent duplicate webhook event detected and handled idempotently.',
-      };
-    }
 
     // Route event family
     if (eventType.startsWith('refund.')) {
@@ -149,6 +137,23 @@ export class FinancialWebhookService {
     const targetOrderId = notes.orderId || notes.order_id || body.orderId;
 
     return await transaction(async (client) => {
+      // 0. Row-level lock on webhook_events to serialize concurrent deliveries of the exact same eventId
+      const evtLock = await client.query(`
+        SELECT status FROM webhook_events
+        WHERE event_id = $1
+        FOR UPDATE
+      `, [eventId]);
+
+      if (evtLock.rows.length > 0 && evtLock.rows[0].status === 'PROCESSED') {
+        return {
+          success: true,
+          duplicate: true,
+          eventId,
+          eventType,
+          message: 'Webhook event already processed (durable replay detected).',
+        };
+      }
+
       // Correlate to persisted refund record
       let refund: any = null;
 
@@ -346,6 +351,23 @@ export class FinancialWebhookService {
     const stagedEvents: any[] = [];
 
     const result = await transaction(async (client) => {
+      // 0. Row-level lock on webhook_events to serialize concurrent deliveries of the exact same eventId
+      const evtLock = await client.query(`
+        SELECT status FROM webhook_events
+        WHERE event_id = $1
+        FOR UPDATE
+      `, [eventId]);
+
+      if (evtLock.rows.length > 0 && evtLock.rows[0].status === 'PROCESSED') {
+        return {
+          success: true,
+          duplicate: true,
+          eventId,
+          eventType,
+          message: 'Payout webhook event already processed (durable replay detected).',
+        };
+      }
+
       // 1. Correlate with seller_payouts
       let sellerPayout: any = null;
       if (referenceId) {

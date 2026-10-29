@@ -43,6 +43,12 @@ export class PaymentService {
       code === '57p01' ||
       code === '57p02' ||
       code === '57p03' ||
+      code === '57p04' ||
+      code === '57p05' ||
+      code === '40001' ||
+      code === '40p01' ||
+      code === '55p03' ||
+      code === '53300' ||
       code === '08006' ||
       code === '08001' ||
       code === '08004' ||
@@ -53,7 +59,11 @@ export class PaymentService {
       msg.includes('database is closed') ||
       msg.includes('connection refused') ||
       msg.includes('cannot connect') ||
-      msg.includes('timeout')
+      msg.includes('timeout') ||
+      msg.includes('deadlock') ||
+      msg.includes('serialization failure') ||
+      msg.includes('could not obtain lock') ||
+      msg.includes('lock timeout')
     );
   }
 
@@ -737,7 +747,7 @@ export class PaymentService {
       || (typeof headers?.['x-provider-signature'] === 'string' ? headers['x-provider-signature'] : undefined)
       || (typeof headers?.['x-razorpay-signature'] === 'string' ? headers['x-razorpay-signature'] : undefined)
       || (typeof (provider as any).extractSignature === 'function' ? (provider as any).extractSignature(headers || {}) : undefined)
-      || `sig_${crypto.createHash('sha256').update(String(rawBody || 'webhook')).digest('hex').slice(0, 64)}`;
+      || '';
 
     // 1. Signature Verification on EXACT raw body buffer
     const isValid = provider.verifyWebhookSignature({
@@ -822,26 +832,28 @@ export class PaymentService {
     const targetOrderId = notes.orderId || notes.order_id || body.orderId;
 
     // 5. Transactional Processing
-    const processingResult = await transaction(async (client) => {
-      // Lock webhook_events row to serialize concurrent deliveries of the exact same eventId
-      const evtLock = await client.query(`
-        SELECT status FROM webhook_events
-        WHERE event_id = $1
-        FOR UPDATE
-      `, [eventId]);
+    let processingResult: any;
+    try {
+      processingResult = await transaction(async (client) => {
+        // Lock webhook_events row to serialize concurrent deliveries of the exact same eventId
+        const evtLock = await client.query(`
+          SELECT status FROM webhook_events
+          WHERE event_id = $1
+          FOR UPDATE
+        `, [eventId]);
 
-      if (evtLock.rows.length > 0 && evtLock.rows[0].status === 'PROCESSED') {
-        return {
-          success: true,
-          duplicate: true,
-          eventId,
-          eventType,
-          orderId: targetOrderId,
-          paymentState: 'CAPTURED' as PaymentState,
-        };
-      }
+        if (evtLock.rows.length > 0 && evtLock.rows[0].status === 'PROCESSED') {
+          return {
+            success: true,
+            duplicate: true,
+            eventId,
+            eventType,
+            orderId: targetOrderId,
+            paymentState: 'CAPTURED' as PaymentState,
+          };
+        }
 
-      // Find the authoritative order
+        // Find the authoritative order
       let orderId = targetOrderId;
       let order: any = null;
 
@@ -1170,6 +1182,18 @@ export class PaymentService {
         };
       }
     });
+    } catch (err: any) {
+      if (err.message?.includes('PAYMENT_AMOUNT_MISMATCH')) {
+        try {
+          await pool.query(`
+            UPDATE webhook_events
+            SET status = 'FAILED', error_message = 'PAYMENT_AMOUNT_MISMATCH'
+            WHERE event_id = $1
+          `, [eventId]);
+        } catch {}
+      }
+      throw err;
+    }
 
     // 6. Publish staged events strictly post-commit
     if (stagedEvents.length > 0) {
