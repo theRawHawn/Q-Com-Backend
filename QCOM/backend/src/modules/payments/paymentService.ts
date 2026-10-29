@@ -783,29 +783,32 @@ export class PaymentService {
 
     const pool = getPool();
 
-    // 3. Webhook Idempotency Check: check if eventId was already successfully processed
-    const existingEvt = await pool.query(`
-      SELECT status FROM webhook_events
-      WHERE event_id = $1
-      LIMIT 1
-    `, [eventId]);
-
-    if (existingEvt.rows.length > 0 && existingEvt.rows[0].status === 'PROCESSED') {
-      return {
-        success: true,
-        duplicate: true,
-        eventId,
-        eventType,
-        message: 'Webhook event already processed successfully.',
-      };
-    }
-
-    // Insert or update webhook_events to RECEIVED
-    await pool.query(`
+    // 3. Webhook Idempotency Check: atomic insert into webhook_events
+    const insertRes = await pool.query(`
       INSERT INTO webhook_events (event_id, gateway, event_type, payload, status, received_at)
       VALUES ($1, $2, $3, $4, 'RECEIVED', NOW())
       ON CONFLICT (event_id) DO NOTHING
+      RETURNING id, status
     `, [eventId, gateway, eventType, JSON.stringify(body)]);
+
+    if (insertRes.rows.length === 0) {
+      // Event record already exists! Check if already PROCESSED
+      const existingEvt = await pool.query(`
+        SELECT status FROM webhook_events
+        WHERE event_id = $1
+        LIMIT 1
+      `, [eventId]);
+
+      if (existingEvt.rows.length > 0 && existingEvt.rows[0].status === 'PROCESSED') {
+        return {
+          success: true,
+          duplicate: true,
+          eventId,
+          eventType,
+          message: 'Webhook event already processed successfully.',
+        };
+      }
+    }
 
     const stagedEvents: PaymentDomainEvent[] = [];
 
@@ -820,6 +823,24 @@ export class PaymentService {
 
     // 5. Transactional Processing
     const processingResult = await transaction(async (client) => {
+      // Lock webhook_events row to serialize concurrent deliveries of the exact same eventId
+      const evtLock = await client.query(`
+        SELECT status FROM webhook_events
+        WHERE event_id = $1
+        FOR UPDATE
+      `, [eventId]);
+
+      if (evtLock.rows.length > 0 && evtLock.rows[0].status === 'PROCESSED') {
+        return {
+          success: true,
+          duplicate: true,
+          eventId,
+          eventType,
+          orderId: targetOrderId,
+          paymentState: 'CAPTURED' as PaymentState,
+        };
+      }
+
       // Find the authoritative order
       let orderId = targetOrderId;
       let order: any = null;

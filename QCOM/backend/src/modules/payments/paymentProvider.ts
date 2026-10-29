@@ -94,7 +94,7 @@ export class MockPaymentProvider implements AgnosticPaymentProvider, LegacyPayme
     this.mode = providerId;
     this.displayName = `QCOM Mock Payment Gateway (${providerId})`;
     this.secretKey = options?.secretKey || env.PAYMENT_SECRET;
-    this.webhookSecret = options?.webhookSecret || (env as any).PAYMENT_WEBHOOK_SECRET || env.RAZORPAY_WEBHOOK_SECRET;
+    this.webhookSecret = options?.webhookSecret || env.RAZORPAY_WEBHOOK_SECRET || (env as any).PAYMENT_WEBHOOK_SECRET;
     this.options = options || {};
   }
 

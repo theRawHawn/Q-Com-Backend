@@ -40,6 +40,7 @@ import { runSprint14_4AuthIdorSecurityGateTests } from './sprint14-4-auth-idor-s
 import { runSprint14_5PaymentIdempotencyTests } from './sprint14-5-payment-idempotency-and-integrity.test.js';
 import { runSprint14_6ScalabilityAndMultiInstanceTests } from './sprint14-6-scalability-and-multi-instance.test.js';
 import { runSprint14_7AuthenticationSecurityTests } from './sprint14-7-authentication-and-credential-security.test.js';
+import { runSprint15_1PaymentIdempotencyAndIntegrityTests } from './sprint15-1-payment-idempotency-and-integrity.test.js';
 
 async function runAllTests() {
   console.log('===========================================================');
@@ -145,6 +146,8 @@ async function runAllTests() {
     await runSprint14_6ScalabilityAndMultiInstanceTests();
     // Sprint 14.7 Authentication, Password Hashing & Credential Security Tests
     await runSprint14_7AuthenticationSecurityTests();
+    // Sprint 15.1 Payment Idempotency, Duplicate Webhooks & Financial Integrity Tests
+    await runSprint15_1PaymentIdempotencyAndIntegrityTests();
 
     const duration = ((Date.now() - start) / 1000).toFixed(2);
     console.log('\n===========================================================');

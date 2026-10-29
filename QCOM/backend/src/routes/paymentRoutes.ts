@@ -33,7 +33,7 @@ export async function handleWebhookRequest(req: Request, res: Response): Promise
   const rawBody = (req as any).rawBody || Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body));
 
   try {
-    const gateway = (req.params.providerId || req.query.provider || 'mock') as string;
+    const gateway = (req.params.providerId || req.query.provider || (req.path.includes('razorpay') || req.headers['x-razorpay-signature'] ? 'razorpay' : 'mock')) as string;
     const result = await paymentService.processWebhook({
       rawBody,
       signature,
@@ -85,6 +85,114 @@ export async function handleWebhookRequest(req: Request, res: Response): Promise
 }
 
 /**
+ * Atomic Idempotency Claim and Completion Helpers
+ * Prevents concurrency race conditions, payload tampering, and cross-account key hijacking.
+ */
+async function claimIdempotencyKey(params: {
+  pool: any;
+  idempotencyKey: string;
+  actorId: string;
+  endpoint: string;
+  requestFingerprint: string;
+}): Promise<
+  | { claimed: true }
+  | { claimed: false; status: 'COMPLETED'; statusCode: number; responseBody: any }
+  | { claimed: false; status: 'PROCESSING'; conflictError: string }
+  | { claimed: false; status: 'MISMATCH'; mismatchError: string }
+  | { claimed: false; status: 'UNAUTHORIZED'; authError: string }
+> {
+  const { pool, idempotencyKey, actorId, endpoint, requestFingerprint } = params;
+
+  // 1. Authoritative check on existing record
+  const existingKeyRes = await pool.query(
+    `SELECT status, status_code, response_body, request_fingerprint, actor_id, created_at
+     FROM idempotency_keys
+     WHERE idempotency_key = $1`,
+    [idempotencyKey]
+  );
+
+  if (existingKeyRes.rows.length > 0) {
+    const existing = existingKeyRes.rows[0];
+
+    // Actor ownership verification: Prevent cross-user key hijacking
+    if (existing.actor_id && existing.actor_id !== actorId) {
+      return {
+        claimed: false,
+        status: 'UNAUTHORIZED',
+        authError: 'This Idempotency-Key belongs to a different user account.',
+      };
+    }
+
+    // Payload mismatch check: Reused key with incompatible payload rejected
+    if (existing.request_fingerprint && existing.request_fingerprint !== requestFingerprint) {
+      return {
+        claimed: false,
+        status: 'MISMATCH',
+        mismatchError: 'This Idempotency-Key was already used with a different request payload.',
+      };
+    }
+
+    // Completed check: Return cached response directly
+    if (existing.status === 'COMPLETED') {
+      return {
+        claimed: false,
+        status: 'COMPLETED',
+        statusCode: existing.status_code || 200,
+        responseBody: existing.response_body,
+      };
+    }
+
+    // Processing check: If actively in progress (< 2 minutes old), block concurrent attempt
+    if (existing.status === 'PROCESSING') {
+      const ageMs = Date.now() - new Date(existing.created_at || Date.now()).getTime();
+      if (ageMs <= 120000) {
+        return {
+          claimed: false,
+          status: 'PROCESSING',
+          conflictError: 'An operation with this Idempotency-Key is currently in progress.',
+        };
+      }
+    }
+
+    // Failed or stale state: Allow retry / reclamation
+    await pool.query(
+      `UPDATE idempotency_keys
+       SET status = 'PROCESSING', request_fingerprint = $1, created_at = NOW()
+       WHERE idempotency_key = $2`,
+      [requestFingerprint, idempotencyKey]
+    );
+    return { claimed: true };
+  }
+
+  // 2. New key: Insert initial PROCESSING state
+  await pool.query(
+    `INSERT INTO idempotency_keys (idempotency_key, actor_id, endpoint, status, request_fingerprint, created_at, expires_at)
+     VALUES ($1, $2, $3, 'PROCESSING', $4, NOW(), NOW() + interval '24 hours')
+     ON CONFLICT (idempotency_key) DO UPDATE
+     SET status = 'PROCESSING', request_fingerprint = EXCLUDED.request_fingerprint`,
+    [idempotencyKey, actorId, endpoint, requestFingerprint]
+  );
+
+  return { claimed: true };
+}
+
+async function markIdempotencyCompleted(pool: any, key: string, statusCode: number, responseBody: any): Promise<void> {
+  await pool.query(
+    `UPDATE idempotency_keys
+     SET status = 'COMPLETED', status_code = $1, response_body = $2
+     WHERE idempotency_key = $3`,
+    [statusCode, JSON.stringify(responseBody), key]
+  );
+}
+
+async function markIdempotencyFailed(pool: any, key: string): Promise<void> {
+  await pool.query(
+    `UPDATE idempotency_keys SET status = 'FAILED' WHERE idempotency_key = $1 AND status = 'PROCESSING'`,
+    [key]
+  );
+}
+
+/**
  * POST /api/payment/create-order & POST /api/v1/payments/create-order
  * Protected by customer authentication and Idempotency-Key
  */
@@ -107,54 +215,50 @@ paymentRouter.post('/create-order', authenticate, paymentInitiationRateLimiter, 
   };
   const requestFingerprint = crypto.createHash('sha256').update(JSON.stringify(normalizedPayload)).digest('hex');
 
-  // 2. Idempotency Check
+  // 2. Atomic Idempotency Claim
   if (cleanKey) {
     try {
-      const existingKeyRes = await pool.query(
-        `SELECT status, status_code, response_body, request_fingerprint FROM idempotency_keys WHERE idempotency_key = $1`,
-        [cleanKey]
-      );
+      const claim = await claimIdempotencyKey({
+        pool,
+        idempotencyKey: cleanKey,
+        actorId: req.auth!.userId,
+        endpoint: req.originalUrl,
+        requestFingerprint,
+      });
 
-      if (existingKeyRes.rows.length > 0) {
-        const existing = existingKeyRes.rows[0];
-
-        // Reject if same key is used with a different request payload
-        if (existing.request_fingerprint && existing.request_fingerprint !== requestFingerprint) {
-          res.status(422).json({
+      if (!claim.claimed) {
+        if (claim.status === 'UNAUTHORIZED') {
+          res.status(403).json({
             success: false,
-            error: 'IDEMPOTENCY_PAYLOAD_MISMATCH',
-            message: 'This Idempotency-Key was already used for payment order creation with a different request payload.',
+            error: 'UNAUTHORIZED_IDEMPOTENCY_KEY_ACCESS',
+            message: claim.authError,
             requestId,
           });
           return;
         }
-
-        // Return original result if COMPLETED
-        if (existing.status === 'COMPLETED') {
-          res.status(existing.status_code || 200).json(existing.response_body);
+        if (claim.status === 'MISMATCH') {
+          res.status(422).json({
+            success: false,
+            error: 'IDEMPOTENCY_PAYLOAD_MISMATCH',
+            message: claim.mismatchError,
+            requestId,
+          });
           return;
         }
-
-        // Return 409 if currently PROCESSING
-        if (existing.status === 'PROCESSING') {
+        if (claim.status === 'COMPLETED') {
+          res.status(claim.statusCode).json(claim.responseBody);
+          return;
+        }
+        if (claim.status === 'PROCESSING') {
           res.status(409).json({
             success: false,
             error: 'PAYMENT_ORDER_IN_PROGRESS',
-            message: 'A payment order creation request with this Idempotency-Key is currently in progress.',
+            message: claim.conflictError,
             requestId,
           });
           return;
         }
       }
-
-      // Record PROCESSING state
-      await pool.query(
-        `INSERT INTO idempotency_keys (idempotency_key, actor_id, endpoint, status, request_fingerprint, created_at, expires_at)
-         VALUES ($1, $2, $3, 'PROCESSING', $4, NOW(), NOW() + interval '24 hours')
-         ON CONFLICT (idempotency_key) DO UPDATE
-         SET status = 'PROCESSING', request_fingerprint = EXCLUDED.request_fingerprint`,
-        [cleanKey, req.auth!.userId, req.originalUrl, requestFingerprint]
-      );
     } catch (err: any) {
       if (paymentService.isDatabaseUnavailable(err)) {
         res.setHeader('Retry-After', '3');
@@ -181,12 +285,7 @@ paymentRouter.post('/create-order', authenticate, paymentInitiationRateLimiter, 
 
     if (cleanKey) {
       try {
-        await pool.query(
-          `UPDATE idempotency_keys
-           SET status = 'COMPLETED', status_code = 200, response_body = $1
-           WHERE idempotency_key = $2`,
-          [JSON.stringify(responseBody), cleanKey]
-        );
+        await markIdempotencyCompleted(pool, cleanKey, 200, responseBody);
       } catch (err: any) {
         if (paymentService.isDatabaseUnavailable(err)) {
           res.setHeader('Retry-After', '3');
@@ -206,7 +305,7 @@ paymentRouter.post('/create-order', authenticate, paymentInitiationRateLimiter, 
   } catch (err: any) {
     if (cleanKey) {
       try {
-        await pool.query(`UPDATE idempotency_keys SET status = 'FAILED' WHERE idempotency_key = $1`, [cleanKey]);
+        await markIdempotencyFailed(pool, cleanKey);
       } catch {
         // Suppress secondary error
       }
@@ -281,54 +380,50 @@ paymentRouter.post('/verify', authenticate, async (req: Request, res: Response):
   };
   const requestFingerprint = crypto.createHash('sha256').update(JSON.stringify(normalizedPayload)).digest('hex');
 
-  // 2. Idempotency Check
+  // 2. Atomic Idempotency Claim
   if (cleanKey) {
     try {
-      const existingKeyRes = await pool.query(
-        `SELECT status, status_code, response_body, request_fingerprint FROM idempotency_keys WHERE idempotency_key = $1`,
-        [cleanKey]
-      );
+      const claim = await claimIdempotencyKey({
+        pool,
+        idempotencyKey: cleanKey,
+        actorId: req.auth!.userId,
+        endpoint: req.originalUrl,
+        requestFingerprint,
+      });
 
-      if (existingKeyRes.rows.length > 0) {
-        const existing = existingKeyRes.rows[0];
-
-        // Reject if same key is used with a different request payload
-        if (existing.request_fingerprint && existing.request_fingerprint !== requestFingerprint) {
-          res.status(422).json({
+      if (!claim.claimed) {
+        if (claim.status === 'UNAUTHORIZED') {
+          res.status(403).json({
             success: false,
-            error: 'IDEMPOTENCY_PAYLOAD_MISMATCH',
-            message: 'This Idempotency-Key was already used for payment verification with a different request payload.',
+            error: 'UNAUTHORIZED_IDEMPOTENCY_KEY_ACCESS',
+            message: claim.authError,
             requestId,
           });
           return;
         }
-
-        // Return original result if COMPLETED
-        if (existing.status === 'COMPLETED') {
-          res.status(existing.status_code || 200).json(existing.response_body);
+        if (claim.status === 'MISMATCH') {
+          res.status(422).json({
+            success: false,
+            error: 'IDEMPOTENCY_PAYLOAD_MISMATCH',
+            message: claim.mismatchError,
+            requestId,
+          });
           return;
         }
-
-        // Return 409 if currently PROCESSING
-        if (existing.status === 'PROCESSING') {
+        if (claim.status === 'COMPLETED') {
+          res.status(claim.statusCode).json(claim.responseBody);
+          return;
+        }
+        if (claim.status === 'PROCESSING') {
           res.status(409).json({
             success: false,
             error: 'PAYMENT_VERIFICATION_IN_PROGRESS',
-            message: 'A payment verification request with this Idempotency-Key is currently in progress.',
+            message: claim.conflictError,
             requestId,
           });
           return;
         }
       }
-
-      // Record PROCESSING state
-      await pool.query(
-        `INSERT INTO idempotency_keys (idempotency_key, actor_id, endpoint, status, request_fingerprint, created_at, expires_at)
-         VALUES ($1, $2, $3, 'PROCESSING', $4, NOW(), NOW() + interval '24 hours')
-         ON CONFLICT (idempotency_key) DO UPDATE
-         SET status = 'PROCESSING', request_fingerprint = EXCLUDED.request_fingerprint`,
-        [cleanKey, req.auth!.userId, req.originalUrl, requestFingerprint]
-      );
     } catch (err: any) {
       if (paymentService.isDatabaseUnavailable(err)) {
         res.setHeader('Retry-After', '3');
@@ -366,19 +461,9 @@ paymentRouter.post('/verify', authenticate, async (req: Request, res: Response):
       isDuplicate: !!result.isDuplicate,
     };
 
-    if (result.isDuplicate) {
-      res.status(409).json(responseBody);
-      return;
-    }
-
     if (cleanKey) {
       try {
-        await pool.query(
-          `UPDATE idempotency_keys
-           SET status = 'COMPLETED', status_code = 200, response_body = $1
-           WHERE idempotency_key = $2`,
-          [JSON.stringify(responseBody), cleanKey]
-        );
+        await markIdempotencyCompleted(pool, cleanKey, result.isDuplicate ? 409 : 200, responseBody);
       } catch (err: any) {
         if (paymentService.isDatabaseUnavailable(err)) {
           res.setHeader('Retry-After', '3');
@@ -394,12 +479,17 @@ paymentRouter.post('/verify', authenticate, async (req: Request, res: Response):
       }
     }
 
+    if (result.isDuplicate) {
+      res.status(409).json(responseBody);
+      return;
+    }
+
     res.status(200).json(responseBody);
   } catch (err: any) {
     console.error('PAYMENT_VERIFY_ERROR_CAUGHT:', err?.message || err);
     if (cleanKey) {
       try {
-        await pool.query(`UPDATE idempotency_keys SET status = 'FAILED' WHERE idempotency_key = $1`, [cleanKey]);
+        await markIdempotencyFailed(pool, cleanKey);
       } catch {
         // Suppress secondary error
       }
