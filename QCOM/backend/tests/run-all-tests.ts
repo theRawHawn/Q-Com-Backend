@@ -42,6 +42,10 @@ import { runSprint14_6ScalabilityAndMultiInstanceTests } from './sprint14-6-scal
 import { runSprint14_7AuthenticationSecurityTests } from './sprint14-7-authentication-and-credential-security.test.js';
 import { runSprint15_1PaymentIdempotencyAndIntegrityTests } from './sprint15-1-payment-idempotency-and-integrity.test.js';
 import { runSprint15_1_1PaymentIntegrityVerificationTests } from './sprint15-1-1-payment-integrity-verification.test.js';
+import { runSprint15_2RealPostgresqlPaymentIntegrityTests } from './sprint15-1-2-real-postgresql-payment-integrity.test.js';
+import { runSprint15_3PaymentIntegrityClosureTests } from './sprint15-1-3-payment-integrity-closure.test.js';
+import { runSprint15_4GitRecoveryAndReconciliationClosureTests } from './sprint15-1-4-git-recovery-and-reconciliation-closure.test.js';
+import { runSprint15_6RealPostgresqlAndConcurrencyTests } from './sprint15-1-6-real-postgresql-and-concurrency.test.js';
 
 async function runAllTests() {
   console.log('===========================================================');
@@ -151,6 +155,14 @@ async function runAllTests() {
     await runSprint15_1PaymentIdempotencyAndIntegrityTests();
     // Sprint 15.1.1 Payment Integrity Verification, Concurrency & Recovery Tests
     await runSprint15_1_1PaymentIntegrityVerificationTests();
+    // Sprint 15.1.2 Real PostgreSQL Payment Integrity & Concurrency Verification Tests
+    await runSprint15_2RealPostgresqlPaymentIntegrityTests();
+    // Sprint 15.1.3 Payment Integrity Closure, Concurrency & Recovery Tests
+    await runSprint15_3PaymentIntegrityClosureTests();
+    // Sprint 15.1.4 Git Recovery, Idempotency Reclamation & Reconciliation Closure Tests
+    await runSprint15_4GitRecoveryAndReconciliationClosureTests();
+    // Sprint 15.1.6 Real PostgreSQL 16 Verification & Payment Concurrency Tests
+    await runSprint15_6RealPostgresqlAndConcurrencyTests();
 
     const duration = ((Date.now() - start) / 1000).toFixed(2);
     console.log('\n===========================================================');

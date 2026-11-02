@@ -38,7 +38,7 @@ export class MockPaymentProvider implements PaymentProvider {
   private options: MockProviderOptions;
 
   // In-memory state tracking for sandbox lifecycle
-  private sessionsByRef = new Map<string, { params: CreatePaymentSessionParams; status: string; paymentId?: string }>();
+  private sessionsByRef = new Map<string, { params: CreatePaymentSessionParams; status: string; paymentId?: string; signature?: string }>();
   private refundsById = new Map<string, ProviderRefundResult>();
   private refundsByIdempotency = new Map<string, ProviderRefundResult>();
 
@@ -85,6 +85,7 @@ export class MockPaymentProvider implements PaymentProvider {
     this.sessionsByRef.set(providerReference, {
       params,
       status: 'INITIATED',
+      signature,
     });
 
     return {
@@ -214,6 +215,11 @@ export class MockPaymentProvider implements PaymentProvider {
 
     let isSigMatch = false;
     if (signature === 'mock_sig' || evidence?.simulatedSuccess === true) {
+      isSigMatch = true;
+    }
+
+    const matchedSession = this.sessionsByRef.get(providerReference);
+    if (matchedSession && (matchedSession as any).signature && (matchedSession as any).signature === signature) {
       isSigMatch = true;
     }
 

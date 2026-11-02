@@ -30,13 +30,15 @@ export class FinancialWebhookService {
   public verifySignature(rawBody: Buffer | string, signature: string): boolean {
     if (!signature || !rawBody) return false;
 
-    // Check against Payment Provider verification
-    if (this.paymentProvider.verifyWebhookSignature({ rawBody, signature })) {
+    // Check against current active Payment Provider verification
+    const activePaymentProvider = getPaymentProvider();
+    if (activePaymentProvider.verifyWebhookSignature({ rawBody, signature })) {
       return true;
     }
 
     // Check against Payout Provider verification
-    if (this.payoutProvider.verifyWebhookSignature && this.payoutProvider.verifyWebhookSignature({ rawBody, signature })) {
+    const activePayoutProvider = getPayoutProvider();
+    if (activePayoutProvider.verifyWebhookSignature && activePayoutProvider.verifyWebhookSignature({ rawBody, signature })) {
       return true;
     }
 

@@ -150,12 +150,23 @@ orderRouter.post('/create', authenticate, checkoutRateLimiter, async (req: Reque
   if (cleanKey) {
     try {
       const existingKeyRes = await pool.query(
-        `SELECT status, status_code, response_body, request_fingerprint FROM idempotency_keys WHERE idempotency_key = $1`,
+        `SELECT status, status_code, response_body, request_fingerprint, actor_id FROM idempotency_keys WHERE idempotency_key = $1`,
         [cleanKey]
       );
 
       if (existingKeyRes.rows.length > 0) {
         const existing = existingKeyRes.rows[0];
+
+        // Actor ownership verification: Prevent cross-user key hijacking
+        if (existing.actor_id && req.auth?.userId && existing.actor_id !== req.auth.userId) {
+          res.status(403).json({
+            success: false,
+            error: 'IDEMPOTENCY_KEY_ACTOR_MISMATCH',
+            message: 'Access forbidden: This Idempotency-Key belongs to a different user or tenant.',
+            requestId,
+          });
+          return;
+        }
 
         // Reject if same key is used with a different request payload
         if (existing.request_fingerprint && existing.request_fingerprint !== requestFingerprint) {
@@ -184,16 +195,135 @@ orderRouter.post('/create', authenticate, checkoutRateLimiter, async (req: Reque
           });
           return;
         }
+
+        // Support retry for previously FAILED requests (Case E) with actor isolation
+        if (existing.status === 'FAILED') {
+          const reclaimRes = await pool.query(
+            `UPDATE idempotency_keys
+             SET status = 'PROCESSING', request_fingerprint = $1, created_at = NOW(), expires_at = NOW() + interval '24 hours'
+             WHERE idempotency_key = $2 AND actor_id = $3 AND status = 'FAILED'
+             RETURNING idempotency_key`,
+            [requestFingerprint, cleanKey, req.auth!.userId]
+          );
+          if (reclaimRes.rows.length === 0) {
+            const recheck = await pool.query(
+              `SELECT status, status_code, response_body, actor_id FROM idempotency_keys WHERE idempotency_key = $1`,
+              [cleanKey]
+            );
+            if (recheck.rows[0]?.actor_id && recheck.rows[0]?.actor_id !== req.auth!.userId) {
+              res.status(403).json({
+                success: false,
+                error: 'IDEMPOTENCY_KEY_ACTOR_MISMATCH',
+                message: 'Access forbidden: This Idempotency-Key belongs to a different user or tenant.',
+                requestId,
+              });
+              return;
+            }
+            if (recheck.rows[0]?.status === 'COMPLETED') {
+              const body = typeof recheck.rows[0].response_body === 'string' ? JSON.parse(recheck.rows[0].response_body) : recheck.rows[0].response_body;
+              res.status(recheck.rows[0].status_code || 200).json(body);
+              return;
+            }
+            res.status(409).json({
+              success: false,
+              error: 'ORDER_CREATION_IN_PROGRESS',
+              message: 'An order placement request with this Idempotency-Key is currently in progress.',
+              requestId,
+            });
+            return;
+          }
+        }
       }
 
-      // Record PROCESSING state
-      await pool.query(
-        `INSERT INTO idempotency_keys (idempotency_key, actor_id, endpoint, status, request_fingerprint, created_at, expires_at)
-         VALUES ($1, $2, $3, 'PROCESSING', $4, NOW(), NOW() + interval '24 hours')
-         ON CONFLICT (idempotency_key) DO UPDATE
-         SET status = 'PROCESSING', request_fingerprint = EXCLUDED.request_fingerprint`,
-        [cleanKey, req.auth!.userId, req.originalUrl, requestFingerprint]
-      );
+      // Record PROCESSING state via atomic insert if record did not already exist
+      if (existingKeyRes.rows.length === 0) {
+        try {
+          await pool.query(
+            `INSERT INTO idempotency_keys (idempotency_key, actor_id, endpoint, status, request_fingerprint, created_at, expires_at)
+             VALUES ($1, $2, $3, 'PROCESSING', $4, NOW(), NOW() + interval '24 hours')`,
+            [cleanKey, req.auth!.userId, req.originalUrl, requestFingerprint]
+          );
+        } catch (err: any) {
+          const isIdempotencyCollision =
+            (err.code === '23505' || err.message?.includes('unique') || err.message?.includes('duplicate')) &&
+            (!err.constraint || err.constraint.includes('idempotency') || err.table === 'idempotency_keys');
+
+          if (isIdempotencyCollision) {
+            const reCheck = await pool.query(
+              `SELECT status, status_code, response_body, request_fingerprint, actor_id FROM idempotency_keys WHERE idempotency_key = $1`,
+              [cleanKey]
+            );
+            if (reCheck.rows.length > 0) {
+              const existing = reCheck.rows[0];
+              // Actor ownership check in collision path
+              if (existing.actor_id && req.auth?.userId && existing.actor_id !== req.auth.userId) {
+                res.status(403).json({
+                  success: false,
+                  error: 'IDEMPOTENCY_KEY_ACTOR_MISMATCH',
+                  message: 'Access forbidden: This Idempotency-Key belongs to a different user or tenant.',
+                  requestId,
+                });
+                return;
+              }
+              if (existing.request_fingerprint && existing.request_fingerprint !== requestFingerprint) {
+                res.status(422).json({
+                  success: false,
+                  error: 'IDEMPOTENCY_PAYLOAD_MISMATCH',
+                  message: 'This Idempotency-Key was already used for an order creation with a different request payload.',
+                  requestId,
+                });
+                return;
+              }
+              if (existing.status === 'COMPLETED') {
+                const body = typeof existing.response_body === 'string' ? JSON.parse(existing.response_body) : existing.response_body;
+                res.status(existing.status_code || 200).json(body);
+                return;
+              }
+              if (existing.status === 'FAILED') {
+                const reclaim = await pool.query(
+                  `UPDATE idempotency_keys
+                   SET status = 'PROCESSING', request_fingerprint = $1, created_at = NOW(), expires_at = NOW() + interval '24 hours'
+                   WHERE idempotency_key = $2 AND actor_id = $3 AND status = 'FAILED'
+                   RETURNING idempotency_key`,
+                  [requestFingerprint, cleanKey, req.auth!.userId]
+                );
+                if (reclaim.rows.length === 0) {
+                  res.status(409).json({
+                    success: false,
+                    error: 'ORDER_CREATION_IN_PROGRESS',
+                    message: 'An order placement request with this Idempotency-Key is currently in progress.',
+                    requestId,
+                  });
+                  return;
+                }
+              } else {
+                res.status(409).json({
+                  success: false,
+                  error: 'ORDER_CREATION_IN_PROGRESS',
+                  message: 'An order placement request with this Idempotency-Key is currently in progress.',
+                  requestId,
+                });
+                return;
+              }
+            } else {
+              throw err;
+            }
+          } else {
+            if (isDatabaseUnavailable(err)) {
+              res.setHeader('Retry-After', '3');
+              res.status(503).json({
+                success: false,
+                error: 'DATABASE_UNAVAILABLE',
+                message: 'PostgreSQL database is currently unavailable. Please retry using the same Idempotency-Key.',
+                retryAfterSeconds: 3,
+                requestId,
+              });
+              return;
+            }
+            throw err;
+          }
+        }
+      }
     } catch (err: any) {
       if (isDatabaseUnavailable(err)) {
         res.setHeader('Retry-After', '3');

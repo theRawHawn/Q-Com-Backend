@@ -152,6 +152,53 @@ async function claimIdempotencyKey(params: {
 
     // Completed check: Return cached response directly
     if (existing.status === 'COMPLETED') {
+      // Phase D: Close Payment Reconciliation Response-Caching Risk
+      // If the cached response was RECONCILIATION_REQUIRED (202), verify whether
+      // the payment was subsequently reconciled and settled (via authoritative webhook or background worker).
+      const cachedBody = typeof existing.response_body === 'string'
+        ? JSON.parse(existing.response_body)
+        : existing.response_body;
+
+      if (existing.status_code === 202 || cachedBody?.status === 'RECONCILIATION_REQUIRED' || cachedBody?.isReconciliationRequired === true) {
+        const orderId = cachedBody?.order?.id || cachedBody?.orderId || cachedBody?.paymentReceipt?.orderId;
+        if (orderId) {
+          const durableRes = await pool.query(
+            `SELECT o.id, o.status, o.payment_status, pi.status as intent_status
+             FROM orders o
+             LEFT JOIN payment_intents pi ON pi.order_id = o.id
+             WHERE o.id = $1
+             ORDER BY pi.created_at DESC LIMIT 1`,
+            [orderId]
+          );
+          if (durableRes.rows.length > 0) {
+            const row = durableRes.rows[0];
+            if (row.payment_status === 'PAID' || row.intent_status === 'CAPTURED') {
+              const updatedBody = {
+                ...cachedBody,
+                success: true,
+                message: 'Payment verified and captured successfully (reconciliation resolved).',
+                order: { ...cachedBody.order, id: row.id, status: row.status, payment_status: row.payment_status },
+                isDuplicate: false,
+                isReconciliationRequired: false,
+                status: 'CAPTURED',
+              };
+              await pool.query(
+                `UPDATE idempotency_keys
+                 SET status_code = 200, response_body = $1
+                 WHERE idempotency_key = $2`,
+                [JSON.stringify(updatedBody), idempotencyKey]
+              );
+              return {
+                claimed: false,
+                status: 'COMPLETED',
+                statusCode: 200,
+                responseBody: updatedBody,
+              };
+            }
+          }
+        }
+      }
+
       return {
         claimed: false,
         status: 'COMPLETED',
@@ -172,14 +219,22 @@ async function claimIdempotencyKey(params: {
       }
     }
 
-    // Stale PROCESSING (> 2 minutes) or FAILED state: Reclamation
-    await pool.query(
+    // Stale PROCESSING (> 2 minutes) or FAILED state: Reclamation scoped to actor
+    const reclaimRes = await pool.query(
       `UPDATE idempotency_keys
        SET status = 'PROCESSING', request_fingerprint = $1, created_at = NOW()
-       WHERE idempotency_key = $2`,
-      [requestFingerprint, idempotencyKey]
+       WHERE idempotency_key = $2 AND (actor_id = $3 OR actor_id IS NULL)
+       RETURNING idempotency_key`,
+      [requestFingerprint, idempotencyKey, actorId]
     );
-    return { claimed: true };
+    if (reclaimRes.rows.length > 0) {
+      return { claimed: true };
+    }
+    return {
+      claimed: false,
+      status: 'PROCESSING',
+      conflictError: 'An operation with this Idempotency-Key is currently in progress.',
+    };
   }
 
   // 2. Insert initial PROCESSING state
@@ -493,19 +548,26 @@ paymentRouter.post('/verify', authenticate, async (req: Request, res: Response):
       razorpayOrderId,
     });
 
+    const isRec = !!result.isReconciliationRequired;
     const responseBody = {
-      success: !result.isDuplicate,
+      success: !result.isDuplicate && !isRec,
       message: result.isDuplicate
         ? 'Payment has already been captured and verified (duplicate/replay detected).'
+        : isRec
+        ? 'Payment outcome is ambiguous or gateway connection was interrupted. Marked for reconciliation.'
         : 'Payment verified and captured successfully. Ledger journal posted.',
       order: result.order,
       paymentReceipt: result.receipt,
       isDuplicate: !!result.isDuplicate,
+      isReconciliationRequired: isRec,
+      status: result.status || (isRec ? 'RECONCILIATION_REQUIRED' : 'CAPTURED'),
     };
+
+    const statusCode = result.isDuplicate ? 409 : isRec ? 202 : 200;
 
     if (cleanKey) {
       try {
-        await markIdempotencyCompleted(pool, cleanKey, result.isDuplicate ? 409 : 200, responseBody);
+        await markIdempotencyCompleted(pool, cleanKey, statusCode, responseBody);
       } catch (err: any) {
         if (paymentService.isDatabaseUnavailable(err)) {
           res.setHeader('Retry-After', '3');
@@ -523,6 +585,11 @@ paymentRouter.post('/verify', authenticate, async (req: Request, res: Response):
 
     if (result.isDuplicate) {
       res.status(409).json(responseBody);
+      return;
+    }
+
+    if (isRec) {
+      res.status(202).json(responseBody);
       return;
     }
 
@@ -622,6 +689,51 @@ paymentRouter.get('/providers', (_req: Request, res: Response): void => {
     };
   });
   res.status(200).json({ success: true, providers });
+});
+
+/**
+ * GET /api/payment/status/:orderId & GET /api/v1/payments/status/:orderId
+ * Safe payment status query for authenticated order owner
+ */
+paymentRouter.get('/status/:orderId', authenticate, async (req: Request, res: Response): Promise<void> => {
+  const { orderId } = req.params;
+  const requestId = (req as any).requestId || req.headers['x-request-id'] || 'req-payment-status';
+
+  if (!orderId) {
+    res.status(400).json({ success: false, error: 'MISSING_ORDER_ID', message: 'orderId is required.', requestId });
+    return;
+  }
+
+  try {
+    const payment = await paymentService.getPaymentStatus(orderId, req.auth!.userId);
+    res.status(200).json({
+      success: true,
+      payment,
+    });
+  } catch (err: any) {
+    if (paymentService.isDatabaseUnavailable(err)) {
+      res.setHeader('Retry-After', '3');
+      res.status(503).json({
+        success: false,
+        error: 'DATABASE_UNAVAILABLE',
+        message: 'PostgreSQL database is currently unavailable.',
+        retryAfterSeconds: 3,
+        requestId,
+      });
+      return;
+    }
+
+    const msg = (err.message || '').toLowerCase();
+    const isUnauthorized = msg.includes('unauthorized');
+    const isNotFound = msg.includes('not found');
+
+    res.status(isUnauthorized ? 403 : isNotFound ? 404 : 500).json({
+      success: false,
+      error: isUnauthorized ? 'UNAUTHORIZED_PAYMENT_ACCESS' : isNotFound ? 'ORDER_NOT_FOUND' : 'PAYMENT_STATUS_FAILED',
+      message: err.message || 'Failed to fetch payment status.',
+      requestId,
+    });
+  }
 });
 
 /**

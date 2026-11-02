@@ -494,12 +494,9 @@ export class PaymentService {
         } else {
           isSigValid = provRes.verified;
         }
-      } catch {
+      } catch (err: any) {
+        console.warn(`Provider verifyPayment communication error: ${err.message}`);
         isReconciliationRequired = true;
-      }
-
-      if (!isSigValid && currentIntent?.signature && currentIntent.signature === signature) {
-        isSigValid = true;
       }
 
       if (isReconciliationRequired) {
