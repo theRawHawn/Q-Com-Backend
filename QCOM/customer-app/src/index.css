@@ -1,0 +1,114 @@
+@import "tailwindcss";
+@import "leaflet/dist/leaflet.css";
+
+html, body, #root {
+  overflow-x: hidden;
+  max-width: 100vw;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border-radius: 0 !important;
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+/* Hide scrollbar for horizontal chip carousels */
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Leaflet map styling & hide attribution text */
+.leaflet-control-attribution,
+.leaflet-control-attribution a {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+/* Custom leaflet animations */
+@keyframes pulse-ring {
+  0% { transform: scale(0.95); opacity: 0.8; }
+  50% { transform: scale(1.15); opacity: 0.3; }
+  100% { transform: scale(0.95); opacity: 0.8; }
+}
+
+@keyframes pin-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-4px); }
+}
+
+@keyframes contact-wave {
+  0% { transform: scale(0.5); opacity: 0.9; }
+  100% { transform: scale(2.0); opacity: 0; }
+}
+
+.custom-dest-pin-animated {
+  animation: pin-float 2.5s ease-in-out infinite;
+}
+
+.contact-ripple-wave {
+  animation: contact-wave 1.8s cubic-bezier(0.1, 0.5, 0.8, 1) infinite;
+}
+
+/* Custom Leaflet Zoom Control styling */
+.leaflet-bottom.leaflet-right .leaflet-control-zoom {
+  border: none !important;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.15) !important;
+  border-radius: 12px !important;
+  overflow: hidden;
+  margin-right: 12px !important;
+  margin-bottom: 12px !important;
+}
+
+.leaflet-control-zoom a {
+  width: 38px !important;
+  height: 38px !important;
+  line-height: 38px !important;
+  color: #0f172a !important;
+  font-weight: 800 !important;
+  font-size: 16px !important;
+  background-color: #ffffff !important;
+  border-bottom: 1px solid #f1f5f9 !important;
+}
+
+.leaflet-control-zoom a:hover {
+  background-color: #f8fafc !important;
+  color: #10b981 !important;
+}
+
+/* Creative Live Soundwave Voice Equalizer Animations */
+@keyframes live-voice-bar-1 {
+  0%, 100% { height: 5px; opacity: 0.7; }
+  50% { height: 20px; opacity: 1; }
+}
+@keyframes live-voice-bar-2 {
+  0%, 100% { height: 18px; opacity: 1; }
+  50% { height: 7px; opacity: 0.6; }
+}
+@keyframes live-voice-bar-3 {
+  0%, 100% { height: 8px; opacity: 0.7; }
+  50% { height: 24px; opacity: 1; }
+}
+@keyframes live-voice-bar-4 {
+  0%, 100% { height: 22px; opacity: 1; }
+  50% { height: 9px; opacity: 0.6; }
+}
+@keyframes live-voice-bar-5 {
+  0%, 100% { height: 6px; opacity: 0.7; }
+  50% { height: 17px; opacity: 1; }
+}
+
+.voice-wave-bar-1 { animation: live-voice-bar-1 0.65s ease-in-out infinite; }
+.voice-wave-bar-2 { animation: live-voice-bar-2 0.5s ease-in-out infinite 0.1s; }
+.voice-wave-bar-3 { animation: live-voice-bar-3 0.75s ease-in-out infinite 0.2s; }
+.voice-wave-bar-4 { animation: live-voice-bar-4 0.55s ease-in-out infinite 0.15s; }
+.voice-wave-bar-5 { animation: live-voice-bar-5 0.7s ease-in-out infinite 0.05s; }

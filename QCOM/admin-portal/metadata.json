@@ -1,0 +1,6 @@
+{
+  "name": "QCOM Admin Portal",
+  "description": "Enterprise Control Room and Operations Management Portal for QCOM Hyperlocal Hardware Marketplace with fine-grained RBAC.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

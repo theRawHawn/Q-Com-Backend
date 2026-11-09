@@ -1,0 +1,7 @@
+{
+  "name": "RushQ - Hyperlocal Address Delivery",
+  "description": "Hyper-local quick-commerce platform delivering top essential hardware, plumbing, electrical fittings, fasteners, adhesives, and tools directly to delivery addresses with live seller distance ETA.",
+  "requestFramePermissions": ["camera", "geolocation", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

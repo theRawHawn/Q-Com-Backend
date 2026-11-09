@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:16.6-alpine
+    environment:
+      POSTGRES_USER: qcom_it_admin
+      POSTGRES_PASSWORD: ${QCOM_IT_POSTGRES_PASSWORD:?Set QCOM_IT_POSTGRES_PASSWORD for local integration services}
+      POSTGRES_DB: postgres
+    command: ["postgres", "-c", "max_connections=100"]
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qcom_it_admin -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks:
+      - qcom-integration
+
+  redis:
+    image: redis:7.4.2-alpine
+    environment:
+      QCOM_IT_REDIS_PASSWORD: ${QCOM_IT_REDIS_PASSWORD:?Set QCOM_IT_REDIS_PASSWORD for local integration services}
+    command: ["sh", "-c", "exec redis-server --save '' --appendonly no --requirepass \"$$QCOM_IT_REDIS_PASSWORD\""]
+    ports:
+      - "127.0.0.1:56379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${QCOM_IT_REDIS_PASSWORD}\" redis-cli ping | grep -q PONG"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks:
+      - qcom-integration
+
+networks:
+  qcom-integration:
+    internal: true

@@ -1,0 +1,870 @@
+import { Router, Request, Response } from 'express';
+import crypto from 'crypto';
+import { orderService } from '../modules/orders/orderService.js';
+import { cancellationService } from '../modules/orders/cancellationService.js';
+import { authenticate } from '../middleware/auth.js';
+import { requireRole } from '../middleware/rbac.js';
+import { requireOrderOwnership } from '../middleware/resourceOwnership.js';
+import { getPool } from '../database/connection.js';
+import { checkoutRateLimiter, sellerActionRateLimiter } from '../middleware/rateLimiter.js';
+import { inventoryService } from '../modules/inventory/inventoryService.js';
+import { outboxService } from '../modules/outbox/outboxService.js';
+
+export const orderRouter = Router();
+
+/**
+ * POST /api/orders/check-availability & POST /api/v1/orders/check-availability
+ * Authoritatively verifies current available quantity (stock_count - reserved_count)
+ */
+orderRouter.post('/check-availability', async (req: Request, res: Response): Promise<void> => {
+  const { merchantId, items } = req.body;
+  if (!merchantId || !items || !Array.isArray(items)) {
+    res.status(400).json({
+      success: false,
+      error: 'INVALID_INPUT',
+      message: 'merchantId and items array are required.',
+    });
+    return;
+  }
+  try {
+    const formattedItems = items.map((i: any) => ({
+      productId: i.id || i.productId,
+      quantity: Number(i.quantity || 1),
+    }));
+    const availability = await inventoryService.checkAvailability(merchantId, formattedItems);
+    res.status(200).json({
+      success: true,
+      ...availability,
+    });
+  } catch (err: any) {
+    if (isDatabaseUnavailable(err)) {
+      res.setHeader('Retry-After', '3');
+      res.status(503).json({
+        success: false,
+        error: 'DATABASE_UNAVAILABLE',
+        message: 'PostgreSQL database is currently unavailable.',
+        retryAfterSeconds: 3,
+      });
+      return;
+    }
+    res.status(500).json({
+      success: false,
+      error: 'AVAILABILITY_CHECK_FAILED',
+      message: err.message || 'Failed to check inventory availability.',
+    });
+  }
+});
+
+function isDatabaseUnavailable(err: any): boolean {
+  if (!err) return false;
+  const msg = (err.message || '').toLowerCase();
+  const code = (err.code || '').toLowerCase();
+  return (
+    err.isDatabaseUnavailable === true ||
+    code === '57p01' ||
+    code === '57p02' ||
+    code === '57p03' ||
+    code === '08006' ||
+    code === '08001' ||
+    code === '08004' ||
+    code === 'econnrefused' ||
+    code === 'etimedout' ||
+    code === 'econnreset' ||
+    msg.includes('connection terminated') ||
+    msg.includes('database is closed') ||
+    msg.includes('connection refused') ||
+    msg.includes('cannot connect') ||
+    msg.includes('timeout')
+  );
+}
+
+/**
+ * POST /api/orders/create & POST /api/v1/orders/create
+ */
+orderRouter.post('/create', authenticate, checkoutRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  const pool = getPool();
+  const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
+  const cleanKey = idempotencyKey && typeof idempotencyKey === 'string' ? idempotencyKey.trim().slice(0, 120) : undefined;
+  const requestId = (req as any).requestId || req.headers['x-request-id'] || 'req-order';
+
+  const { 
+    items, 
+    deliveryLocation, 
+    deliveryAddress, 
+    jobSite: rawJobSite, 
+    paymentMethod, 
+    couponCode, 
+    isGstEnabled, 
+    gstin, 
+    businessName, 
+    riderTip, 
+    merchantId 
+  } = req.body;
+
+  const destinationLocation = deliveryLocation || deliveryAddress || rawJobSite;
+
+  if (!items || !Array.isArray(items) || items.length === 0) {
+    res.status(400).json({ success: false, error: 'EMPTY_CART', message: 'Cart items are required.' });
+    return;
+  }
+  if (!destinationLocation || typeof destinationLocation !== 'object') {
+    res.status(400).json({ success: false, error: 'INVALID_LOCATION', message: 'Valid deliveryLocation or deliveryAddress is required.' });
+    return;
+  }
+
+  // Resilient coordinate normalization: accepts deliveryLocation.coordinates.lat/lng, lat/lng, or latitude/longitude
+  const rawLat = destinationLocation.latitude ?? destinationLocation.lat ?? destinationLocation.coordinates?.lat ?? destinationLocation.coordinates?.latitude ?? 12.9352;
+  const rawLng = destinationLocation.longitude ?? destinationLocation.lng ?? destinationLocation.coordinates?.lng ?? destinationLocation.coordinates?.longitude ?? 77.6245;
+  const parsedLat = typeof rawLat === 'number' ? rawLat : parseFloat(rawLat);
+  const parsedLng = typeof rawLng === 'number' ? rawLng : parseFloat(rawLng);
+
+  if (isNaN(parsedLat) || isNaN(parsedLng)) {
+    res.status(400).json({ success: false, error: 'INVALID_LOCATION', message: 'Valid delivery latitude and longitude are required.' });
+    return;
+  }
+
+  // Standardized normalized delivery location object (retaining jobSite property internally for DB & backward compatibility)
+  const normalizedDeliveryLocation = {
+    ...destinationLocation,
+    latitude: parsedLat,
+    longitude: parsedLng,
+  };
+
+  // 1. Deterministic Request Fingerprint
+  const normalizedPayload = {
+    userId: req.auth!.userId,
+    items: items.map((i: any) => ({ productId: i.id || i.productId, quantity: Number(i.quantity || 1) })).sort((a, b) => a.productId.localeCompare(b.productId)),
+    deliveryLocation: {
+      latitude: normalizedDeliveryLocation.latitude,
+      longitude: normalizedDeliveryLocation.longitude,
+      address: normalizedDeliveryLocation.address || '',
+    },
+    paymentMethod: paymentMethod || 'Instant UPI',
+    couponCode: couponCode || null,
+    isGstEnabled: !!isGstEnabled,
+    gstin: gstin || null,
+  };
+  const requestFingerprint = crypto.createHash('sha256').update(JSON.stringify(normalizedPayload)).digest('hex');
+
+  // 2. Idempotency Check
+  if (cleanKey) {
+    try {
+      const existingKeyRes = await pool.query(
+        `SELECT status, status_code, response_body, request_fingerprint, actor_id FROM idempotency_keys WHERE idempotency_key = $1`,
+        [cleanKey]
+      );
+
+      if (existingKeyRes.rows.length > 0) {
+        const existing = existingKeyRes.rows[0];
+
+        // Actor ownership verification: Prevent cross-user key hijacking
+        if (existing.actor_id && req.auth?.userId && existing.actor_id !== req.auth.userId) {
+          res.status(403).json({
+            success: false,
+            error: 'IDEMPOTENCY_KEY_ACTOR_MISMATCH',
+            message: 'Access forbidden: This Idempotency-Key belongs to a different user or tenant.',
+            requestId,
+          });
+          return;
+        }
+
+        // Reject if same key is used with a different request payload
+        if (existing.request_fingerprint && existing.request_fingerprint !== requestFingerprint) {
+          res.status(422).json({
+            success: false,
+            error: 'IDEMPOTENCY_PAYLOAD_MISMATCH',
+            message: 'This Idempotency-Key was already used for an order creation with a different request payload.',
+            requestId,
+          });
+          return;
+        }
+
+        // Return original result if COMPLETED
+        if (existing.status === 'COMPLETED') {
+          res.status(existing.status_code || 200).json(existing.response_body);
+          return;
+        }
+
+        // Return 409 if currently PROCESSING
+        if (existing.status === 'PROCESSING') {
+          res.status(409).json({
+            success: false,
+            error: 'ORDER_CREATION_IN_PROGRESS',
+            message: 'An order placement request with this Idempotency-Key is currently in progress.',
+            requestId,
+          });
+          return;
+        }
+
+        // Support retry for previously FAILED requests (Case E) with actor isolation
+        if (existing.status === 'FAILED') {
+          const reclaimRes = await pool.query(
+            `UPDATE idempotency_keys
+             SET status = 'PROCESSING', request_fingerprint = $1, created_at = NOW(), expires_at = NOW() + interval '24 hours'
+             WHERE idempotency_key = $2 AND actor_id = $3 AND status = 'FAILED'
+             RETURNING idempotency_key`,
+            [requestFingerprint, cleanKey, req.auth!.userId]
+          );
+          if (reclaimRes.rows.length === 0) {
+            const recheck = await pool.query(
+              `SELECT status, status_code, response_body, actor_id FROM idempotency_keys WHERE idempotency_key = $1`,
+              [cleanKey]
+            );
+            if (recheck.rows[0]?.actor_id && recheck.rows[0]?.actor_id !== req.auth!.userId) {
+              res.status(403).json({
+                success: false,
+                error: 'IDEMPOTENCY_KEY_ACTOR_MISMATCH',
+                message: 'Access forbidden: This Idempotency-Key belongs to a different user or tenant.',
+                requestId,
+              });
+              return;
+            }
+            if (recheck.rows[0]?.status === 'COMPLETED') {
+              const body = typeof recheck.rows[0].response_body === 'string' ? JSON.parse(recheck.rows[0].response_body) : recheck.rows[0].response_body;
+              res.status(recheck.rows[0].status_code || 200).json(body);
+              return;
+            }
+            res.status(409).json({
+              success: false,
+              error: 'ORDER_CREATION_IN_PROGRESS',
+              message: 'An order placement request with this Idempotency-Key is currently in progress.',
+              requestId,
+            });
+            return;
+          }
+        }
+      }
+
+      // Record PROCESSING state via atomic insert if record did not already exist
+      if (existingKeyRes.rows.length === 0) {
+        try {
+          await pool.query(
+            `INSERT INTO idempotency_keys (idempotency_key, actor_id, endpoint, status, request_fingerprint, created_at, expires_at)
+             VALUES ($1, $2, $3, 'PROCESSING', $4, NOW(), NOW() + interval '24 hours')`,
+            [cleanKey, req.auth!.userId, req.originalUrl, requestFingerprint]
+          );
+        } catch (err: any) {
+          const isIdempotencyCollision =
+            (err.code === '23505' || err.message?.includes('unique') || err.message?.includes('duplicate')) &&
+            (!err.constraint || err.constraint.includes('idempotency') || err.table === 'idempotency_keys');
+
+          if (isIdempotencyCollision) {
+            const reCheck = await pool.query(
+              `SELECT status, status_code, response_body, request_fingerprint, actor_id FROM idempotency_keys WHERE idempotency_key = $1`,
+              [cleanKey]
+            );
+            if (reCheck.rows.length > 0) {
+              const existing = reCheck.rows[0];
+              // Actor ownership check in collision path
+              if (existing.actor_id && req.auth?.userId && existing.actor_id !== req.auth.userId) {
+                res.status(403).json({
+                  success: false,
+                  error: 'IDEMPOTENCY_KEY_ACTOR_MISMATCH',
+                  message: 'Access forbidden: This Idempotency-Key belongs to a different user or tenant.',
+                  requestId,
+                });
+                return;
+              }
+              if (existing.request_fingerprint && existing.request_fingerprint !== requestFingerprint) {
+                res.status(422).json({
+                  success: false,
+                  error: 'IDEMPOTENCY_PAYLOAD_MISMATCH',
+                  message: 'This Idempotency-Key was already used for an order creation with a different request payload.',
+                  requestId,
+                });
+                return;
+              }
+              if (existing.status === 'COMPLETED') {
+                const body = typeof existing.response_body === 'string' ? JSON.parse(existing.response_body) : existing.response_body;
+                res.status(existing.status_code || 200).json(body);
+                return;
+              }
+              if (existing.status === 'FAILED') {
+                const reclaim = await pool.query(
+                  `UPDATE idempotency_keys
+                   SET status = 'PROCESSING', request_fingerprint = $1, created_at = NOW(), expires_at = NOW() + interval '24 hours'
+                   WHERE idempotency_key = $2 AND actor_id = $3 AND status = 'FAILED'
+                   RETURNING idempotency_key`,
+                  [requestFingerprint, cleanKey, req.auth!.userId]
+                );
+                if (reclaim.rows.length === 0) {
+                  res.status(409).json({
+                    success: false,
+                    error: 'ORDER_CREATION_IN_PROGRESS',
+                    message: 'An order placement request with this Idempotency-Key is currently in progress.',
+                    requestId,
+                  });
+                  return;
+                }
+              } else {
+                res.status(409).json({
+                  success: false,
+                  error: 'ORDER_CREATION_IN_PROGRESS',
+                  message: 'An order placement request with this Idempotency-Key is currently in progress.',
+                  requestId,
+                });
+                return;
+              }
+            } else {
+              throw err;
+            }
+          } else {
+            if (isDatabaseUnavailable(err)) {
+              res.setHeader('Retry-After', '3');
+              res.status(503).json({
+                success: false,
+                error: 'DATABASE_UNAVAILABLE',
+                message: 'PostgreSQL database is currently unavailable. Please retry using the same Idempotency-Key.',
+                retryAfterSeconds: 3,
+                requestId,
+              });
+              return;
+            }
+            throw err;
+          }
+        }
+      }
+    } catch (err: any) {
+      if (isDatabaseUnavailable(err)) {
+        res.setHeader('Retry-After', '3');
+        res.status(503).json({
+          success: false,
+          error: 'DATABASE_UNAVAILABLE',
+          message: 'PostgreSQL database is currently unavailable. Please retry using the same Idempotency-Key.',
+          retryAfterSeconds: 3,
+          requestId,
+        });
+        return;
+      }
+      throw err;
+    }
+  }
+
+  // 3. Execute Order Creation in PostgreSQL Transaction
+  try {
+    const result = await orderService.createOrder({
+      userId: req.auth!.userId,
+      merchantId,
+      items: items.map((i: any) => ({ productId: i.id || i.productId, quantity: Number(i.quantity || 1) })),
+      jobSite: normalizedDeliveryLocation,
+      deliveryLocation: normalizedDeliveryLocation,
+      paymentMethod: paymentMethod || 'Instant UPI',
+      couponCode,
+      isGstEnabled,
+      gstin,
+      businessName,
+      riderTip,
+      idempotencyKey: cleanKey,
+    });
+
+    const responseBody = {
+      success: true,
+      message: 'Order placed successfully and locked with authoritative pricing snapshot.',
+      order: result.order,
+      priceSnapshot: result.pricingSnapshot,
+    };
+
+    // 4. Mark Idempotency Record COMPLETED
+    if (cleanKey) {
+      try {
+        await pool.query(
+          `UPDATE idempotency_keys
+           SET status = 'COMPLETED', status_code = 200, response_body = $1
+           WHERE idempotency_key = $2`,
+          [JSON.stringify(responseBody), cleanKey]
+        );
+      } catch (err: any) {
+        if (isDatabaseUnavailable(err)) {
+          res.setHeader('Retry-After', '3');
+          res.status(503).json({
+            success: false,
+            error: 'DATABASE_UNAVAILABLE',
+            message: 'PostgreSQL database is currently unavailable. Please retry using the same Idempotency-Key.',
+            retryAfterSeconds: 3,
+            requestId,
+          });
+          return;
+        }
+      }
+    }
+
+    res.status(200).json(responseBody);
+  } catch (err: any) {
+    if (cleanKey) {
+      try {
+        await pool.query(
+          `UPDATE idempotency_keys SET status = 'FAILED' WHERE idempotency_key = $1`,
+          [cleanKey]
+        );
+      } catch {
+        // Suppress update error if DB connection broke
+      }
+    }
+
+    if (isDatabaseUnavailable(err)) {
+      res.setHeader('Retry-After', '3');
+      res.status(503).json({
+        success: false,
+        error: 'DATABASE_UNAVAILABLE',
+        message: 'PostgreSQL database is currently unavailable. Please retry using the same Idempotency-Key.',
+        retryAfterSeconds: 3,
+        requestId,
+      });
+      return;
+    }
+
+    if (err.message && (err.message.includes('INSUFFICIENT_STOCK') || err.message.toLowerCase().includes('insufficient stock'))) {
+      res.status(400).json({
+        success: false,
+        error: 'INSUFFICIENT_STOCK',
+        message: err.message,
+        requestId,
+      });
+      return;
+    }
+
+    res.status(400).json({
+      success: false,
+      error: 'ORDER_CREATION_FAILED',
+      message: err.message || 'Failed to create order.',
+    });
+  }
+});
+
+/**
+ * GET /api/orders & GET /api/v1/orders
+ */
+orderRouter.get('/', authenticate, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const orders = await orderService.getOrders(req.auth!.userId);
+    res.status(200).json({
+      success: true,
+      orders,
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: 'ORDERS_FETCH_FAILED',
+      message: err.message || 'Failed to retrieve order history.',
+    });
+  }
+});
+
+/**
+ * GET /api/orders/:orderId & GET /api/v1/orders/:orderId
+ */
+orderRouter.get('/:orderId', authenticate, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { orderId } = req.params;
+    const isStaff = req.auth!.roles?.some((r: string) => ['SUPER_ADMIN', 'OPERATIONS', 'SELLER'].includes(r));
+    const order = await orderService.getOrderById(orderId, req.auth!.userId, isStaff);
+
+    if (!order) {
+      res.status(404).json({ success: false, error: 'ORDER_NOT_FOUND', message: 'Order not found or unauthorized.' });
+      return;
+    }
+
+    res.status(200).json({
+      success: true,
+      order,
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: 'ORDER_FETCH_FAILED',
+      message: err.message || 'Failed to retrieve order.',
+    });
+  }
+});
+
+/**
+ * POST /api/orders/:orderId/cancel & POST /api/v1/orders/:orderId/cancel
+ */
+orderRouter.post('/:orderId/cancel', authenticate, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { orderId } = req.params;
+    const { reason } = req.body;
+    const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
+    const result = await orderService.cancelOrder(orderId, req.auth!.userId, reason, idempotencyKey);
+
+    res.status(200).json({
+      success: true,
+      message: 'Order cancelled successfully and reserved inventory released.',
+      order: result.order,
+      refund: result.refund,
+    });
+  } catch (err: any) {
+    if (isDatabaseUnavailable(err)) {
+      res.status(503).json({ success: false, error: 'DATABASE_UNAVAILABLE', message: 'Database temporarily unavailable.' });
+      return;
+    }
+    const status = err.message.includes('NOT_FOUND') ? 404 : 400;
+    res.status(status).json({
+      success: false,
+      error: 'CANCELLATION_FAILED',
+      message: err.message || 'Failed to cancel order.',
+    });
+  }
+});
+
+/**
+ * POST /api/orders/:orderId/cancel-merchant & POST /api/v1/orders/:orderId/cancel-merchant
+ * Merchant cancellation: Validates caller merchant ownership for this specific order
+ */
+orderRouter.post(
+  '/:orderId/cancel-merchant',
+  authenticate,
+  requireOrderOwnership('orderId'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { orderId } = req.params;
+      const { reason, merchantId } = req.body;
+      const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
+
+      const pool = getPool();
+      const orderRes = await pool.query(`SELECT merchant_id FROM orders WHERE id = $1`, [orderId]);
+      if (orderRes.rows.length === 0) {
+        res.status(404).json({ success: false, error: 'ORDER_NOT_FOUND', message: 'Order not found.' });
+        return;
+      }
+      const orderMerchantId = orderRes.rows[0].merchant_id;
+      const isGlobalAdmin =
+        req.auth!.isSuperAdmin ||
+        req.auth!.roles.includes('SUPER_ADMIN') ||
+        req.auth!.roles.includes('OPERATIONS');
+      const isMerchantAuthorized = req.auth!.merchantIds && req.auth!.merchantIds.includes(orderMerchantId);
+
+      if (!isGlobalAdmin && !isMerchantAuthorized) {
+        res.status(403).json({
+          success: false,
+          error: 'FORBIDDEN',
+          message: 'You are not authorized to cancel orders for this merchant.',
+        });
+        return;
+      }
+
+      const effectiveMerchantId = orderMerchantId;
+
+      const result = await cancellationService.cancelBySeller({
+        orderId,
+        merchantId: effectiveMerchantId,
+        reason: reason || 'Merchant cancelled order.',
+        idempotencyKey,
+      });
+
+      res.status(200).json({
+        success: true,
+        message: 'Order cancelled by merchant.',
+        order: result.order,
+        refund: result.refund,
+      });
+    } catch (err: any) {
+      if (isDatabaseUnavailable(err)) {
+        res.status(503).json({ success: false, error: 'DATABASE_UNAVAILABLE', message: 'Database temporarily unavailable.' });
+        return;
+      }
+      const status = err.message.includes('NOT_FOUND') ? 404 : 400;
+      res.status(status).json({
+        success: false,
+        error: 'CANCELLATION_FAILED',
+        message: err.message || 'Failed to cancel order.',
+      });
+    }
+  }
+);
+
+/**
+ * POST /api/admin/orders/:orderId/cancel & POST /api/v1/admin/orders/:orderId/cancel
+ * Admin cancellation: Strictly restricted to Super Admin and Operations roles
+ */
+orderRouter.post(
+  '/admin/:orderId/cancel',
+  authenticate,
+  requireRole(['SUPER_ADMIN', 'OPERATIONS']),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { orderId } = req.params;
+      const { reason } = req.body;
+      const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
+
+      const result = await cancellationService.cancelByAdmin({
+        orderId,
+        adminUserId: req.auth!.userId,
+        reason: reason || 'Admin cancelled order.',
+        idempotencyKey,
+      });
+
+      res.status(200).json({
+        success: true,
+        message: 'Order cancelled by administrator.',
+        order: result.order,
+        refund: result.refund,
+      });
+    } catch (err: any) {
+      if (isDatabaseUnavailable(err)) {
+        res.status(503).json({ success: false, error: 'DATABASE_UNAVAILABLE', message: 'Database temporarily unavailable.' });
+        return;
+      }
+      const status = err.message.includes('NOT_FOUND') ? 404 : 400;
+      res.status(status).json({
+        success: false,
+        error: 'CANCELLATION_FAILED',
+        message: err.message || 'Failed to cancel order.',
+      });
+    }
+  }
+);
+
+/**
+ * GET /api/orders/delivery-economics/config
+ */
+orderRouter.get('/delivery-economics/config', async (req: Request, res: Response): Promise<void> => {
+  const pool = getPool();
+  try {
+    const resConfig = await pool.query(`
+      SELECT rider_base_payout, rider_per_km_rate, max_delivery_subsidy, pg_cost_percent, packaging_cost_inr, ops_cost_inr
+      FROM delivery_economics_configs
+      WHERE is_active = TRUE
+      LIMIT 1
+    `);
+    const row = resConfig.rows[0] || {
+      rider_base_payout: 45.00,
+      rider_per_km_rate: 8.00,
+      max_delivery_subsidy: 35.00,
+      pg_cost_percent: 1.80,
+      packaging_cost_inr: 8.00,
+      ops_cost_inr: 5.00,
+    };
+    res.status(200).json({
+      success: true,
+      config: {
+        riderBasePayout: parseFloat(row.rider_base_payout),
+        riderPerKmRate: parseFloat(row.rider_per_km_rate),
+        maxDeliverySubsidy: parseFloat(row.max_delivery_subsidy),
+        pgCostPercent: parseFloat(row.pg_cost_percent),
+        packagingCostInr: parseFloat(row.packaging_cost_inr),
+        opsCostInr: parseFloat(row.ops_cost_inr),
+      },
+    });
+  } catch {
+    res.status(200).json({
+      success: true,
+      config: {
+        riderBasePayout: 45.00,
+        riderPerKmRate: 8.00,
+        maxDeliverySubsidy: 35.00,
+        pgCostPercent: 1.80,
+        packagingCostInr: 8.00,
+        opsCostInr: 5.00,
+      },
+    });
+  }
+});
+
+/**
+ * POST /api/orders/delivery-economics/config
+ */
+orderRouter.post('/delivery-economics/config', async (req: Request, res: Response): Promise<void> => {
+  const { riderBasePayout, riderPerKmRate, maxDeliverySubsidy, pgCostPercent, packagingCostInr, opsCostInr } = req.body;
+  const pool = getPool();
+  try {
+    await pool.query(`
+      INSERT INTO delivery_economics_configs (key, rider_base_payout, rider_per_km_rate, max_delivery_subsidy, pg_cost_percent, packaging_cost_inr, ops_cost_inr)
+      VALUES ('default', $1, $2, $3, $4, $5, $6)
+      ON CONFLICT (key) DO UPDATE
+      SET rider_base_payout = EXCLUDED.rider_base_payout,
+          rider_per_km_rate = EXCLUDED.rider_per_km_rate,
+          max_delivery_subsidy = EXCLUDED.max_delivery_subsidy,
+          pg_cost_percent = EXCLUDED.pg_cost_percent,
+          packaging_cost_inr = EXCLUDED.packaging_cost_inr,
+          ops_cost_inr = EXCLUDED.ops_cost_inr,
+          updated_at = NOW()
+    `, [
+      riderBasePayout ?? 45.00,
+      riderPerKmRate ?? 8.00,
+      maxDeliverySubsidy ?? 35.00,
+      pgCostPercent ?? 1.80,
+      packagingCostInr ?? 8.00,
+      opsCostInr ?? 5.00,
+    ]);
+
+    res.status(200).json({
+      success: true,
+      message: 'Delivery economics configuration updated successfully.',
+      config: {
+        riderBasePayout: riderBasePayout ?? 45.00,
+        riderPerKmRate: riderPerKmRate ?? 8.00,
+        maxDeliverySubsidy: maxDeliverySubsidy ?? 35.00,
+        pgCostPercent: pgCostPercent ?? 1.80,
+        packagingCostInr: packagingCostInr ?? 8.00,
+        opsCostInr: opsCostInr ?? 5.00,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: 'UPDATE_FAILED',
+      message: err.message || 'Failed to update delivery economics config.',
+    });
+  }
+});
+
+/**
+ * POST /api/orders/:orderId/accept-seller & POST /api/v1/orders/:orderId/accept-seller
+ * Atomic single-winner seller order acceptance with concurrency race-condition prevention
+ */
+async function handleSellerAcceptOrder(req: Request, res: Response): Promise<void> {
+  const { orderId } = req.params;
+  const pool = getPool();
+  try {
+    const isGlobalAdmin =
+      Boolean(req.auth?.isSuperAdmin) ||
+      Boolean(req.auth?.roles?.some((r: string) => ['SUPER_ADMIN', 'OPERATIONS'].includes(r)));
+
+    let authorizedMerchantIds = req.auth?.merchantIds || [];
+
+    // Verify merchant membership and status in real-time against database
+    if (!isGlobalAdmin && authorizedMerchantIds.length > 0) {
+      const placeholders = authorizedMerchantIds.map((_, i) => `$${i + 1}`).join(', ');
+      const activeMerchRes = await pool.query(
+        `SELECT id, status FROM merchants WHERE id IN (${placeholders})`,
+        authorizedMerchantIds
+      );
+      // Filter only merchants that are ACTIVE (not SUSPENDED, PENDING, or REJECTED)
+      const activeIds = activeMerchRes.rows.filter(m => m.status === 'ACTIVE').map(m => m.id);
+      authorizedMerchantIds = activeIds;
+    }
+
+    // If caller is not global admin and has no active authorized merchants, reject immediately
+    if (!isGlobalAdmin && authorizedMerchantIds.length === 0) {
+      res.status(403).json({
+        success: false,
+        error: 'FORBIDDEN',
+        message: 'You are not authorized to accept orders for this merchant, or the merchant account is suspended.',
+      });
+      return;
+    }
+
+    // Atomic single-winner conditional update with embedded merchant ownership check (TOCTOU-proof)
+    let updateQuery: string;
+    let updateParams: any[];
+
+    if (isGlobalAdmin) {
+      updateQuery = `
+        UPDATE orders
+        SET status = 'accepted', updated_at = NOW()
+        WHERE id = $1 
+          AND status = 'placed'
+          AND payment_status NOT IN ('FAILED', 'REFUNDED')
+        RETURNING id, order_number, user_id, merchant_id, status, total_amount, payment_status
+      `;
+      updateParams = [orderId];
+    } else {
+      const placeholders = authorizedMerchantIds.map((_, i) => `$${i + 2}`).join(', ');
+      updateQuery = `
+        UPDATE orders
+        SET status = 'accepted', updated_at = NOW()
+        WHERE id = $1 
+          AND status = 'placed'
+          AND payment_status NOT IN ('FAILED', 'REFUNDED')
+          AND merchant_id IN (${placeholders})
+        RETURNING id, order_number, user_id, merchant_id, status, total_amount, payment_status
+      `;
+      updateParams = [orderId, ...authorizedMerchantIds];
+    }
+
+    const updateRes = await pool.query(updateQuery, updateParams);
+
+    if (updateRes.rowCount === 0) {
+      const checkRes = await pool.query(
+        `SELECT id, merchant_id, status, payment_status FROM orders WHERE id = $1`,
+        [orderId]
+      );
+
+      if (checkRes.rows.length === 0) {
+        res.status(404).json({ success: false, error: 'ORDER_NOT_FOUND', message: 'Order not found.' });
+        return;
+      }
+
+      const order = checkRes.rows[0];
+
+      // Enforce merchant ownership first
+      if (!isGlobalAdmin && !authorizedMerchantIds.includes(order.merchant_id)) {
+        res.status(403).json({
+          success: false,
+          error: 'FORBIDDEN',
+          message: 'You are not authorized to accept orders for this merchant.',
+        });
+        return;
+      }
+
+      // Enforce payment eligibility
+      if (order.payment_status === 'FAILED' || order.payment_status === 'REFUNDED') {
+        res.status(400).json({
+          success: false,
+          error: 'INELIGIBLE_PAYMENT_STATUS',
+          message: `Cannot accept order with payment status '${order.payment_status}'.`,
+          paymentStatus: order.payment_status,
+        });
+        return;
+      }
+
+      if (order.status === 'accepted') {
+        res.status(409).json({
+          success: false,
+          error: 'ORDER_ALREADY_ACCEPTED',
+          message: 'Order has already been accepted.',
+          currentStatus: order.status,
+        });
+        return;
+      }
+
+      res.status(409).json({
+        success: false,
+        error: 'INVALID_ORDER_STATE',
+        message: `Cannot accept order in '${order.status}' status.`,
+        currentStatus: order.status,
+      });
+      return;
+    }
+
+    const acceptedOrder = updateRes.rows[0];
+
+    try {
+      await outboxService.stageEvent(pool as any, {
+        eventType: 'ORDER_ACCEPTED',
+        aggregateType: 'ORDER',
+        aggregateId: orderId,
+        payload: {
+          orderId,
+          merchantId: acceptedOrder.merchant_id,
+          acceptedBy: req.auth?.userId,
+          status: 'accepted',
+        },
+      });
+    } catch {
+      // Non-blocking for outbox logging in non-transactional contexts
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Order accepted successfully by seller.',
+      order: {
+        id: acceptedOrder.id,
+        orderNumber: acceptedOrder.order_number,
+        merchantId: acceptedOrder.merchant_id,
+        status: acceptedOrder.status,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: 'ACCEPT_FAILED',
+      message: err.message || 'Failed to accept order.',
+    });
+  }
+}
+
+orderRouter.post('/:orderId/accept-seller', authenticate, sellerActionRateLimiter, handleSellerAcceptOrder);
+orderRouter.post('/:orderId/accept', authenticate, sellerActionRateLimiter, handleSellerAcceptOrder);
+
