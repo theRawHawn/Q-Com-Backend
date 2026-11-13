@@ -92,6 +92,16 @@ export async function runSprint15_2_1ConcurrencyAuthorizationAndResilienceTests(
 
   // Customer
   const customerPhone = '+91-9988776655';
+  const sellerAPhone = '+91-9845012345';
+  const sellerBPhone = '+91-9845099999';
+  const rider1Phone = '+91-9812345678';
+  const rider2Phone = '+91-9812345679';
+  const suspendedRiderPhone = '+91-9812345699';
+  const adminPhone = '+91-8000000000';
+  await realPool.query(`DELETE FROM otp_challenges WHERE phone IN ($1, $2, $3, $4, $5, $6, $7)`, [
+    customerPhone, sellerAPhone, sellerBPhone, rider1Phone, rider2Phone, suspendedRiderPhone, adminPhone
+  ]);
+
   const custOtpReq = await apiCall('/api/auth/request-otp', { method: 'POST', body: { phone: customerPhone } });
   const custVerify = await apiCall('/api/auth/verify-otp', {
     method: 'POST',
@@ -101,7 +111,6 @@ export async function runSprint15_2_1ConcurrencyAuthorizationAndResilienceTests(
   const customerId = custVerify.data.user.id;
 
   // Seller A (Merchant A: Suresh Babu)
-  const sellerAPhone = '+91-9845012345';
   const sellerAOtpReq = await apiCall('/api/auth/request-otp', { method: 'POST', body: { phone: sellerAPhone } });
   const sellerAVerify = await apiCall('/api/auth/verify-otp', {
     method: 'POST',
@@ -110,7 +119,6 @@ export async function runSprint15_2_1ConcurrencyAuthorizationAndResilienceTests(
   const sellerAToken = sellerAVerify.data.token || sellerAVerify.data.accessToken;
 
   // Seller B (Merchant B: Ramesh Kaveri)
-  const sellerBPhone = '+91-9845099999';
   const sellerBOtpReq = await apiCall('/api/auth/request-otp', { method: 'POST', body: { phone: sellerBPhone } });
   const sellerBVerify = await apiCall('/api/auth/verify-otp', {
     method: 'POST',
@@ -119,7 +127,6 @@ export async function runSprint15_2_1ConcurrencyAuthorizationAndResilienceTests(
   const sellerBToken = sellerBVerify.data.token || sellerBVerify.data.accessToken;
 
   // Delivery Partner 1 (Arjun Teja - Active)
-  const rider1Phone = '+91-9812345678';
   const rider1OtpReq = await apiCall('/api/auth/request-otp', { method: 'POST', body: { phone: rider1Phone } });
   const rider1Verify = await apiCall('/api/auth/verify-otp', {
     method: 'POST',
@@ -128,7 +135,6 @@ export async function runSprint15_2_1ConcurrencyAuthorizationAndResilienceTests(
   const rider1Token = rider1Verify.data.token || rider1Verify.data.accessToken;
 
   // Delivery Partner 2 (Kiran Kumar - Active)
-  const rider2Phone = '+91-9812345679';
   const rider2OtpReq = await apiCall('/api/auth/request-otp', { method: 'POST', body: { phone: rider2Phone } });
   const rider2Verify = await apiCall('/api/auth/verify-otp', {
     method: 'POST',
@@ -137,7 +143,6 @@ export async function runSprint15_2_1ConcurrencyAuthorizationAndResilienceTests(
   const rider2Token = rider2Verify.data.token || rider2Verify.data.accessToken;
 
   // Suspended Delivery Partner
-  const suspendedRiderPhone = '+91-9812345699';
   const suspUserRes = await realPool.query(`
     INSERT INTO users (phone, name, is_phone_verified, account_type)
     VALUES ($1, 'Suspended Partner', TRUE, 'individual')
@@ -163,7 +168,6 @@ export async function runSprint15_2_1ConcurrencyAuthorizationAndResilienceTests(
   const suspendedRiderToken = suspVerify.data.token || suspVerify.data.accessToken;
 
   // Super Admin
-  const adminPhone = '+91-8000000000';
   const adminOtpReq = await apiCall('/api/auth/request-otp', { method: 'POST', body: { phone: adminPhone } });
   const adminVerify = await apiCall('/api/auth/verify-otp', {
     method: 'POST',
@@ -194,7 +198,7 @@ export async function runSprint15_2_1ConcurrencyAuthorizationAndResilienceTests(
       place_of_supply_state_code, pricing_snapshot, estimated_delivery_at
     )
     VALUES (
-      $1, 'QC-TEST-SELLER-A', $2, $3, 'placed', 200.00, 30.00, 10.00, 0.00,
+      $1, 'QC-TEST-SELLER-A-' || substr(md5(random()::text), 1, 8), $2, $3, 'placed', 200.00, 30.00, 10.00, 0.00,
       0.00, 240.00, 21.60, 21.60, 0.00, 283.20, 0.00,
       0.00, 'Pay on Delivery', 'PENDING', '112233', 'TOK_A', '{"address":"Sector 17"}',
       '29', '{"grandTotal":283.20}', NOW() + INTERVAL '30 minutes'
@@ -260,7 +264,7 @@ export async function runSprint15_2_1ConcurrencyAuthorizationAndResilienceTests(
       place_of_supply_state_code, pricing_snapshot, estimated_delivery_at
     )
     VALUES (
-      $1, 'QC-TEST-FAIL-PAY', $2, $3, 'placed', 100.00, 20.00, 5.00, 0.00,
+      $1, 'QC-TEST-FAIL-PAY-' || substr(md5(random()::text), 1, 8), $2, $3, 'placed', 100.00, 20.00, 5.00, 0.00,
       0.00, 125.00, 11.25, 11.25, 0.00, 147.50, 0.00,
       0.00, 'Instant UPI', 'FAILED', '998877', 'TOK_FAIL', '{"address":"Sector 12"}',
       '29', '{"grandTotal":147.50}', NOW() + INTERVAL '30 minutes'
@@ -291,7 +295,7 @@ export async function runSprint15_2_1ConcurrencyAuthorizationAndResilienceTests(
       place_of_supply_state_code, pricing_snapshot, estimated_delivery_at
     )
     VALUES (
-      $1, 'QC-TEST-TRIP-ORDER', $2, $3, 'accepted', 150.00, 30.00, 10.00, 0.00,
+      $1, 'QC-TEST-TRIP-ORDER-' || substr(md5(random()::text), 1, 8), $2, $3, 'accepted', 150.00, 30.00, 10.00, 0.00,
       0.00, 190.00, 17.10, 17.10, 0.00, 224.20, 0.00,
       0.00, 'Pay on Delivery', 'PENDING', '445566', 'TOK_TRIP', '{"address":"Hub Koramangala"}',
       '29', '{"grandTotal":224.20}', NOW() + INTERVAL '25 minutes'
@@ -376,7 +380,7 @@ export async function runSprint15_2_1ConcurrencyAuthorizationAndResilienceTests(
       place_of_supply_state_code, pricing_snapshot, estimated_delivery_at
     )
     VALUES (
-      $1, 'QC-TEST-ADMIN-ASSIGN', $2, $3, 'accepted', 100.00, 30.00, 10.00, 0.00,
+      $1, 'QC-TEST-ADMIN-ASSIGN-' || substr(md5(random()::text), 1, 8), $2, $3, 'accepted', 100.00, 30.00, 10.00, 0.00,
       0.00, 140.00, 12.60, 12.60, 0.00, 165.20, 0.00,
       0.00, 'Pay on Delivery', 'PENDING', '778899', 'TOK_ADMIN', '{"address":"Admin Dispatch Hub"}',
       '29', '{"grandTotal":165.20}', NOW() + INTERVAL '25 minutes'

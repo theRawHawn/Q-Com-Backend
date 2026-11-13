@@ -137,7 +137,16 @@ function assertInMemoryFallbackAllowed(operation: string): void {
  * Initializes or returns the Redis client.
  * Connects lazily. In development/testing, falls back to in-memory store if Redis is unavailable.
  */
+export function setRedisClient(client: Redis | null): void {
+  redisClient = client;
+  isRedisConnected = !!client;
+}
+
 export function getRedisClient(): Redis | null {
+  if (redisClient && isRedisConnected) {
+    return redisClient;
+  }
+
   if (process.env.NODE_ENV === 'test' && !process.env.FORCE_REDIS) {
     return null;
   }

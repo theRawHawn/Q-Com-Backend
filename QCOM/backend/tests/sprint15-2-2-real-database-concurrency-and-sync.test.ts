@@ -95,8 +95,19 @@ export async function runSprint15_2_2RealDatabaseConcurrencyAndSyncTests(): Prom
   // ---------------------------------------------------------------------------
   console.log('\n--- Step 2: Authenticating Personas ---');
 
-  // Customer
+  // Personas
   const custPhone = '+91-9988112233';
+  const sellerAPhone = '+91-9845012345';
+  const sellerBPhone = '+91-9845099999';
+  const rider1Phone = '+91-9740011111';
+  const rider2Phone = '+91-9740022222';
+  const suspendedRiderPhone = '+91-9740099999';
+  const adminPhone = '+91-8000000000';
+  await realPool.query(`DELETE FROM otp_challenges WHERE phone IN ($1, $2, $3, $4, $5, $6, $7)`, [
+    custPhone, sellerAPhone, sellerBPhone, rider1Phone, rider2Phone, suspendedRiderPhone, adminPhone
+  ]);
+
+  // Customer
   const cOtp = await apiCall('/api/auth/request-otp', { method: 'POST', body: { phone: custPhone } });
   const cVer = await apiCall('/api/auth/verify-otp', {
     method: 'POST',
@@ -105,7 +116,6 @@ export async function runSprint15_2_2RealDatabaseConcurrencyAndSyncTests(): Prom
   const customerToken = cVer.data.token || cVer.data.accessToken;
 
   // Seller A (Merchant A)
-  const sellerAPhone = '+91-9845012345';
   const sAOtp = await apiCall('/api/auth/request-otp', { method: 'POST', body: { phone: sellerAPhone } });
   const sAVer = await apiCall('/api/auth/verify-otp', {
     method: 'POST',
@@ -114,7 +124,6 @@ export async function runSprint15_2_2RealDatabaseConcurrencyAndSyncTests(): Prom
   const sellerAToken = sAVer.data.token || sAVer.data.accessToken;
 
   // Seller B (Merchant B)
-  const sellerBPhone = '+91-9845099999';
   const sBOtp = await apiCall('/api/auth/request-otp', { method: 'POST', body: { phone: sellerBPhone } });
   const sBVer = await apiCall('/api/auth/verify-otp', {
     method: 'POST',
@@ -123,7 +132,6 @@ export async function runSprint15_2_2RealDatabaseConcurrencyAndSyncTests(): Prom
   const sellerBToken = sBVer.data.token || sBVer.data.accessToken;
 
   // Active Rider 1
-  const rider1Phone = '+91-9740011111';
   const r1Otp = await apiCall('/api/auth/request-otp', { method: 'POST', body: { phone: rider1Phone } });
   const r1Ver = await apiCall('/api/auth/verify-otp', {
     method: 'POST',
@@ -132,7 +140,6 @@ export async function runSprint15_2_2RealDatabaseConcurrencyAndSyncTests(): Prom
   const rider1Token = r1Ver.data.token || r1Ver.data.accessToken;
 
   // Active Rider 2
-  const rider2Phone = '+91-9740022222';
   const r2Otp = await apiCall('/api/auth/request-otp', { method: 'POST', body: { phone: rider2Phone } });
   const r2Ver = await apiCall('/api/auth/verify-otp', {
     method: 'POST',
@@ -141,7 +148,6 @@ export async function runSprint15_2_2RealDatabaseConcurrencyAndSyncTests(): Prom
   const rider2Token = r2Ver.data.token || r2Ver.data.accessToken;
 
   // Suspended Rider
-  const suspendedRiderPhone = '+91-9740099999';
   const rSOtp = await apiCall('/api/auth/request-otp', { method: 'POST', body: { phone: suspendedRiderPhone } });
   const rSVer = await apiCall('/api/auth/verify-otp', {
     method: 'POST',
@@ -150,7 +156,6 @@ export async function runSprint15_2_2RealDatabaseConcurrencyAndSyncTests(): Prom
   const suspendedRiderToken = rSVer.data.token || rSVer.data.accessToken;
 
   // Admin (Seeded Super Administrator)
-  const adminPhone = '+91-8000000000';
   const admOtp = await apiCall('/api/auth/request-otp', { method: 'POST', body: { phone: adminPhone } });
   const admVer = await apiCall('/api/auth/verify-otp', {
     method: 'POST',

@@ -188,12 +188,13 @@ export async function runSprint15_2CapacityConcurrencyAndResilienceTests(): Prom
 
   // Insert 3 test orders with items directly in DB
   const testOrderIds = [crypto.randomUUID(), crypto.randomUUID(), crypto.randomUUID()];
+  const runTs = Date.now();
   for (let idx = 0; idx < testOrderIds.length; idx++) {
     const oId = testOrderIds[idx];
     await realPool.query(`
       INSERT INTO orders (id, order_number, user_id, merchant_id, status, items_subtotal, delivery_fee, handling_fee, urgency_fee, discount_amount, taxable_amount, cgst_amount, sgst_amount, igst_amount, total_amount, withholding_amount, gst_tcs_amount, payment_method, payment_status, delivery_otp, handover_token, jobsite_address, place_of_supply_state_code, pricing_snapshot, estimated_delivery_at)
       VALUES ($1, $2, $3, $4, 'placed', 200.00, 30.00, 10.00, 0.00, 0.00, 240.00, 21.60, 21.60, 0.00, 283.20, 0.00, 0.00, 'Pay on Delivery', 'PENDING', '123456', 'TOK123', '{"address":"Bangalore"}', '29', '{"grandTotal":283.20}', NOW() + INTERVAL '25 minutes')
-    `, [oId, `QC-TEST-${idx + 1}`, customerId, merchantId]);
+    `, [oId, `QC-TEST-${runTs}-${idx + 1}`, customerId, merchantId]);
 
     // Insert 2 items for each order
     await realPool.query(`
@@ -243,8 +244,8 @@ export async function runSprint15_2CapacityConcurrencyAndResilienceTests(): Prom
   const raceOrderId = crypto.randomUUID();
   await realPool.query(`
     INSERT INTO orders (id, order_number, user_id, merchant_id, status, items_subtotal, delivery_fee, handling_fee, urgency_fee, discount_amount, taxable_amount, cgst_amount, sgst_amount, igst_amount, total_amount, withholding_amount, gst_tcs_amount, payment_method, payment_status, delivery_otp, handover_token, jobsite_address, place_of_supply_state_code, pricing_snapshot, estimated_delivery_at)
-    VALUES ($1, 'QC-RACE-001', $2, $3, 'placed', 100.00, 30.00, 10.00, 0.00, 0.00, 140.00, 12.60, 12.60, 0.00, 165.20, 0.00, 0.00, 'Pay on Delivery', 'PENDING', '654321', 'TOK999', '{"address":"Race Order"}', '29', '{"grandTotal":165.20}', NOW() + INTERVAL '25 minutes')
-  `, [raceOrderId, customerId, merchantId]);
+    VALUES ($1, $2, $3, $4, 'placed', 100.00, 30.00, 10.00, 0.00, 0.00, 140.00, 12.60, 12.60, 0.00, 165.20, 0.00, 0.00, 'Pay on Delivery', 'PENDING', '654321', 'TOK999', '{"address":"Race Order"}', '29', '{"grandTotal":165.20}', NOW() + INTERVAL '25 minutes')
+  `, [raceOrderId, `QC-RACE-${crypto.randomUUID().slice(0, 8)}`, customerId, merchantId]);
 
   // Two concurrent seller terminals attempt to accept the order simultaneously
   const [acceptRes1, acceptRes2] = await Promise.all([
@@ -279,8 +280,8 @@ export async function runSprint15_2CapacityConcurrencyAndResilienceTests(): Prom
   // Create delivery trip in BROADCASTING status
   await realPool.query(`
     INSERT INTO orders (id, order_number, user_id, merchant_id, status, items_subtotal, delivery_fee, handling_fee, urgency_fee, discount_amount, taxable_amount, cgst_amount, sgst_amount, igst_amount, total_amount, withholding_amount, gst_tcs_amount, payment_method, payment_status, delivery_otp, handover_token, jobsite_address, place_of_supply_state_code, pricing_snapshot, estimated_delivery_at)
-    VALUES ($1, 'QC-TRIP-001', $2, $3, 'placed', 100.00, 30.00, 10.00, 0.00, 0.00, 140.00, 12.60, 12.60, 0.00, 165.20, 0.00, 0.00, 'Pay on Delivery', 'PENDING', '654321', 'TOK999', '{"address":"Trip Order"}', '29', '{"grandTotal":165.20}', NOW() + INTERVAL '25 minutes')
-  `, [tripOrderId, customerId, merchantId]);
+    VALUES ($1, $2, $3, $4, 'placed', 100.00, 30.00, 10.00, 0.00, 0.00, 140.00, 12.60, 12.60, 0.00, 165.20, 0.00, 0.00, 'Pay on Delivery', 'PENDING', '654321', 'TOK999', '{"address":"Trip Order"}', '29', '{"grandTotal":165.20}', NOW() + INTERVAL '25 minutes')
+  `, [tripOrderId, `QC-TRIP-${crypto.randomUUID().slice(0, 8)}`, customerId, merchantId]);
 
   await realPool.query(`
     INSERT INTO delivery_trips (id, order_id, status, base_fare, distance_fare, surge_fare, total_rider_payout)
@@ -289,6 +290,8 @@ export async function runSprint15_2CapacityConcurrencyAndResilienceTests(): Prom
 
   // Authenticate two distinct delivery partners
   const rider1Phone = '+91-9812345678';
+  const rider2Phone = '+91-9812345679';
+  await realPool.query(`DELETE FROM otp_challenges WHERE phone IN ($1, $2)`, [rider1Phone, rider2Phone]);
   const rider1OtpReq = await apiCall('/api/auth/request-otp', { method: 'POST', body: { phone: rider1Phone } });
   const rider1Otp = await apiCall('/api/auth/verify-otp', {
     method: 'POST',
@@ -296,7 +299,6 @@ export async function runSprint15_2CapacityConcurrencyAndResilienceTests(): Prom
   });
   const rider1Token = rider1Otp.data.token || rider1Otp.data.accessToken;
 
-  const rider2Phone = '+91-9812345679';
   const rider2OtpReq = await apiCall('/api/auth/request-otp', { method: 'POST', body: { phone: rider2Phone } });
   const rider2Otp = await apiCall('/api/auth/verify-otp', {
     method: 'POST',
