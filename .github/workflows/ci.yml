@@ -38,6 +38,7 @@ jobs:
 
     env:
       NODE_ENV: test
+      DATABASE_URL: postgres://qcom_user:qcom_password@127.0.0.1:5432/qcom_test
       TEST_DATABASE_URL: postgres://qcom_user:qcom_password@127.0.0.1:5432/qcom_test
       REDIS_URL: redis://127.0.0.1:6379
       FORCE_REDIS: '1'
@@ -50,23 +51,38 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Node.js 20
+      - name: Set up Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: 'npm'
 
-      - name: Install root dependencies
-        run: npm ci
+      - name: Install root and backend dependencies
+        run: |
+          npm ci --legacy-peer-deps
+          npm ci --prefix QCOM/backend --legacy-peer-deps
+
+      - name: Verify PostgreSQL 16 and Redis 7 versions
+        run: |
+          node -e "const pg=require('./QCOM/backend/node_modules/pg'); const p=new pg.Pool({connectionString:process.env.TEST_DATABASE_URL}); p.query('SELECT version()').then(r=>{console.log('PG:',r.rows[0].version); return p.end();});"
+          node -e "const {Redis}=require('./node_modules/ioredis'); const r=new Redis(process.env.REDIS_URL); r.info('server').then(i=>{console.log('Redis:', i.split(/\r?\n/).find(l=>l.startsWith('redis_version'))); r.disconnect();});"
 
       - name: Run database migrations (001-026)
+        env:
+          NODE_PATH: ${{ github.workspace }}/node_modules:${{ github.workspace }}/QCOM/backend/node_modules
         run: npx tsx QCOM/backend/scripts/migrate.ts
 
       - name: Run database seeds
+        env:
+          NODE_PATH: ${{ github.workspace }}/node_modules:${{ github.workspace }}/QCOM/backend/node_modules
         run: npx tsx QCOM/backend/scripts/seed.ts
 
       - name: Run all 54 backend automated test suites
+        env:
+          NODE_PATH: ${{ github.workspace }}/node_modules:${{ github.workspace }}/QCOM/backend/node_modules
         run: npx tsx QCOM/backend/tests/run-all-tests.ts
 
-      - name: Run typecheck
-        run: npx tsc --noEmit
+      - name: Run typecheck (root and backend)
+        run: |
+          npx tsc --noEmit
+          npm --prefix QCOM/backend run build
