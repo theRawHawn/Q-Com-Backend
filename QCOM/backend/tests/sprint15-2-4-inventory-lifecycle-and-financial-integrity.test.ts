@@ -86,7 +86,7 @@ export async function runSprint15_2_4InventoryAndFinancialIntegrityTests(): Prom
   setPool(realPool);
 
   // Ensure migrations and reference seeds
-  await runMigrations(REAL_PG_URL);
+  await runMigrations({ poolOverride: realPool });
   await runSeeds(realPool);
 
   // Initialize Express server

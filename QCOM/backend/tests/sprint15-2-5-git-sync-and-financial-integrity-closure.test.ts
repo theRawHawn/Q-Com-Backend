@@ -79,7 +79,7 @@ export async function runSprint15_2_5GitSyncAndFinancialIntegrityTests(): Promis
   setPool(realPool);
 
   // Ensure migrations and reference seeds
-  await runMigrations(REAL_PG_URL);
+  await runMigrations({ poolOverride: realPool });
   await runSeeds(realPool);
 
   // Initialize Express server
