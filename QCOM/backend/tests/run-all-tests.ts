@@ -51,6 +51,9 @@ import { runSprint15_8BuildFailureAndRefundIntegrityTests } from './sprint15-1-8
 import { runSprint15_2CapacityConcurrencyAndResilienceTests } from './sprint15-2-capacity-concurrency-and-resilience.test.js';
 import { runSprint15_2_1ConcurrencyAuthorizationAndResilienceTests } from './sprint15-2-1-concurrency-authorization-and-resilience.test.js';
 import { runSprint15_2_2RealDatabaseConcurrencyAndSyncTests } from './sprint15-2-2-real-database-concurrency-and-sync.test.js';
+import { runSprint15_2_3RealPg16Redis7InfrastructureTests } from './sprint15-2-3-real-pg16-redis7-infrastructure.test.js';
+import { runSprint15_2_4InventoryAndFinancialIntegrityTests } from './sprint15-2-4-inventory-lifecycle-and-financial-integrity.test.js';
+import { runSprint15_2_5GitSyncAndFinancialIntegrityTests } from './sprint15-2-5-git-sync-and-financial-integrity-closure.test.js';
 
 async function runAllTests() {
   console.log('===========================================================');
@@ -178,6 +181,12 @@ async function runAllTests() {
     await runSprint15_2_1ConcurrencyAuthorizationAndResilienceTests();
     // Sprint 15.2.2 Real Database Concurrency Verification & Repository Synchronization Tests
     await runSprint15_2_2RealDatabaseConcurrencyAndSyncTests();
+    // Sprint 15.2.3 Real PostgreSQL 16 & Redis 7 Integration Testing Infrastructure
+    await runSprint15_2_3RealPg16Redis7InfrastructureTests();
+    // Sprint 15.2.4 CI Execution, Inventory Lifecycle & Financial Integrity Verification Tests
+    await runSprint15_2_4InventoryAndFinancialIntegrityTests();
+    // Sprint 15.2.5 GitHub Synchronization & Final Financial Integrity Closure Tests
+    await runSprint15_2_5GitSyncAndFinancialIntegrityTests();
 
     const duration = ((Date.now() - start) / 1000).toFixed(2);
     console.log('\n===========================================================');
