@@ -16,6 +16,7 @@ import { refundService } from '../src/modules/payments/refundService.js';
 import { createSlidingWindowRateLimiter } from '../src/middleware/rateLimiter.js';
 import { slidingWindowRateLimit, getRedisClient, setRedisClient } from '../src/database/redis.js';
 import { env } from '../src/config/env.js';
+import { REQUIRED_REDIS_VERSION, assertExactRedisVersion } from '../src/config/redisVersion.js';
 
 const REAL_PG_URL = process.env.TEST_DATABASE_URL || 'postgres://qcom_user:qcom_password@127.0.0.1:5432/qcom_test';
 const REAL_REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
@@ -67,22 +68,23 @@ export async function runSprint15_2_3RealPg16Redis7InfrastructureTests(): Promis
   });
 
   let redisVersion = '';
+  let redisInfo = '';
   try {
     await redisProbeClient.connect();
-    const redisInfo = await redisProbeClient.info('server');
-    const match = redisInfo.match(/^redis_version:([^\r\n]+)/m);
-    redisVersion = match ? match[1] : 'unknown';
+    redisInfo = await redisProbeClient.info('server');
+    redisVersion = assertExactRedisVersion(redisInfo, REQUIRED_REDIS_VERSION);
   } catch (err: any) {
     throw new assert.AssertionError({
-      message: `[FATAL] Unable to connect to Real Redis 7 at ${REAL_REDIS_URL}: ${err.message}. Sprint 15.2.3 strictly forbids in-memory fallback.`,
+      message: `[FATAL] Real Redis ${REQUIRED_REDIS_VERSION} check failed at ${REAL_REDIS_URL}: ${err.message}`,
     });
   }
 
-  assert.ok(
-    redisVersion.startsWith('7.'),
-    `Redis 7 is strictly required; connected Redis reported version: "${redisVersion}". In-memory fallback is prohibited.`
+  assert.throws(
+    () => assertExactRedisVersion('redis_version:7.4.12\r\n', REQUIRED_REDIS_VERSION),
+    /Expected Redis version: 7\.0\.15/,
+    'Version checker must explicitly reject unpinned Redis versions such as 7.4.12'
   );
-  console.log(`  ✓ Real Redis 7 verified: version ${redisVersion}`);
+  console.log(`  ✓ Real Redis ${REQUIRED_REDIS_VERSION} exact match verified: version ${redisVersion} (mismatch rejection tested)`);
   setRedisClient(redisProbeClient);
   totalPassed++;
 

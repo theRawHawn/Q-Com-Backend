@@ -26,6 +26,7 @@ import { refundService } from '../src/modules/payments/refundService.js';
 import { paymentService } from '../src/modules/payments/paymentService.js';
 import { setRedisClient, getRedisClient, slidingWindowRateLimit } from '../src/database/redis.js';
 import { env } from '../src/config/env.js';
+import { REQUIRED_REDIS_VERSION, assertExactRedisVersion } from '../src/config/redisVersion.js';
 
 const REAL_PG_URL = process.env.TEST_DATABASE_URL || 'postgres://qcom_user:qcom_password@127.0.0.1:5432/qcom_test';
 const REAL_REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
@@ -65,13 +66,8 @@ export async function runSprint15_2_5GitSyncAndFinancialIntegrityTests(): Promis
   });
   await redisProbeClient.connect();
   const redisInfo = await redisProbeClient.info('server');
-  const match = redisInfo.match(/^redis_version:([^\r\n]+)/m);
-  const redisVersion = match ? match[1] : 'unknown';
-  assert.ok(
-    redisVersion.startsWith('7.'),
-    `Redis 7 is strictly required. Found: ${redisVersion}`
-  );
-  console.log(`  ✓ Real Redis 7 verified: version ${redisVersion}`);
+  const redisVersion = assertExactRedisVersion(redisInfo, REQUIRED_REDIS_VERSION);
+  console.log(`  ✓ Real Redis ${REQUIRED_REDIS_VERSION} verified: version ${redisVersion}`);
   setRedisClient(redisProbeClient);
   totalPassed++;
 

@@ -54,13 +54,17 @@ import { runSprint15_2_2RealDatabaseConcurrencyAndSyncTests } from './sprint15-2
 import { runSprint15_2_3RealPg16Redis7InfrastructureTests } from './sprint15-2-3-real-pg16-redis7-infrastructure.test.js';
 import { runSprint15_2_4InventoryAndFinancialIntegrityTests } from './sprint15-2-4-inventory-lifecycle-and-financial-integrity.test.js';
 import { runSprint15_2_5GitSyncAndFinancialIntegrityTests } from './sprint15-2-5-git-sync-and-financial-integrity-closure.test.js';
+import { verifyRedisExactVersion } from '../scripts/verify-redis-version.js';
 
 async function runAllTests() {
   console.log('===========================================================');
-  console.log('  QCOM Unified Backend Engine — Automated Test Suite (Sprint 1–10.1A)');
+  console.log('  QCOM Unified Backend Engine — Automated Test Suite (Sprint 1–15.2.5)');
   console.log('===========================================================');
   const start = Date.now();
   try {
+    // Enforce exact Redis 7.0.15 preflight check before running integration suites
+    await verifyRedisExactVersion();
+
     // Sprint 1 Test Suites
     await testMigrations();
     await testSeeds();

@@ -17,7 +17,7 @@ services:
       - qcom-integration
 
   redis:
-    image: redis:7.4.2-alpine
+    image: redis:7.0.15-alpine
     environment:
       QCOM_IT_REDIS_PASSWORD: ${QCOM_IT_REDIS_PASSWORD:?Set QCOM_IT_REDIS_PASSWORD for local integration services}
     command: ["sh", "-c", "exec redis-server --save '' --appendonly no --requirepass \"$$QCOM_IT_REDIS_PASSWORD\""]

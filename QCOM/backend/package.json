@@ -11,7 +11,8 @@
     "test": "tsx tests/run-all-tests.ts",
     "test:integration:real-services": "tsx tests/integration/real-services.test.ts",
     "db:migrate": "tsx scripts/migrate.ts",
-    "db:seed": "tsx scripts/seed.ts"
+    "db:seed": "tsx scripts/seed.ts",
+    "verify:redis": "tsx scripts/verify-redis-version.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

@@ -33,4 +33,15 @@ for db in qcom_test qcom_staging qcom_db; do
     su - postgres -c "psql -c \"CREATE DATABASE $db OWNER qcom_user;\""
 done
 
-echo "[SUCCESS] PostgreSQL 16 and Redis 7 are active and provisioned."
+# 4. Verify Redis exact version (7.0.15) without silently replacing existing installs
+REQUIRED_REDIS_VERSION="7.0.15"
+ACTUAL_REDIS_VERSION=$(redis-cli -h 127.0.0.1 -p 6379 INFO server | awk -F: '/^redis_version:/ { gsub("\r", "", $2); print $2 }')
+echo "[Redis] Expected version: ${REQUIRED_REDIS_VERSION} | Actual version: ${ACTUAL_REDIS_VERSION:-unknown}"
+if [ "${ACTUAL_REDIS_VERSION}" != "${REQUIRED_REDIS_VERSION}" ]; then
+  echo "[ERROR] Redis version mismatch: expected ${REQUIRED_REDIS_VERSION}, found ${ACTUAL_REDIS_VERSION:-unknown}." >&2
+  echo "        Do not use unpinned versions or in-memory fallback for integration testing." >&2
+  echo "        Provision Redis 7.0.15 via: docker run -d --name qcom-redis -p 6379:6379 redis:7.0.15-alpine" >&2
+  exit 1
+fi
+
+echo "[SUCCESS] PostgreSQL 16 and Redis ${REQUIRED_REDIS_VERSION} are active and provisioned."

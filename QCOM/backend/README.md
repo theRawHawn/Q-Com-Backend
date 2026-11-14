@@ -11,7 +11,7 @@ QCOM is an enterprise-grade backend platform powering a 10-to-20 minute quick-co
 | [PRD.md](./PRD.md) | Product requirements, business domain, and applications |
 | [DESIGN.md](./DESIGN.md) | Architectural choices, trade-offs, and domain design |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | Component inventory, topology, and scaling strategy |
-| [DATABASE.md](./DATABASE.md) | PostgreSQL 16 schema, migrations (001-025), and invariants |
+| [DATABASE.md](./DATABASE.md) | PostgreSQL 16 schema, migrations (001-026), and invariants |
 | [API.md](./API.md) | HTTP and WebSocket API contracts and error schemas |
 | [AUTH.md](./AUTH.md) | Authentication flows, session lifecycle, and IDOR protection |
 | [PLAN.md](./PLAN.md) | Engineering milestones and forward roadmap |
@@ -42,7 +42,7 @@ Keep these paths distinct until their contents are deliberately reconciled.
 ### 1. Prerequisites
 - Node.js v20+ / v22+
 - PostgreSQL 16
-- Redis 7 (optional for local development; production security-sensitive rate limits require distributed Redis)
+- Redis **7.0.15** (`redis:7.0.15-alpine`) for local integration testing and GitHub Actions CI parity (production environments may use managed HA Redis `>= 7.0.15` for distributed rate limits and Pub/Sub)
 
 ### 2. Environment Configuration
 Copy `.env.example` to `.env` and configure your database target:
@@ -51,23 +51,19 @@ cp .env.example .env
 ```
 When running behind a reverse proxy, set `TRUST_PROXY_CIDRS` to a comma-separated list of the proxy's exact IPs/CIDRs. Leave it empty for direct connections; arbitrary `X-Forwarded-For` headers are not trusted.
 
-### 3. Database Migration & Seeding
+### 3. Verify Redis Version & Initialize Database
 ```bash
-npm run db:migrate
-npm run db:seed
+npm --prefix QCOM/backend run verify:redis
+npm --prefix QCOM/backend run db:migrate
+npm --prefix QCOM/backend run db:seed
 ```
 
 ### 4. Running Backend
 ```bash
-npm run dev
+npm --prefix QCOM/backend run dev
 ```
 
-### 5. Running the Complete Automated Test Suite
-From workspace root:
+### 5. Running the Complete Automated Test Suite (54 Suites)
 ```bash
-npm run test:backend
-```
-Or from `QCOM/backend`:
-```bash
-npm test
+npm --prefix QCOM/backend test
 ```

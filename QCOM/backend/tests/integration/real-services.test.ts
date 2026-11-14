@@ -97,9 +97,9 @@ async function runRedisProcessPair(key: string, limit: number, attempts: number)
 }
 
 async function assertRedis7(client: NonNullable<ReturnType<typeof import('../../src/database/redis.js')['getRedisClient']>>): Promise<void> {
+  const { assertExactRedisVersion, REQUIRED_REDIS_VERSION } = await import('../../src/config/redisVersion.js');
   const info = await client.info('server');
-  const version = info.match(/^redis_version:([^\r\n]+)/m)?.[1];
-  assert.ok(version?.startsWith('7.'), `Redis 7 required; server reported ${version || 'unknown'}.`);
+  const version = assertExactRedisVersion(info, REQUIRED_REDIS_VERSION);
   console.log(`Redis server version: ${version}`);
 }
 

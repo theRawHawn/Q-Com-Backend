@@ -2,7 +2,7 @@
 
 **Architecture Style:** Modular Monolith (Single-Process, Multi-Domain Engine)  
 **Authoritative Store:** PostgreSQL 16  
-**Ephemeral / PubSub Cache:** Redis 7  
+**Ephemeral / PubSub Cache:** Redis 7.0.15 (`redis:7.0.15-alpine` pinned for dev/CI; Managed HA Redis `>= 7.0.15` in production)  
 **Gateway & Real-Time:** Express 4.x + `ws` WebSocket Server  
 **Target Environment:** Containerized Node.js (Docker / Cloud Run)  
 
