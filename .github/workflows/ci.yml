@@ -115,10 +115,12 @@ jobs:
         run: |
           PG_PW=$(openssl rand -hex 16)
           RD_PW=$(openssl rand -hex 16)
-          echo "QCOM_IT_POSTGRES_PASSWORD=$PG_PW" >> "$GITHUB_ENV"
-          echo "QCOM_IT_REDIS_PASSWORD=$RD_PW" >> "$GITHUB_ENV"
           echo "::add-mask::$PG_PW"
           echo "::add-mask::$RD_PW"
+          export QCOM_IT_POSTGRES_PASSWORD="$PG_PW"
+          export QCOM_IT_REDIS_PASSWORD="$RD_PW"
+          echo "QCOM_IT_POSTGRES_PASSWORD=$PG_PW" >> "$GITHUB_ENV"
+          echo "QCOM_IT_REDIS_PASSWORD=$RD_PW" >> "$GITHUB_ENV"
           docker compose -f QCOM/backend/docker-compose.integration.yml up -d --wait
 
       - name: Verify exact Redis 7.0.15 & PostgreSQL 16 versions

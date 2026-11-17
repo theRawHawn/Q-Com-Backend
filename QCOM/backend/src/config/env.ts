@@ -106,7 +106,7 @@ export function validateProductionSecurity(config: EnvConfig): void {
       throw new Error('[Security Exception] Production requires a high-entropy JWT_ACCESS_SECRET of at least 32 characters.');
     }
 
-    if (process.env.JWT_SECRET && (defaultDevSecrets.includes(config.JWT_SECRET) || config.JWT_SECRET.length < 32)) {
+    if (config.JWT_SECRET && process.env.JWT_SECRET && (defaultDevSecrets.includes(config.JWT_SECRET) || config.JWT_SECRET.length < 32)) {
       throw new Error('[Security Exception] Production JWT_SECRET must be high-entropy and at least 32 characters.');
     }
 
