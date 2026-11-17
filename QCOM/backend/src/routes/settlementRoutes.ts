@@ -5,6 +5,7 @@ import { env } from '../config/env.js';
 import { authenticate } from '../middleware/auth.js';
 import { requireRole } from '../middleware/rbac.js';
 import { requireRiderOwnership } from '../middleware/resourceOwnership.js';
+import { paymentWebhookRateLimiter } from '../middleware/rateLimiter.js';
 import { settlementAllocationService } from '../modules/settlements/settlementAllocationService.js';
 import { sellerSettlementService } from '../modules/settlements/sellerSettlementService.js';
 import { riderPayoutService } from '../modules/settlements/riderPayoutService.js';
@@ -38,7 +39,7 @@ function isDatabaseUnavailable(err: any): boolean {
  * POST /api/v1/settlements/allocate
  * Trigger post-fulfillment financial allocation for a delivered order
  */
-settlementRouter.post('/allocate', authenticate, async (req: Request, res: Response): Promise<void> => {
+settlementRouter.post('/allocate', authenticate, requireRole(['SUPER_ADMIN', 'FINANCE_ADMIN', 'OPERATIONS']), async (req: Request, res: Response): Promise<void> => {
   const { orderId } = req.body;
 
   if (!orderId) {
@@ -119,6 +120,21 @@ settlementRouter.get('/order/:orderId/allocation', authenticate, async (req: Req
     }
 
     const row = result.rows[0];
+    const isGlobalAdmin =
+      Boolean(req.auth?.isSuperAdmin) ||
+      Boolean(req.auth?.roles?.some((r) => ['ADMIN', 'SUPER_ADMIN', 'FINANCE_ADMIN', 'OPERATIONS'].includes(r)));
+    const isAuthorizedMerchant = Boolean(row.merchant_id && req.auth?.merchantIds?.includes(row.merchant_id));
+    const isAssignedRider = Boolean(row.rider_id && req.auth?.riderId === row.rider_id);
+
+    if (!isGlobalAdmin && !isAuthorizedMerchant && !isAssignedRider) {
+      res.status(403).json({
+        success: false,
+        error: 'RESOURCE_ACCESS_DENIED',
+        message: 'Access forbidden: You are not authorized to inspect settlement allocations for this order.',
+      });
+      return;
+    }
+
     res.status(200).json({
       success: true,
       allocation: {
@@ -460,7 +476,7 @@ settlementRouter.post('/rider/payout', authenticate, async (req: Request, res: R
  * POST /api/v1/settlements/cod/remit
  * Rider remits collected Cash on Delivery funds via UPI or hub deposit
  */
-settlementRouter.post('/cod/remit', authenticate, async (req: Request, res: Response): Promise<void> => {
+settlementRouter.post('/cod/remit', authenticate, requireRiderOwnership('riderId'), async (req: Request, res: Response): Promise<void> => {
   const { riderId, amount, method, reference } = req.body;
 
   if (!riderId || amount === undefined) {
@@ -620,4 +636,4 @@ settlementRouter.post(
  * POST /api/v1/settlements/webhooks/payouts
  * Dedicated endpoint for banking payout webhook ingestion
  */
-settlementRouter.post("/webhooks/payouts", handleWebhookRequest);
+settlementRouter.post("/webhooks/payouts", paymentWebhookRateLimiter, handleWebhookRequest);

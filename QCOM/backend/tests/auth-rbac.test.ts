@@ -42,13 +42,13 @@ export async function testAuthAndRbac() {
 
     // 1.3 OTP Challenge stored in database with hashed OTP
     const challengeDb = await pool.query(
-      `SELECT otp_hash, is_consumed, attempt_count FROM otp_challenges WHERE phone = $1`,
+      `SELECT otp_hash, salt, is_consumed, attempt_count FROM otp_challenges WHERE phone = $1`,
       [testPhone]
     );
     assert.equal(challengeDb.rows.length, 1);
     assert.equal(challengeDb.rows[0].is_consumed, false);
     assert.notEqual(challengeDb.rows[0].otp_hash, otpRes1.debugOtp, 'Raw OTP must NEVER be stored plaintext in database');
-    const expectedHash = hashOtp(testPhone, otpRes1.debugOtp!, 'LOGIN');
+    const expectedHash = hashOtp(testPhone, otpRes1.debugOtp!, 'LOGIN', challengeDb.rows[0].salt);
     assert.equal(challengeDb.rows[0].otp_hash, expectedHash);
     console.log('✓ OTP generation, cryptographic hashing, and cooldown enforcement verified');
 
@@ -143,7 +143,7 @@ export async function testAuthAndRbac() {
     console.log('[Test 4] Testing Explicit Logout and Server-Side Revocation...');
     
     // Create new session for user
-    const login2 = await authService.adminLogin('EMP-001', undefined, '127.0.0.1', 'AdminBrowser', pool);
+    const login2 = await authService.adminLogin('EMP-001', process.env.SEED_ADMIN_PASSWORD || 'QcomSeedAdmin#2026', '127.0.0.1', 'AdminBrowser', pool);
     assert.ok(login2.session.id);
 
     // Logout

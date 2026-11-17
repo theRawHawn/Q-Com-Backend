@@ -5,6 +5,7 @@ import { refundService } from '../modules/payments/refundService.js';
 import { authenticate } from '../middleware/auth.js';
 import { requireRole } from '../middleware/rbac.js';
 import { requireOrderOwnership } from '../middleware/resourceOwnership.js';
+import { paymentWebhookRateLimiter } from '../middleware/rateLimiter.js';
 import { bloomFilterService } from '../modules/resilience/bloomFilterService.js';
 
 function isDatabaseUnavailable(err: any): boolean {
@@ -182,7 +183,7 @@ refundRouter.get(
  * POST /api/v1/refunds/webhooks/refunds
  * Dedicated endpoint for refund webhook ingestion
  */
-refundRouter.post("/webhooks/refunds", handleWebhookRequest);
+refundRouter.post("/webhooks/refunds", paymentWebhookRateLimiter, handleWebhookRequest);
 
 /**
  * POST /api/v1/admin/recovery/trigger

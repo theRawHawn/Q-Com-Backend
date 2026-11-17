@@ -11,10 +11,71 @@ import { AuthenticatedSocketContext, RealtimeClientMessage, RealtimeServerMessag
 import { liveLocationService } from './liveLocationService.js';
 import { calculateWebSocketReconnectDelay } from '../resilience/retryPolicy.js';
 
+import net from 'net';
+
 interface ExtendedWebSocket extends WebSocket {
   isAlive: boolean;
   authContext?: AuthenticatedSocketContext;
   subscribedChannels: Set<string>;
+}
+
+function normalizeIp(ip?: string | null): string {
+  if (!ip) return '127.0.0.1';
+  const trimmed = ip.trim();
+  return trimmed.startsWith('::ffff:') ? trimmed.slice(7) : trimmed;
+}
+
+function ipv4ToInt(ip: string): number | null {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  let num = 0;
+  for (const part of parts) {
+    if (!/^\d+$/.test(part)) return null;
+    const octet = Number(part);
+    if (octet < 0 || octet > 255) return null;
+    num = (num << 8) + octet;
+  }
+  return num >>> 0;
+}
+
+function isTrustedProxyIp(remoteIp: string, trustedCidrsRaw: string): boolean {
+  const cidrs = trustedCidrsRaw.split(',').map((c) => c.trim()).filter(Boolean);
+  if (cidrs.length === 0) return false;
+
+  const cleanRemote = normalizeIp(remoteIp);
+  if (cleanRemote === '::1') {
+    if (cidrs.includes('::1') || cidrs.includes('127.0.0.1') || cidrs.includes('loopback')) {
+      return true;
+    }
+  }
+
+  for (const entry of cidrs) {
+    if (entry === cleanRemote) return true;
+    if (entry === 'loopback' && (cleanRemote === '127.0.0.1' || cleanRemote === '::1')) return true;
+    const [network, prefixStr] = entry.split('/');
+    if (!network || !prefixStr) continue;
+    const prefix = Number(prefixStr);
+    const remoteInt = ipv4ToInt(cleanRemote);
+    const netInt = ipv4ToInt(normalizeIp(network));
+    if (remoteInt !== null && netInt !== null && Number.isInteger(prefix) && prefix >= 0 && prefix <= 32) {
+      const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+      if ((remoteInt & mask) === (netInt & mask)) return true;
+    }
+  }
+  return false;
+}
+
+function resolveWebSocketClientIp(remoteAddress: string | undefined, forwardedForHeader: string | string[] | undefined): string {
+  const peerIp = normalizeIp(remoteAddress);
+  if (!forwardedForHeader || !isTrustedProxyIp(peerIp, env.TRUST_PROXY_CIDRS)) {
+    return peerIp;
+  }
+  const rawHeader = Array.isArray(forwardedForHeader) ? forwardedForHeader[0] : forwardedForHeader;
+  const candidate = rawHeader.split(',')[0]?.trim();
+  if (candidate && net.isIP(normalizeIp(candidate))) {
+    return normalizeIp(candidate);
+  }
+  return peerIp;
 }
 
 export class RealtimeGateway {
@@ -47,7 +108,13 @@ export class RealtimeGateway {
           try {
             const data = JSON.parse(dataStr);
             if (data.originInstanceId !== this.instanceId) {
-              this.broadcastLocally(data.room, data.message);
+              if (data.controlType === 'SESSION_REVOKED' && data.sessionId) {
+                this.closeLocalSessionSockets(data.sessionId);
+              } else if (data.controlType === 'USER_LOGOUT_ALL' && data.userId) {
+                this.closeLocalUserSockets(data.userId);
+              } else if (data.room && data.message) {
+                this.broadcastLocally(data.room, data.message);
+              }
             }
           } catch {
             // ignore malformed broadcast message
@@ -67,10 +134,10 @@ export class RealtimeGateway {
 
     httpServer.on('upgrade', async (request, socket, head) => {
       try {
-        const clientIp =
-          (request.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
-          request.socket.remoteAddress ||
-          '127.0.0.1';
+        const clientIp = resolveWebSocketClientIp(
+          request.socket.remoteAddress,
+          request.headers['x-forwarded-for']
+        );
 
         // 1. IP Connection Limit Check
         const currentIpCount = this.ipConnectionCounts.get(clientIp) || 0;
@@ -113,7 +180,7 @@ export class RealtimeGateway {
         // 4. Authoritative PostgreSQL Session Validation
         const pool = getPool();
         const sessionRes = await pool.query(
-          `SELECT id, user_id, status, expires_at 
+          `SELECT id, user_id, token_version, status, expires_at 
            FROM auth_sessions 
            WHERE id = $1 AND user_id = $2`,
           [payload.session_id, payload.sub]
@@ -126,7 +193,11 @@ export class RealtimeGateway {
         }
 
         const session = sessionRes.rows[0];
-        if (session.status !== 'ACTIVE' || new Date(session.expires_at).getTime() < Date.now()) {
+        if (
+          session.status !== 'ACTIVE' ||
+          Number(payload.token_version) !== Number(session.token_version) ||
+          new Date(session.expires_at).getTime() < Date.now()
+        ) {
           socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
           socket.destroy();
           return;
@@ -510,10 +581,7 @@ export class RealtimeGateway {
     this.broadcastToRoom(`user:${userId}`, message);
   }
 
-  /**
-   * Handles user logout: instantly severs open sockets for the revoked session.
-   */
-  public handleSessionRevocation(sessionId: string): void {
+  private closeLocalSessionSockets(sessionId: string): void {
     if (!this.wss) return;
     for (const client of this.wss.clients) {
       const extWs = client as ExtendedWebSocket;
@@ -528,10 +596,7 @@ export class RealtimeGateway {
     }
   }
 
-  /**
-   * Handles global logout-all: instantly severs all active sockets across all devices for this user.
-   */
-  public handleUserLogoutAll(userId: string): void {
+  private closeLocalUserSockets(userId: string): void {
     const sockets = this.userSockets.get(userId);
     if (!sockets) return;
     for (const ws of sockets) {
@@ -541,6 +606,58 @@ export class RealtimeGateway {
         message: 'All sessions for your account have been terminated.',
       });
       ws.close(4401, 'LOGOUT_ALL');
+    }
+  }
+
+  /**
+   * Handles user logout: instantly severs open sockets for the revoked session.
+   */
+  public handleSessionRevocation(sessionId: string): void {
+    this.closeLocalSessionSockets(sessionId);
+    try {
+      const client = getRedisClient();
+      if (client) {
+        const res = client.publish(
+          'qcom:ws:broadcast',
+          JSON.stringify({
+            controlType: 'SESSION_REVOKED',
+            sessionId,
+            originInstanceId: this.instanceId,
+            timestamp: Date.now(),
+          })
+        );
+        if (res && typeof (res as any).catch === 'function') {
+          (res as any).catch(() => {});
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * Handles global logout-all: instantly severs all active sockets across all devices for this user.
+   */
+  public handleUserLogoutAll(userId: string): void {
+    this.closeLocalUserSockets(userId);
+    try {
+      const client = getRedisClient();
+      if (client) {
+        const res = client.publish(
+          'qcom:ws:broadcast',
+          JSON.stringify({
+            controlType: 'USER_LOGOUT_ALL',
+            userId,
+            originInstanceId: this.instanceId,
+            timestamp: Date.now(),
+          })
+        );
+        if (res && typeof (res as any).catch === 'function') {
+          (res as any).catch(() => {});
+        }
+      }
+    } catch {
+      // ignore
     }
   }
 

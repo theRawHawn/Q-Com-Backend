@@ -4,6 +4,7 @@ import { dispatchService } from '../modules/dispatch/dispatchService.js';
 import { getPool } from '../database/connection.js';
 import { authenticate } from '../middleware/auth.js';
 import { dispatchActionRateLimiter } from '../middleware/rateLimiter.js';
+import { requireOrderOwnership } from '../middleware/resourceOwnership.js';
 
 export const dispatchRouter = Router();
 
@@ -366,7 +367,7 @@ dispatchRouter.post('/assign', authenticate, dispatchActionRateLimiter, requireD
 /**
  * GET /api/v1/dispatch/orders/:orderId
  */
-dispatchRouter.get('/orders/:orderId', authenticate, async (req: Request, res: Response): Promise<void> => {
+dispatchRouter.get('/orders/:orderId', authenticate, requireOrderOwnership('orderId'), async (req: Request, res: Response): Promise<void> => {
   try {
     const { orderId } = req.params;
     const assignment = await dispatchService.getAssignmentByOrderId(orderId);
@@ -393,6 +394,27 @@ dispatchRouter.get('/assignments/:assignmentId', authenticate, async (req: Reque
     if (!assignment) {
       res.status(404).json({ success: false, error: 'ASSIGNMENT_NOT_FOUND', message: `Assignment '${assignmentId}' not found.` });
       return;
+    }
+
+    const isGlobalAdmin =
+      Boolean(req.auth!.isSuperAdmin) ||
+      Boolean(req.auth!.roles?.some((r) => ['SUPER_ADMIN', 'OPERATIONS', 'DISPATCHER'].includes(r)));
+
+    if (!isGlobalAdmin) {
+      const pool = getPool();
+      const orderRes = await pool.query(`SELECT user_id, merchant_id FROM orders WHERE id = $1 LIMIT 1`, [assignment.orderId]);
+      const orderRow = orderRes.rows[0];
+      const isCustomerOwner = orderRow?.user_id === req.auth!.userId;
+      const isMerchantOwner = Boolean(orderRow?.merchant_id && req.auth!.merchantIds?.includes(orderRow.merchant_id));
+      const isAssignedRider = Boolean(req.auth!.riderId && assignment.riderId === req.auth!.riderId);
+      if (!isCustomerOwner && !isMerchantOwner && !isAssignedRider) {
+        res.status(403).json({
+          success: false,
+          error: 'RESOURCE_ACCESS_DENIED',
+          message: 'Access forbidden: You are not authorized to view this dispatch assignment.',
+        });
+        return;
+      }
     }
 
     res.status(200).json({ success: true, assignment });
@@ -485,6 +507,28 @@ dispatchRouter.post('/offers/:offerId/reject', authenticate, requireRiderOrDispa
 dispatchRouter.post('/offers/:offerId/expire', authenticate, requireExpireAuthorized, async (req: Request, res: Response): Promise<void> => {
   try {
     const { offerId } = req.params;
+    const isDispatchAdmin =
+      Boolean(req.auth!.isSuperAdmin) ||
+      Boolean(req.auth!.roles?.some((r) => ['SUPER_ADMIN', 'OPERATIONS', 'DISPATCHER'].includes(r))) ||
+      Boolean(req.auth!.permissions?.includes('orders.assign_rider'));
+
+    if (!isDispatchAdmin) {
+      const pool = getPool();
+      const offerRes = await pool.query(`SELECT rider_id FROM dispatch_offers WHERE id = $1 LIMIT 1`, [offerId]);
+      if (offerRes.rows.length === 0) {
+        res.status(404).json({ success: false, error: 'OFFER_NOT_FOUND', message: 'Rider offer not found.' });
+        return;
+      }
+      if (!req.auth!.riderId || offerRes.rows[0].rider_id !== req.auth!.riderId) {
+        res.status(403).json({
+          success: false,
+          error: 'RIDER_ACCESS_DENIED',
+          message: 'Access forbidden: You can only expire dispatch offers assigned to your own rider account.',
+        });
+        return;
+      }
+    }
+
     await dispatchService.expireOffer(offerId);
     res.status(200).json({ success: true, message: 'Offer expired successfully.' });
   } catch (err: any) {

@@ -7,6 +7,13 @@ export interface AppError extends Error {
   details?: any;
 }
 
+export function safeErrorMessage(err: any, fallback: string): string {
+  if (env.NODE_ENV === 'production') {
+    return fallback;
+  }
+  return err?.message || fallback;
+}
+
 export function notFoundHandler(req: Request, res: Response): void {
   const requestId = req.requestId || 'req_unknown';
   res.status(404).json({

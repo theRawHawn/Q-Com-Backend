@@ -38,10 +38,16 @@ rbacRouter.post('/roles', async (req: Request, res: Response): Promise<void> => 
       description,
       isSystemRole: req.auth!.isSuperAdmin ? Boolean(isSystemRole) : false,
       actorId: req.auth!.userId,
+      actorIsSuperAdmin: req.auth!.isSuperAdmin,
     });
     res.status(201).json({ success: true, message: 'Role created successfully.', role });
   } catch (err: any) {
-    res.status(400).json({ success: false, error: 'CREATE_FAILED', message: err.message });
+    const isForbidden = String(err.message || '').includes('PRIVILEGE_ESCALATION_DENIED');
+    res.status(isForbidden ? 403 : 400).json({
+      success: false,
+      error: isForbidden ? 'PRIVILEGE_ESCALATION_DENIED' : 'CREATE_FAILED',
+      message: err.message,
+    });
   }
 });
 
@@ -69,10 +75,15 @@ rbacRouter.post('/roles/:roleId/permissions', async (req: Request, res: Response
   }
 
   try {
-    await rbacService.assignPermissionToRole(roleId, permissionId, req.auth!.userId);
+    await rbacService.assignPermissionToRole(roleId, permissionId, req.auth!.userId, undefined, req.auth!.isSuperAdmin);
     res.status(200).json({ success: true, message: 'Permission assigned to role successfully.' });
   } catch (err: any) {
-    res.status(400).json({ success: false, error: 'ASSIGN_FAILED', message: err.message });
+    const isForbidden = String(err.message || '').includes('PRIVILEGE_ESCALATION_DENIED');
+    res.status(isForbidden ? 403 : 400).json({
+      success: false,
+      error: isForbidden ? 'PRIVILEGE_ESCALATION_DENIED' : 'ASSIGN_FAILED',
+      message: err.message,
+    });
   }
 });
 
@@ -83,10 +94,15 @@ rbacRouter.delete('/roles/:roleId/permissions/:permissionId', async (req: Reques
   const { roleId, permissionId } = req.params;
 
   try {
-    await rbacService.removePermissionFromRole(roleId, permissionId, req.auth!.userId);
+    await rbacService.removePermissionFromRole(roleId, permissionId, req.auth!.userId, undefined, req.auth!.isSuperAdmin);
     res.status(200).json({ success: true, message: 'Permission removed from role successfully.' });
   } catch (err: any) {
-    res.status(400).json({ success: false, error: 'REMOVE_FAILED', message: err.message });
+    const isForbidden = String(err.message || '').includes('PRIVILEGE_ESCALATION_DENIED');
+    res.status(isForbidden ? 403 : 400).json({
+      success: false,
+      error: isForbidden ? 'PRIVILEGE_ESCALATION_DENIED' : 'REMOVE_FAILED',
+      message: err.message,
+    });
   }
 });
 
@@ -102,10 +118,15 @@ rbacRouter.post('/users/:userId/roles', async (req: Request, res: Response): Pro
   }
 
   try {
-    await rbacService.assignRoleToUser(userId, roleId, req.auth!.userId);
+    await rbacService.assignRoleToUser(userId, roleId, req.auth!.userId, undefined, req.auth!.isSuperAdmin);
     res.status(200).json({ success: true, message: 'Role assigned to user successfully.' });
   } catch (err: any) {
-    res.status(400).json({ success: false, error: 'ASSIGN_FAILED', message: err.message });
+    const isForbidden = String(err.message || '').includes('PRIVILEGE_ESCALATION_DENIED');
+    res.status(isForbidden ? 403 : 400).json({
+      success: false,
+      error: isForbidden ? 'PRIVILEGE_ESCALATION_DENIED' : 'ASSIGN_FAILED',
+      message: err.message,
+    });
   }
 });
 
@@ -116,9 +137,14 @@ rbacRouter.delete('/users/:userId/roles/:roleId', async (req: Request, res: Resp
   const { userId, roleId } = req.params;
 
   try {
-    await rbacService.removeRoleFromUser(userId, roleId, req.auth!.userId);
+    await rbacService.removeRoleFromUser(userId, roleId, req.auth!.userId, undefined, req.auth!.isSuperAdmin);
     res.status(200).json({ success: true, message: 'Role removed from user successfully.' });
   } catch (err: any) {
-    res.status(400).json({ success: false, error: 'REMOVE_FAILED', message: err.message });
+    const isForbidden = String(err.message || '').includes('PRIVILEGE_ESCALATION_DENIED');
+    res.status(isForbidden ? 403 : 400).json({
+      success: false,
+      error: isForbidden ? 'PRIVILEGE_ESCALATION_DENIED' : 'REMOVE_FAILED',
+      message: err.message,
+    });
   }
 });

@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { paymentService } from '../modules/payments/paymentService.js';
 import { paymentProviderRegistry } from '../modules/payments/paymentProvider.js';
 import { authenticate } from '../middleware/auth.js';
+import { requireOrderOwnership } from '../middleware/resourceOwnership.js';
 import { getPool } from '../database/connection.js';
 import { paymentInitiationRateLimiter, paymentWebhookRateLimiter } from '../middleware/rateLimiter.js';
 
@@ -785,7 +786,7 @@ paymentRouter.get('/:orderId', authenticate, async (req: Request, res: Response)
  * POST /api/payment/webhook/:providerId
  * Provider-specific webhook ingestion route
  */
-paymentRouter.post('/webhook/:providerId', handleWebhookRequest);
+paymentRouter.post('/webhook/:providerId', paymentWebhookRateLimiter, handleWebhookRequest);
 
 /**
  * POST /api/payment/attempt
@@ -831,7 +832,7 @@ paymentRouter.post('/attempt', authenticate, async (req: Request, res: Response)
  * POST /api/payment/reconcile/:orderId
  * Authoritative reconciliation of ambiguous payment status
  */
-paymentRouter.post('/reconcile/:orderId', authenticate, async (req: Request, res: Response): Promise<void> => {
+paymentRouter.post('/reconcile/:orderId', authenticate, requireOrderOwnership('orderId'), async (req: Request, res: Response): Promise<void> => {
   const { orderId } = req.params;
   if (!orderId) {
     res.status(400).json({ success: false, error: 'MISSING_ORDER_ID', message: 'orderId is required.' });

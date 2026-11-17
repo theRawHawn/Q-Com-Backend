@@ -98,12 +98,18 @@ export async function runSprint14_7AuthenticationSecurityTests(): Promise<void> 
   // ---------------------------------------------------------------------------
   console.log('\n--- Section 2: Admin Password Lifecycle & Lockout Protection ---');
 
-  // 2.1 Admin Login without password initially (seeded admin)
-  const adminLogin1 = await apiCall(baseUrl1, '/api/auth/admin/login', {
+  // 2.1 Passwordless admin login must be rejected, and seeded admin authenticates with password
+  const passwordlessLogin = await apiCall(baseUrl1, '/api/auth/admin/login', {
     method: 'POST',
     body: { employeeCode: 'EMP-001' },
   });
-  assert.strictEqual(adminLogin1.status, 200, 'Admin can login via employee code');
+  assert.strictEqual(passwordlessLogin.status, 401, 'Passwordless admin login must be rejected');
+
+  const adminLogin1 = await apiCall(baseUrl1, '/api/auth/admin/login', {
+    method: 'POST',
+    body: { employeeCode: 'EMP-001', password: process.env.SEED_ADMIN_PASSWORD || 'QcomSeedAdmin#2026' },
+  });
+  assert.strictEqual(adminLogin1.status, 200, 'Admin can login via employee code and valid password');
   const adminToken = adminLogin1.data.accessToken;
   const adminUserId = adminLogin1.data.employee.id;
 

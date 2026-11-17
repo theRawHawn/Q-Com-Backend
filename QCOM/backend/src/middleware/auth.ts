@@ -66,7 +66,7 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
     // 2. Authoritative PostgreSQL Session Validation
     const pool = getPool();
     const sessionRes = await pool.query(
-      `SELECT id, user_id, status, expires_at 
+      `SELECT id, user_id, token_version, status, expires_at 
        FROM auth_sessions 
        WHERE id = $1 AND user_id = $2`,
       [payload.session_id, payload.sub]
@@ -87,6 +87,15 @@ export async function authenticate(req: Request, res: Response, next: NextFuncti
         success: false,
         error: 'SESSION_REVOKED',
         message: 'This session has been revoked or terminated.',
+      });
+      return;
+    }
+
+    if (Number(payload.token_version) !== Number(session.token_version)) {
+      res.status(401).json({
+        success: false,
+        error: 'SESSION_REVOKED',
+        message: 'Session token version has been invalidated. Please log in again.',
       });
       return;
     }

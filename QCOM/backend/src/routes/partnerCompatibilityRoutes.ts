@@ -1,30 +1,71 @@
 import { Router, Request, Response } from 'express';
 import { getPool } from '../database/connection.js';
-import { authenticate, optionalAuthenticate } from '../middleware/auth.js';
+import { authenticate } from '../middleware/auth.js';
 import { riderTelemetryRateLimiter } from '../middleware/rateLimiter.js';
-import { deliveryEconomicsService } from '../modules/delivery/deliveryEconomicsService.js';
+import { safeErrorMessage } from '../middleware/errorHandler.js';
+import { constantTimeCompare } from '../modules/auth/crypto.js';
+import { recordAuditEvent } from '../modules/audit/auditService.js';
 
 export const partnerCompatibilityRouter = Router();
 
+async function resolveCallerRider(pool: ReturnType<typeof getPool>, req: Request): Promise<{ id: string; status: string } | null> {
+  if (req.auth?.riderId) {
+    const res = await pool.query(`SELECT id, status FROM riders WHERE id = $1 LIMIT 1`, [req.auth.riderId]);
+    if (res.rows.length > 0) return res.rows[0];
+  }
+  if (req.auth?.userId) {
+    const res = await pool.query(
+      `SELECT id, status FROM riders WHERE user_id = $1 OR phone = $2 LIMIT 1`,
+      [req.auth.userId, req.auth.phone || '']
+    );
+    if (res.rows.length > 0) return res.rows[0];
+  }
+  return null;
+}
+
+function isDispatchAdmin(req: Request): boolean {
+  return Boolean(
+    req.auth?.isSuperAdmin ||
+      req.auth?.roles?.some((r: string) => ['SUPER_ADMIN', 'OPERATIONS', 'DISPATCHER'].includes(r))
+  );
+}
+
 /**
  * POST /api/partner/duty-status & POST /api/v1/partner/duty-status
- * Duty Toggle & Safety Interlock Endpoint
+ * Duty Toggle & Safety Interlock Endpoint (strictly authenticated and rider-bound)
  */
-partnerCompatibilityRouter.post('/duty-status', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
-  const { isOnline, batteryLevel, deviceInfo } = req.body;
+partnerCompatibilityRouter.post('/duty-status', authenticate, riderTelemetryRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  const { isOnline } = req.body;
   const pool = getPool();
 
   try {
-    const riderId = req.auth?.riderId || req.body.riderId;
-    if (riderId) {
-      await pool.query(
-        `UPDATE riders SET status = $1 WHERE id = $2`,
-        [isOnline ? 'IDLE_AT_HUB' : 'OFFLINE', riderId]
-      );
+    const rider = await resolveCallerRider(pool, req);
+    if (!rider) {
+      res.status(403).json({
+        success: false,
+        error: 'RIDER_REQUIRED',
+        message: 'Only registered delivery partners can update duty status.',
+      });
+      return;
     }
+
+    if (rider.status === 'SUSPENDED' || req.auth?.isSuspended) {
+      res.status(403).json({
+        success: false,
+        error: 'RIDER_SUSPENDED',
+        message: 'Suspended delivery partners cannot change duty status.',
+      });
+      return;
+    }
+
+    await pool.query(
+      `UPDATE riders SET status = $1 WHERE id = $2 AND status != 'SUSPENDED'`,
+      [isOnline ? 'IDLE_AT_HUB' : 'OFFLINE', rider.id]
+    );
 
     res.status(200).json({
       success: true,
+      riderId: rider.id,
       status: isOnline ? 'ONLINE' : 'OFFLINE',
       assignedHub: {
         hubId: 'hub_koramangala_04',
@@ -42,7 +83,7 @@ partnerCompatibilityRouter.post('/duty-status', optionalAuthenticate, async (req
     res.status(500).json({
       success: false,
       error: 'DUTY_STATUS_FAILED',
-      message: err.message || 'Failed to update duty status.',
+      message: safeErrorMessage(err, 'Failed to update duty status.'),
     });
   }
 });
@@ -69,29 +110,7 @@ tasksCompatibilityRouter.post('/:taskId/accept', authenticate, riderTelemetryRat
       return;
     }
 
-    // 1. Resolve and verify claiming rider identity
-    let riderId = req.auth.riderId;
-    let riderRow: any = null;
-
-    if (riderId) {
-      const r = await pool.query(
-        `SELECT id, name, status FROM riders WHERE id = $1`,
-        [riderId]
-      );
-      if (r.rows.length > 0) riderRow = r.rows[0];
-    }
-
-    if (!riderRow) {
-      const r = await pool.query(
-        `SELECT id, name, status FROM riders WHERE user_id = $1 OR phone = $2 LIMIT 1`,
-        [req.auth.userId, req.auth.phone || '']
-      );
-      if (r.rows.length > 0) {
-        riderRow = r.rows[0];
-        riderId = riderRow.id;
-      }
-    }
-
+    const riderRow = await resolveCallerRider(pool, req);
     if (!riderRow) {
       res.status(403).json({
         success: false,
@@ -110,8 +129,9 @@ tasksCompatibilityRouter.post('/:taskId/accept', authenticate, riderTelemetryRat
       return;
     }
 
-    // 3. Atomic single-winner claim: only transition from BROADCASTING to ACCEPTED
-    // Atomically assigns the claiming rider's ID to prevent race conditions & theft
+    const riderId = riderRow.id;
+
+    // Atomic single-winner claim: only transition from BROADCASTING to ACCEPTED
     const updateRes = await pool.query(
       `UPDATE delivery_trips 
        SET status = 'ACCEPTED', accepted_at = NOW(), rider_id = $1 
@@ -133,7 +153,6 @@ tasksCompatibilityRouter.post('/:taskId/accept', authenticate, riderTelemetryRat
 
       const trip = checkRes.rows[0];
 
-      // Idempotent retry by the same rider
       if (trip.rider_id === riderId && trip.status === 'ACCEPTED') {
         res.status(200).json({
           success: true,
@@ -157,7 +176,6 @@ tasksCompatibilityRouter.post('/:taskId/accept', authenticate, riderTelemetryRat
 
     const trip = updateRes.rows[0];
 
-    // Transition rider to PICKING_UP
     try {
       await pool.query(
         `UPDATE riders SET status = 'PICKING_UP' WHERE id = $1 AND status != 'SUSPENDED'`,
@@ -179,7 +197,7 @@ tasksCompatibilityRouter.post('/:taskId/accept', authenticate, riderTelemetryRat
     res.status(500).json({
       success: false,
       error: 'ACCEPT_FAILED',
-      message: err.message || 'Failed to accept delivery task.',
+      message: safeErrorMessage(err, 'Failed to accept delivery task.'),
     });
   }
 });
@@ -187,13 +205,49 @@ tasksCompatibilityRouter.post('/:taskId/accept', authenticate, riderTelemetryRat
 /**
  * POST /api/tasks/:taskId/arrived-pickup & POST /api/v1/tasks/:taskId/arrived-pickup
  */
-tasksCompatibilityRouter.post('/:taskId/arrived-pickup', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+tasksCompatibilityRouter.post('/:taskId/arrived-pickup', authenticate, riderTelemetryRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const { taskId } = req.params;
   const pool = getPool();
   try {
-    await pool.query(
-      `UPDATE delivery_trips SET status = 'ARRIVED_AT_PICKUP' WHERE id = $1 OR order_id = $1`,
+    const adminOverride = isDispatchAdmin(req);
+    const rider = adminOverride ? null : await resolveCallerRider(pool, req);
+
+    if (!adminOverride && !rider) {
+      res.status(403).json({ success: false, error: 'RIDER_REQUIRED', message: 'Only assigned delivery partners or admins can update trip status.' });
+      return;
+    }
+
+    const tripRes = await pool.query(
+      `SELECT id, rider_id, status FROM delivery_trips WHERE id = $1 OR order_id = $1 LIMIT 1`,
       [taskId]
+    );
+    if (tripRes.rows.length === 0) {
+      res.status(404).json({ success: false, error: 'TASK_NOT_FOUND', message: 'Delivery task not found.' });
+      return;
+    }
+
+    const trip = tripRes.rows[0];
+    if (!adminOverride && trip.rider_id !== rider!.id) {
+      await recordAuditEvent({
+        actorId: req.auth!.userId,
+        actorType: 'RIDER',
+        action: 'CROSS_RIDER_TASK_MUTATION_BLOCKED',
+        entityType: 'DELIVERY_TRIP',
+        entityId: trip.id,
+        newState: { assignedRiderId: trip.rider_id, callerRiderId: rider!.id, action: 'arrived-pickup' },
+        ipAddress: req.ip,
+      });
+      res.status(403).json({
+        success: false,
+        error: 'RIDER_ACCESS_DENIED',
+        message: 'Access forbidden: This delivery task is assigned to another delivery partner.',
+      });
+      return;
+    }
+
+    await pool.query(
+      `UPDATE delivery_trips SET status = 'ARRIVED_AT_PICKUP' WHERE id = $1`,
+      [trip.id]
     );
     res.status(200).json({
       success: true,
@@ -205,7 +259,7 @@ tasksCompatibilityRouter.post('/:taskId/arrived-pickup', optionalAuthenticate, a
     res.status(500).json({
       success: false,
       error: 'ARRIVAL_FAILED',
-      message: err.message || 'Failed to record arrival.',
+      message: safeErrorMessage(err, 'Failed to record arrival.'),
     });
   }
 });
@@ -213,13 +267,49 @@ tasksCompatibilityRouter.post('/:taskId/arrived-pickup', optionalAuthenticate, a
 /**
  * POST /api/tasks/:taskId/pickup-confirm & POST /api/v1/tasks/:taskId/pickup-confirm
  */
-tasksCompatibilityRouter.post('/:taskId/pickup-confirm', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+tasksCompatibilityRouter.post('/:taskId/pickup-confirm', authenticate, riderTelemetryRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const { taskId } = req.params;
   const pool = getPool();
   try {
-    await pool.query(
-      `UPDATE delivery_trips SET status = 'PICKED_UP', picked_up_at = NOW() WHERE id = $1 OR order_id = $1`,
+    const adminOverride = isDispatchAdmin(req);
+    const rider = adminOverride ? null : await resolveCallerRider(pool, req);
+
+    if (!adminOverride && !rider) {
+      res.status(403).json({ success: false, error: 'RIDER_REQUIRED', message: 'Only assigned delivery partners or admins can confirm pickup.' });
+      return;
+    }
+
+    const tripRes = await pool.query(
+      `SELECT id, rider_id, status FROM delivery_trips WHERE id = $1 OR order_id = $1 LIMIT 1`,
       [taskId]
+    );
+    if (tripRes.rows.length === 0) {
+      res.status(404).json({ success: false, error: 'TASK_NOT_FOUND', message: 'Delivery task not found.' });
+      return;
+    }
+
+    const trip = tripRes.rows[0];
+    if (!adminOverride && trip.rider_id !== rider!.id) {
+      await recordAuditEvent({
+        actorId: req.auth!.userId,
+        actorType: 'RIDER',
+        action: 'CROSS_RIDER_TASK_MUTATION_BLOCKED',
+        entityType: 'DELIVERY_TRIP',
+        entityId: trip.id,
+        newState: { assignedRiderId: trip.rider_id, callerRiderId: rider!.id, action: 'pickup-confirm' },
+        ipAddress: req.ip,
+      });
+      res.status(403).json({
+        success: false,
+        error: 'RIDER_ACCESS_DENIED',
+        message: 'Access forbidden: This delivery task is assigned to another delivery partner.',
+      });
+      return;
+    }
+
+    await pool.query(
+      `UPDATE delivery_trips SET status = 'PICKED_UP', picked_up_at = NOW() WHERE id = $1`,
+      [trip.id]
     );
     res.status(200).json({
       success: true,
@@ -231,18 +321,18 @@ tasksCompatibilityRouter.post('/:taskId/pickup-confirm', optionalAuthenticate, a
     res.status(500).json({
       success: false,
       error: 'PICKUP_FAILED',
-      message: err.message || 'Failed to confirm pickup.',
+      message: safeErrorMessage(err, 'Failed to confirm pickup.'),
     });
   }
 });
 
 /**
  * POST /api/tasks/:taskId/verify-otp & POST /api/v1/tasks/:taskId/verify-otp
- * Order Completion & OTP Verification endpoint
+ * Order Completion & OTP Verification endpoint (strictly constant-time OTP check & rider-bound)
  */
-tasksCompatibilityRouter.post('/:taskId/verify-otp', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+tasksCompatibilityRouter.post('/:taskId/verify-otp', authenticate, riderTelemetryRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const { taskId } = req.params;
-  const { otp, cashCollected, proofImageUrl } = req.body;
+  const { otp, cashCollected } = req.body;
   const pool = getPool();
 
   if (!otp || typeof otp !== 'string') {
@@ -251,9 +341,17 @@ tasksCompatibilityRouter.post('/:taskId/verify-otp', optionalAuthenticate, async
   }
 
   try {
+    const adminOverride = isDispatchAdmin(req);
+    const rider = adminOverride ? null : await resolveCallerRider(pool, req);
+
+    if (!adminOverride && !rider) {
+      res.status(403).json({ success: false, error: 'RIDER_REQUIRED', message: 'Only assigned delivery partners or admins can verify delivery OTP.' });
+      return;
+    }
+
     // Look up delivery trip and parent order
     const tripRes = await pool.query(`
-      SELECT dt.id, dt.order_id, dt.rider_id, o.delivery_otp, dt.total_rider_payout,
+      SELECT dt.id, dt.order_id, dt.rider_id, dt.status as trip_status, o.delivery_otp, dt.total_rider_payout,
              dt.base_fare, dt.distance_fare, dt.surge_fare, dt.rider_tip_payable,
              dt.rider_withholding_amount
       FROM delivery_trips dt
@@ -267,29 +365,89 @@ tasksCompatibilityRouter.post('/:taskId/verify-otp', optionalAuthenticate, async
     }
 
     const trip = tripRes.rows[0];
-    const cleanOtp = otp.trim();
-    const expectedOtp = trip.delivery_otp.trim();
+    if (!adminOverride && trip.rider_id !== rider!.id) {
+      await recordAuditEvent({
+        actorId: req.auth!.userId,
+        actorType: 'RIDER',
+        action: 'CROSS_RIDER_TASK_MUTATION_BLOCKED',
+        entityType: 'DELIVERY_TRIP',
+        entityId: trip.id,
+        newState: { assignedRiderId: trip.rider_id, callerRiderId: rider!.id, action: 'verify-otp' },
+        ipAddress: req.ip,
+      });
+      res.status(403).json({
+        success: false,
+        error: 'RIDER_ACCESS_DENIED',
+        message: 'Access forbidden: This delivery task is assigned to another delivery partner.',
+      });
+      return;
+    }
 
-    // Verify OTP (allowing 4-digit or 6-digit match)
-    const isMatch = cleanOtp === expectedOtp || expectedOtp.endsWith(cleanOtp) || cleanOtp === '1234' || cleanOtp === '123456';
+    if (trip.trip_status === 'DELIVERED' || trip.trip_status === 'COMPLETED') {
+      res.status(409).json({
+        success: false,
+        error: 'TASK_ALREADY_DELIVERED',
+        message: 'Delivery task has already been completed.',
+      });
+      return;
+    }
+
+    const cleanOtp = otp.trim();
+    const expectedOtp = String(trip.delivery_otp || '').trim();
+
+    // Strict constant-time equality verification — NO hardcoded bypasses or suffix matching
+    const isMatch =
+      expectedOtp.length > 0 &&
+      cleanOtp.length === expectedOtp.length &&
+      constantTimeCompare(cleanOtp, expectedOtp);
+
     if (!isMatch) {
+      await recordAuditEvent({
+        actorId: req.auth!.userId,
+        actorType: 'RIDER',
+        action: 'DELIVERY_OTP_FAILED',
+        entityType: 'DELIVERY_TRIP',
+        entityId: trip.id,
+        newState: { orderId: trip.order_id },
+        ipAddress: req.ip,
+      });
       res.status(400).json({ success: false, error: 'INVALID_OTP', message: 'Invalid delivery OTP provided.' });
       return;
     }
 
-    // Complete delivery in PostgreSQL
-    await pool.query(`
+    // Complete delivery atomically in PostgreSQL (prevents concurrent delivery OTP replay)
+    const deliverRes = await pool.query(`
       UPDATE delivery_trips 
       SET status = 'DELIVERED', delivered_at = NOW(), otp_verified = TRUE,
           cod_collected_amount = COALESCE($1, cod_collected_amount)
-      WHERE id = $2
+      WHERE id = $2 AND status NOT IN ('DELIVERED', 'COMPLETED')
+      RETURNING id
     `, [Number(cashCollected) || 0, trip.id]);
+
+    if (deliverRes.rowCount === 0) {
+      res.status(409).json({
+        success: false,
+        error: 'TASK_ALREADY_DELIVERED',
+        message: 'Delivery task has already been completed.',
+      });
+      return;
+    }
 
     await pool.query(`
       UPDATE orders 
       SET status = 'delivered', delivered_at = NOW() 
       WHERE id = $1
     `, [trip.order_id]);
+
+    await recordAuditEvent({
+      actorId: req.auth!.userId,
+      actorType: 'RIDER',
+      action: 'DELIVERY_OTP_VERIFIED',
+      entityType: 'DELIVERY_TRIP',
+      entityId: trip.id,
+      newState: { orderId: trip.order_id },
+      ipAddress: req.ip,
+    });
 
     const basePay = parseFloat(trip.base_fare || 35);
     const distPay = parseFloat(trip.distance_fare || 15);
@@ -310,16 +468,16 @@ tasksCompatibilityRouter.post('/:taskId/verify-otp', optionalAuthenticate, async
         totalCredited: totalPayout,
       },
       walletSummary: {
-        todayTotalEarnings: 742.50,
-        withdrawableBalance: 742.50,
-        completedDeliveriesToday: 8,
+        todayTotalEarnings: totalPayout,
+        withdrawableBalance: totalPayout,
+        completedDeliveriesToday: 1,
       },
     });
   } catch (err: any) {
     res.status(500).json({
       success: false,
       error: 'VERIFY_OTP_FAILED',
-      message: err.message || 'Failed to verify delivery OTP.',
+      message: safeErrorMessage(err, 'Failed to verify delivery OTP.'),
     });
   }
 });

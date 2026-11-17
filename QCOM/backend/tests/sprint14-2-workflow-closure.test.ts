@@ -142,10 +142,10 @@ export async function runSprint14_2WorkflowClosureTests(): Promise<void> {
   const acceptRes = await apiCall(`/api/tasks/${tripId}/accept`, { method: 'POST', token: riderToken });
   assert.strictEqual(acceptRes.status, 200);
 
-  const arrivedRes = await apiCall(`/api/tasks/${tripId}/arrived-pickup`, { method: 'POST' });
+  const arrivedRes = await apiCall(`/api/tasks/${tripId}/arrived-pickup`, { method: 'POST', token: riderToken });
   assert.strictEqual(arrivedRes.status, 200);
 
-  const pickupRes = await apiCall(`/api/tasks/${tripId}/pickup-confirm`, { method: 'POST' });
+  const pickupRes = await apiCall(`/api/tasks/${tripId}/pickup-confirm`, { method: 'POST', token: riderToken });
   assert.strictEqual(pickupRes.status, 200);
 
   // 6. Delivery Handover & Customer OTP Verification
@@ -154,6 +154,7 @@ export async function runSprint14_2WorkflowClosureTests(): Promise<void> {
 
   const verifyOtpRes = await apiCall(`/api/tasks/${tripId}/verify-otp`, {
     method: 'POST',
+    token: riderToken,
     body: { otp: deliveryOtp, cashCollected: 500 },
   });
   assert.strictEqual(verifyOtpRes.status, 200);

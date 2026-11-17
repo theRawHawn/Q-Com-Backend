@@ -287,11 +287,17 @@ async function runPostgresChecks(): Promise<void> {
     const { setPool } = await import('../../src/database/connection.js');
     setPool(freshPool);
     try {
+      const migrationFiles = getMigrationFiles(migrationRoot);
       const applied = await runMigrations({ poolOverride: freshPool });
-      assert.equal(applied.length, 25, 'Fresh database must apply all 25 migrations.');
+      assert.equal(
+        applied.length,
+        migrationFiles.length,
+        `Fresh database must apply all ${migrationFiles.length} migrations (001–026+).`
+      );
+      assert.ok(applied.length >= 26, `Expected at least 26 migrations, got ${applied.length}.`);
+      assert.ok(applied.some((name) => name.startsWith('026_')), 'Fresh database must apply migration 026.');
       assert.deepEqual(await runMigrations({ poolOverride: freshPool }), [], 'A migration rerun must apply no changes.');
 
-      const migrationFiles = getMigrationFiles(migrationRoot);
       const previousFiles = migrationFiles.filter((migration) => Number(migration.version) < 25);
       assert.equal(previousFiles.length, 24, 'Expected migrations 001 through 024 before migration 025.');
       migrationDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'qcom-it-migrations-'));
@@ -311,6 +317,7 @@ async function runPostgresChecks(): Promise<void> {
       assert.equal(legacyEvent.rowCount, 1);
       const upgradeApplied = await runMigrations({ poolOverride: upgradePool });
       assert.ok(upgradeApplied.some((name) => name.startsWith('025_')), 'Upgrade must apply migration 025.');
+      assert.ok(upgradeApplied.some((name) => name.startsWith('026_')), 'Upgrade must apply migration 026.');
       const preserved = await upgradePool.query(
         `SELECT status, lease_token, lease_expires_at FROM outbox_events WHERE id = $1`,
         [legacyEvent.rows[0].id]

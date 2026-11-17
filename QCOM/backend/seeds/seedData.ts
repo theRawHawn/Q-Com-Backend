@@ -1,5 +1,6 @@
 import pg from 'pg';
 import { getPool } from '../src/database/connection.js';
+import { hashPassword } from '../src/modules/auth/crypto.js';
 
 export async function runSeeds(poolOverride?: pg.Pool): Promise<void> {
   const pool = poolOverride || getPool();
@@ -630,25 +631,45 @@ export async function runSeeds(poolOverride?: pg.Pool): Promise<void> {
       [userId, 'Tower 4 Construction Gate, Palm Heights, Koramangala', 'Opposite Sony Signal', 'Rahul Site Supervisor', '+91-9876543210', 'electrical', 12.9380, 77.6290]
     );
 
-    // 14. Demo Admin & Super Admin Users
+    // 14. Demo Admin & Super Admin Users (Non-production seeded credentials)
     console.log('[Seeds] Seeding Demo Admins...');
+    const seedAdminPassword = process.env.SEED_ADMIN_PASSWORD || 'QcomSeedAdmin#2026';
+    const seedAdminHash = process.env.NODE_ENV !== 'production' ? hashPassword(seedAdminPassword).formatted : null;
+
     const superAdminUser = await client.query(
-      `INSERT INTO users (phone, name, email, is_phone_verified, account_type)
-       VALUES ('+91-8000000000', 'Super Administrator', 'superadmin@qcom.local', TRUE, 'business')
-       ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name RETURNING id`
+      `INSERT INTO users (phone, name, email, is_phone_verified, account_type, password_hash)
+       VALUES ('+91-8000000000', 'Super Administrator', 'superadmin@qcom.local', TRUE, 'business', $1)
+       ON CONFLICT (phone) DO UPDATE SET
+         name = EXCLUDED.name,
+         password_hash = COALESCE(users.password_hash, EXCLUDED.password_hash)
+       RETURNING id`,
+      [seedAdminHash]
+    );
+    const emp001User = await client.query(
+      `INSERT INTO users (phone, name, email, is_phone_verified, account_type, password_hash)
+       VALUES ('+91-8000000001', 'Admin EMP-001', 'emp-001@qcom.local', TRUE, 'business', $1)
+       ON CONFLICT (phone) DO UPDATE SET
+         name = EXCLUDED.name,
+         password_hash = COALESCE(users.password_hash, EXCLUDED.password_hash)
+       RETURNING id`,
+      [seedAdminHash]
     );
     const superAdminRoleId = roleMap.get('SUPER_ADMIN');
     if (superAdminRoleId) {
       await client.query(
-        `INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-        [superAdminUser.rows[0].id, superAdminRoleId]
+        `INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2), ($3, $4) ON CONFLICT DO NOTHING`,
+        [superAdminUser.rows[0].id, superAdminRoleId, emp001User.rows[0].id, superAdminRoleId]
       );
     }
 
     const opsAdminUser = await client.query(
-      `INSERT INTO users (phone, name, email, is_phone_verified, account_type)
-       VALUES ('+91-8000000002', 'Operations Lead', 'ops@qcom.local', TRUE, 'business')
-       ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name RETURNING id`
+      `INSERT INTO users (phone, name, email, is_phone_verified, account_type, password_hash)
+       VALUES ('+91-8000000002', 'Operations Lead', 'ops@qcom.local', TRUE, 'business', $1)
+       ON CONFLICT (phone) DO UPDATE SET
+         name = EXCLUDED.name,
+         password_hash = COALESCE(users.password_hash, EXCLUDED.password_hash)
+       RETURNING id`,
+      [seedAdminHash]
     );
     const opsRoleId = roleMap.get('OPERATIONS');
     if (opsRoleId) {

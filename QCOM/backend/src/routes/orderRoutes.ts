@@ -6,7 +6,7 @@ import { authenticate } from '../middleware/auth.js';
 import { requireRole } from '../middleware/rbac.js';
 import { requireOrderOwnership } from '../middleware/resourceOwnership.js';
 import { getPool } from '../database/connection.js';
-import { checkoutRateLimiter, sellerActionRateLimiter } from '../middleware/rateLimiter.js';
+import { checkoutRateLimiter, sellerActionRateLimiter, adminSensitiveRateLimiter } from '../middleware/rateLimiter.js';
 import { inventoryService } from '../modules/inventory/inventoryService.js';
 import { outboxService } from '../modules/outbox/outboxService.js';
 
@@ -453,11 +453,19 @@ orderRouter.get('/', authenticate, async (req: Request, res: Response): Promise<
 /**
  * GET /api/orders/:orderId & GET /api/v1/orders/:orderId
  */
-orderRouter.get('/:orderId', authenticate, async (req: Request, res: Response): Promise<void> => {
+orderRouter.get('/:orderId', authenticate, requireOrderOwnership('orderId'), async (req: Request, res: Response): Promise<void> => {
   try {
     const { orderId } = req.params;
-    const isStaff = req.auth!.roles?.some((r: string) => ['SUPER_ADMIN', 'OPERATIONS', 'SELLER'].includes(r));
-    const order = await orderService.getOrderById(orderId, req.auth!.userId, isStaff);
+    const isGlobalAdmin =
+      Boolean(req.auth!.isSuperAdmin) ||
+      Boolean(req.auth!.roles?.some((r: string) => ['SUPER_ADMIN', 'OPERATIONS', 'FINANCE_ADMIN'].includes(r)));
+    const order = await orderService.getOrderById(
+      orderId,
+      req.auth!.userId,
+      isGlobalAdmin,
+      req.auth!.merchantIds || [],
+      req.auth!.riderId
+    );
 
     if (!order) {
       res.status(404).json({ success: false, error: 'ORDER_NOT_FOUND', message: 'Order not found or unauthorized.' });
@@ -480,7 +488,7 @@ orderRouter.get('/:orderId', authenticate, async (req: Request, res: Response): 
 /**
  * POST /api/orders/:orderId/cancel & POST /api/v1/orders/:orderId/cancel
  */
-orderRouter.post('/:orderId/cancel', authenticate, async (req: Request, res: Response): Promise<void> => {
+orderRouter.post('/:orderId/cancel', authenticate, requireOrderOwnership('orderId'), async (req: Request, res: Response): Promise<void> => {
   try {
     const { orderId } = req.params;
     const { reason } = req.body;
@@ -664,7 +672,12 @@ orderRouter.get('/delivery-economics/config', async (req: Request, res: Response
 /**
  * POST /api/orders/delivery-economics/config
  */
-orderRouter.post('/delivery-economics/config', async (req: Request, res: Response): Promise<void> => {
+orderRouter.post(
+  '/delivery-economics/config',
+  authenticate,
+  adminSensitiveRateLimiter,
+  requireRole(['SUPER_ADMIN', 'FINANCE_ADMIN', 'OPERATIONS']),
+  async (req: Request, res: Response): Promise<void> => {
   const { riderBasePayout, riderPerKmRate, maxDeliverySubsidy, pgCostPercent, packagingCostInr, opsCostInr } = req.body;
   const pool = getPool();
   try {

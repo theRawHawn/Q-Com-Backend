@@ -2,13 +2,14 @@ import { Router, Request, Response } from 'express';
 import { invoiceService } from '../modules/invoices/invoiceService.js';
 import { pdfGenerator } from '../modules/invoices/pdfGenerator.js';
 import { authenticate } from '../middleware/auth.js';
+import { requireOrderOwnership } from '../middleware/resourceOwnership.js';
 
 export const invoiceRouter = Router();
 
 /**
  * GET /api/invoices/order/:orderId & GET /api/v1/invoices/order/:orderId
  */
-invoiceRouter.get('/order/:orderId', authenticate, async (req: Request, res: Response): Promise<void> => {
+invoiceRouter.get('/order/:orderId', authenticate, requireOrderOwnership('orderId'), async (req: Request, res: Response): Promise<void> => {
   try {
     const { orderId } = req.params;
     const invoices = await invoiceService.getOrCreateOrderInvoices(orderId);
@@ -29,7 +30,7 @@ invoiceRouter.get('/order/:orderId', authenticate, async (req: Request, res: Res
 /**
  * GET /api/invoices/order/:orderId/text
  */
-invoiceRouter.get('/order/:orderId/text', authenticate, async (req: Request, res: Response): Promise<void> => {
+invoiceRouter.get('/order/:orderId/text', authenticate, requireOrderOwnership('orderId'), async (req: Request, res: Response): Promise<void> => {
   try {
     const { orderId } = req.params;
     const invoices = await invoiceService.getOrCreateOrderInvoices(orderId);

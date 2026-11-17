@@ -369,27 +369,44 @@ export class OrderService {
    * Retrieves single order by ID with tenant & customer isolation check
    * Protects PostgreSQL with Bloom Filter negative-lookup optimization
    */
-  public async getOrderById(orderId: string, userId: string, isStaff: boolean = false): Promise<OrderRecord | null> {
+  public async getOrderById(
+    orderId: string,
+    userId: string,
+    isGlobalAdmin: boolean = false,
+    merchantIds: string[] = [],
+    riderId?: string
+  ): Promise<OrderRecord | null> {
     // 1. Bloom Filter negative-lookup protection with cross-instance propagation safety
     if (!(await bloomFilterService.mightContainSafe('orders', orderId))) {
       return null; // Definitely absent, avoid database query
     }
 
     const pool = getPool();
-    const query = isStaff
-      ? `SELECT * FROM orders WHERE id = $1 LIMIT 1`
-      : `SELECT * FROM orders WHERE id = $1 AND user_id = $2 LIMIT 1`;
-    const params = isStaff ? [orderId] : [orderId, userId];
-
-    const res = await pool.query(query, params);
+    const res = await pool.query(
+      `SELECT o.*, dt.rider_id
+       FROM orders o
+       LEFT JOIN delivery_trips dt ON dt.order_id = o.id
+       WHERE o.id = $1
+       LIMIT 1`,
+      [orderId]
+    );
     if (res.rows.length === 0) {
-      if (isStaff) {
+      if (isGlobalAdmin) {
         bloomFilterService.recordFalsePositive();
       }
       return null;
     }
 
     const r = res.rows[0];
+    if (!isGlobalAdmin) {
+      const isCustomerOwner = r.user_id === userId;
+      const isMerchantOwner = merchantIds.length > 0 && merchantIds.includes(r.merchant_id);
+      const isAssignedRider = Boolean(riderId && r.rider_id === riderId);
+      if (!isCustomerOwner && !isMerchantOwner && !isAssignedRider) {
+        return null;
+      }
+    }
+
     const itemsRes = await pool.query(`SELECT * FROM order_items WHERE order_id = $1`, [r.id]);
 
     return {

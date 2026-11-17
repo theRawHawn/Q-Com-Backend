@@ -1,11 +1,21 @@
 import { Router, Request, Response } from 'express';
 import { getPool } from '../database/connection.js';
-import { authenticate, optionalAuthenticate } from '../middleware/auth.js';
-import { requirePermission } from '../middleware/rbac.js';
-import { catalogSearchRateLimiter, sellerActionRateLimiter, adminSensitiveRateLimiter } from '../middleware/rateLimiter.js';
+import { authenticate } from '../middleware/auth.js';
+import { requireRole } from '../middleware/rbac.js';
+import { safeErrorMessage } from '../middleware/errorHandler.js';
+import { catalogSearchRateLimiter, adminSensitiveRateLimiter } from '../middleware/rateLimiter.js';
 import { recordAuditEvent } from '../modules/audit/auditService.js';
+import { realtimeGateway } from '../modules/realtime/websocketServer.js';
 
 export const adminCompatibilityRouter = Router();
+
+const ANY_ADMIN_ROLES = ['SUPER_ADMIN', 'ADMIN', 'OPERATIONS', 'FINANCE_ADMIN', 'DISPATCHER', 'MARKETING_ADMIN'];
+const OPS_ADMIN_ROLES = ['SUPER_ADMIN', 'ADMIN', 'OPERATIONS', 'DISPATCHER'];
+const SELLER_OPS_ROLES = ['SUPER_ADMIN', 'ADMIN', 'OPERATIONS'];
+const FINANCE_ROLES = ['SUPER_ADMIN', 'FINANCE_ADMIN'];
+const AUDIT_VIEW_ROLES = ['SUPER_ADMIN', 'ADMIN', 'OPERATIONS', 'FINANCE_ADMIN'];
+const PROMO_ROLES = ['SUPER_ADMIN', 'ADMIN', 'OPERATIONS', 'MARKETING_ADMIN'];
+const SUPER_ADMIN_ONLY = ['SUPER_ADMIN'];
 
 // Indian Operational Cities reference data
 const OPERATIONAL_CITIES = [
@@ -23,7 +33,7 @@ const OPERATIONAL_CITIES = [
  * GET /api/admin/cities & GET /api/v1/admin/cities
  * Returns serviceable Indian tier 1 & 2 cities for quick-commerce operational zones
  */
-adminCompatibilityRouter.get('/cities', (_req: Request, res: Response) => {
+adminCompatibilityRouter.get('/cities', authenticate, requireRole(ANY_ADMIN_ROLES), (_req: Request, res: Response) => {
   res.status(200).json({
     success: true,
     cities: OPERATIONAL_CITIES,
@@ -32,87 +42,37 @@ adminCompatibilityRouter.get('/cities', (_req: Request, res: Response) => {
 
 /**
  * GET /api/admin/me & GET /api/v1/admin/me
- * Admin session and effective permissions handshake
+ * Strictly verified administrative session and effective permissions handshake (header spoofing rejected)
  */
-adminCompatibilityRouter.get('/me', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
-  const pool = getPool();
-  try {
-    // If authenticated via JWT or Session
-    if (req.auth) {
-      const perms = req.auth.permissions || [];
-      res.status(200).json({
-        success: true,
-        user: {
-          id: req.auth.userId,
-          name: req.auth.name,
-          email: req.auth.email,
-          phone: req.auth.phone,
-          roles: req.auth.roles,
-          permissions: perms,
-          isSuperAdmin: req.auth.isSuperAdmin,
-        },
-        permissions: perms,
-        roles: req.auth.roles,
-      });
-      return;
-    }
-
-    // Header-based identity or default super-admin persona
-    const adminRole = (req.headers['x-admin-role'] as string) || 'SUPER_ADMIN';
-    const adminId = (req.headers['x-admin-id'] as string) || 'emp-001';
-
-    // Query default admin or seed admin
-    const adminRes = await pool.query(
-      `SELECT u.id, u.name, u.email, u.phone 
-       FROM users u 
-       JOIN user_roles ur ON u.id = ur.user_id 
-       JOIN roles r ON ur.role_id = r.id 
-       WHERE r.code = 'SUPER_ADMIN' OR r.name = 'SUPER_ADMIN' 
-       LIMIT 1`
-    );
-
-    const fallbackAdmin = adminRes.rows[0] || {
-      id: adminId,
-      name: 'Priya Sharma (Platform Admin)',
-      email: 'admin@qcom-platform.in',
-      phone: '+91 99999 00001',
-    };
-
-    const permsRes = await pool.query(`SELECT key FROM permissions`);
-    const allPerms = permsRes.rows.map(r => r.key);
-
-    res.status(200).json({
-      success: true,
-      user: {
-        id: fallbackAdmin.id,
-        name: fallbackAdmin.name,
-        email: fallbackAdmin.email,
-        phone: fallbackAdmin.phone,
-        role: adminRole,
-        roles: [adminRole],
-        permissions: allPerms,
-        isSuperAdmin: true,
-      },
-      permissions: allPerms,
-      roles: [adminRole],
-    });
-  } catch (err: any) {
-    res.status(500).json({
-      success: false,
-      error: 'ADMIN_HANDSHAKE_FAILED',
-      message: err.message || 'Failed to resolve admin persona.',
-    });
-  }
+adminCompatibilityRouter.get('/me', authenticate, requireRole(ANY_ADMIN_ROLES), async (req: Request, res: Response): Promise<void> => {
+  const perms = req.auth!.permissions || [];
+  res.status(200).json({
+    success: true,
+    user: {
+      id: req.auth!.userId,
+      name: req.auth!.name,
+      email: req.auth!.email,
+      phone: req.auth!.phone,
+      roles: req.auth!.roles,
+      permissions: perms,
+      isSuperAdmin: req.auth!.isSuperAdmin,
+    },
+    permissions: perms,
+    roles: req.auth!.roles,
+  });
 });
 
 /**
  * GET /api/admin/orders & GET /api/v1/admin/orders
  * Returns all system orders for central control room monitoring
  */
-adminCompatibilityRouter.get('/orders', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.get('/orders', authenticate, requireRole(OPS_ADMIN_ROLES.concat(['FINANCE_ADMIN'])), async (req: Request, res: Response): Promise<void> => {
   const pool = getPool();
   try {
     const { status, limit = 50, offset = 0 } = req.query;
+    const boundedLimit = Math.min(200, Math.max(1, Number(limit) || 50));
+    const boundedOffset = Math.max(0, Number(offset) || 0);
+
     let query = `
       SELECT o.id, o.order_number, o.user_id, o.merchant_id, o.status,
              o.total_amount, o.payment_method, o.payment_status,
@@ -129,7 +89,7 @@ adminCompatibilityRouter.get('/orders', optionalAuthenticate, async (req: Reques
       query += ` WHERE o.status = $1`;
     }
     query += ` ORDER BY o.placed_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
-    params.push(Number(limit), Number(offset));
+    params.push(boundedLimit, boundedOffset);
 
     const ordersRes = await pool.query(query, params);
     res.status(200).json({
@@ -139,7 +99,7 @@ adminCompatibilityRouter.get('/orders', optionalAuthenticate, async (req: Reques
         orderNumber: r.order_number,
         userId: r.user_id,
         customerName: r.customer_name || 'Customer',
-        customerPhone: r.customer_phone || '+91 98450 12891',
+        customerPhone: r.customer_phone || null,
         merchantId: r.merchant_id,
         merchantName: r.merchant_name || 'Partner Store',
         status: r.status,
@@ -156,7 +116,7 @@ adminCompatibilityRouter.get('/orders', optionalAuthenticate, async (req: Reques
     res.status(500).json({
       success: false,
       error: 'ORDER_FETCH_FAILED',
-      message: err.message || 'Failed to query operational orders.',
+      message: safeErrorMessage(err, 'Failed to query operational orders.'),
     });
   }
 });
@@ -165,7 +125,7 @@ adminCompatibilityRouter.get('/orders', optionalAuthenticate, async (req: Reques
  * GET /api/admin/riders & GET /api/v1/admin/riders
  * Returns fleet rider partners and their live telemetry/duty states
  */
-adminCompatibilityRouter.get('/riders', optionalAuthenticate, async (_req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.get('/riders', authenticate, requireRole(OPS_ADMIN_ROLES), async (_req: Request, res: Response): Promise<void> => {
   const pool = getPool();
   try {
     const ridersRes = await pool.query(`
@@ -183,7 +143,7 @@ adminCompatibilityRouter.get('/riders', optionalAuthenticate, async (_req: Reque
       riders: ridersRes.rows.map(r => ({
         id: r.id,
         name: r.name || 'Fleet Partner',
-        phone: r.phone || '+91 99000 11223',
+        phone: r.phone || null,
         vehicleType: r.vehicle_type,
         vehiclePlate: r.vehicle_plate,
         rating: parseFloat(r.rating || 5.0),
@@ -202,7 +162,7 @@ adminCompatibilityRouter.get('/riders', optionalAuthenticate, async (_req: Reque
     res.status(500).json({
       success: false,
       error: 'RIDER_FETCH_FAILED',
-      message: err.message || 'Failed to query rider fleet.',
+      message: safeErrorMessage(err, 'Failed to query rider fleet.'),
     });
   }
 });
@@ -247,19 +207,19 @@ const handleGetSellers = async (_req: Request, res: Response): Promise<void> => 
     res.status(500).json({
       success: false,
       error: 'SELLER_FETCH_FAILED',
-      message: err.message || 'Failed to query sellers.',
+      message: safeErrorMessage(err, 'Failed to query sellers.'),
     });
   }
 };
 
-adminCompatibilityRouter.get('/sellers', optionalAuthenticate, handleGetSellers);
-adminCompatibilityRouter.get('/merchants', optionalAuthenticate, handleGetSellers);
+adminCompatibilityRouter.get('/sellers', authenticate, requireRole(AUDIT_VIEW_ROLES), handleGetSellers);
+adminCompatibilityRouter.get('/merchants', authenticate, requireRole(AUDIT_VIEW_ROLES), handleGetSellers);
 
 /**
  * GET /api/admin/settlements & GET /api/v1/admin/settlements
  * Returns settlement journal overview and pending merchant payables
  */
-adminCompatibilityRouter.get('/settlements', optionalAuthenticate, async (_req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.get('/settlements', authenticate, requireRole(FINANCE_ROLES), async (_req: Request, res: Response): Promise<void> => {
   const pool = getPool();
   try {
     const settlementsRes = await pool.query(`
@@ -300,7 +260,7 @@ adminCompatibilityRouter.get('/settlements', optionalAuthenticate, async (_req: 
     res.status(500).json({
       success: false,
       error: 'SETTLEMENT_FETCH_FAILED',
-      message: err.message || 'Failed to query settlements.',
+      message: safeErrorMessage(err, 'Failed to query settlements.'),
     });
   }
 });
@@ -309,19 +269,7 @@ adminCompatibilityRouter.get('/settlements', optionalAuthenticate, async (_req: 
  * GET /api/admin/audit-logs & GET /api/v1/admin/audit-logs
  * Immutable audit logs viewer for compliance and regulatory inspection
  */
-adminCompatibilityRouter.get('/audit-logs', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
-  if (req.auth) {
-    const hasAdminRole = req.auth.roles?.some((r: string) => ['SUPER_ADMIN', 'ADMIN', 'OPERATIONS_MANAGER', 'STAFF'].includes(r)) || req.auth.isSuperAdmin;
-    if (!hasAdminRole) {
-      res.status(403).json({
-        success: false,
-        error: 'FORBIDDEN',
-        message: 'Administrative privileges required to access audit logs.',
-      });
-      return;
-    }
-  }
-
+adminCompatibilityRouter.get('/audit-logs', authenticate, requireRole(AUDIT_VIEW_ROLES), async (_req: Request, res: Response): Promise<void> => {
   const pool = getPool();
   try {
     const logsRes = await pool.query(`
@@ -349,29 +297,30 @@ adminCompatibilityRouter.get('/audit-logs', optionalAuthenticate, async (req: Re
     res.status(500).json({
       success: false,
       error: 'AUDIT_LOG_FETCH_FAILED',
-      message: err.message || 'Failed to query audit logs.',
+      message: safeErrorMessage(err, 'Failed to query audit logs.'),
     });
   }
 });
 
 /**
  * GET /api/admin/refunds & GET /api/v1/admin/refunds
- * Central refund requests and returns queue
+ * Central refund requests queue
  */
-adminCompatibilityRouter.get('/refunds', optionalAuthenticate, async (_req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.get('/refunds', authenticate, requireRole(['SUPER_ADMIN', 'FINANCE_ADMIN', 'OPERATIONS']), async (_req: Request, res: Response): Promise<void> => {
   const pool = getPool();
   try {
-    const returnsRes = await pool.query(`
-      SELECT id, order_id, user_id, merchant_id, status, reason,
-             refund_amount, created_at
-      FROM returns
-      ORDER BY created_at DESC
+    const refundsRes = await pool.query(`
+      SELECT r.id, r.order_id, o.user_id, o.merchant_id, r.status,
+             r.reason_code as reason, r.amount as refund_amount, r.created_at
+      FROM refunds r
+      LEFT JOIN orders o ON r.order_id = o.id
+      ORDER BY r.created_at DESC
       LIMIT 100
     `);
 
     res.status(200).json({
       success: true,
-      refunds: returnsRes.rows.map(r => ({
+      refunds: refundsRes.rows.map(r => ({
         id: r.id,
         orderId: r.order_id,
         userId: r.user_id,
@@ -386,7 +335,7 @@ adminCompatibilityRouter.get('/refunds', optionalAuthenticate, async (_req: Requ
     res.status(500).json({
       success: false,
       error: 'REFUND_FETCH_FAILED',
-      message: err.message || 'Failed to query refunds.',
+      message: safeErrorMessage(err, 'Failed to query refunds.'),
     });
   }
 });
@@ -435,9 +384,6 @@ adminCompatibilityRouter.post('/orders/:orderId/assign-rider', authenticate, adm
   }
 
   try {
-    // 3. Atomic state-protected update:
-    // Only assign if trip is in BROADCASTING, CREATED, OFFERED, PENDING
-    // Cannot overwrite active trips in ACCEPTED, ARRIVED_AT_PICKUP, PICKED_UP, ARRIVED_AT_DROP, IN_TRANSIT, DELIVERED, COMPLETED
     const updateRes = await pool.query(
       `UPDATE delivery_trips 
        SET rider_id = $1, status = 'ACCEPTED', accepted_at = NOW() 
@@ -477,7 +423,6 @@ adminCompatibilityRouter.post('/orders/:orderId/assign-rider', authenticate, adm
 
     const assignedTrip = updateRes.rows[0];
 
-    // 4. Record security audit log for admin override
     try {
       await recordAuditEvent({
         actorId: req.auth?.userId || 'unknown_admin',
@@ -505,18 +450,32 @@ adminCompatibilityRouter.post('/orders/:orderId/assign-rider', authenticate, adm
     res.status(500).json({
       success: false,
       error: 'ASSIGNMENT_FAILED',
-      message: err.message || 'Failed to assign rider.',
+      message: safeErrorMessage(err, 'Failed to assign rider.'),
     });
   }
 });
 
 /**
  * POST /api/admin/riders/:id/release-payout
- * Admin release rider payout approval
+ * Admin release rider payout approval (strictly Finance Admin or Super Admin)
  */
-adminCompatibilityRouter.post('/riders/:id/release-payout', optionalAuthenticate, adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/riders/:id/release-payout', authenticate, requireRole(FINANCE_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
   const { amount } = req.body;
+  try {
+    await recordAuditEvent({
+      actorId: req.auth!.userId,
+      actorType: 'ADMIN',
+      action: 'ADMIN_RIDER_PAYOUT_RELEASED',
+      entityType: 'RIDER',
+      entityId: id,
+      newState: { amount: amount || 0 },
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] as string | undefined,
+    });
+  } catch {
+    // Non-blocking
+  }
   res.status(200).json({
     success: true,
     message: 'Rider payout released successfully.',
@@ -530,11 +489,20 @@ adminCompatibilityRouter.post('/riders/:id/release-payout', optionalAuthenticate
  * POST /api/admin/sellers/:id/approve
  * Admin approve seller onboarding
  */
-adminCompatibilityRouter.post('/sellers/:id/approve', optionalAuthenticate, adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/sellers/:id/approve', authenticate, requireRole(SELLER_OPS_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
   const pool = getPool();
   try {
-    await pool.query(`UPDATE merchants SET status = 'ACTIVE' WHERE id = $1`, [id]);
+    await pool.query(`UPDATE merchants SET status = 'ACTIVE', updated_at = NOW() WHERE id = $1`, [id]);
+    await recordAuditEvent({
+      actorId: req.auth!.userId,
+      actorType: 'ADMIN',
+      action: 'ADMIN_SELLER_APPROVED',
+      entityType: 'MERCHANT',
+      entityId: id,
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] as string | undefined,
+    });
     res.status(200).json({
       success: true,
       message: 'Seller approved successfully.',
@@ -544,7 +512,7 @@ adminCompatibilityRouter.post('/sellers/:id/approve', optionalAuthenticate, admi
     res.status(500).json({
       success: false,
       error: 'APPROVAL_FAILED',
-      message: err.message || 'Failed to approve seller.',
+      message: safeErrorMessage(err, 'Failed to approve seller.'),
     });
   }
 });
@@ -553,8 +521,8 @@ adminCompatibilityRouter.post('/sellers/:id/approve', optionalAuthenticate, admi
  * POST /api/admin/riders/broadcast
  * Broadcast task dispatch trigger
  */
-adminCompatibilityRouter.post('/riders/broadcast', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
-  const { taskIds, riderCount } = req.body;
+adminCompatibilityRouter.post('/riders/broadcast', authenticate, requireRole(OPS_ADMIN_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  const { riderCount } = req.body;
   res.status(200).json({
     success: true,
     message: 'Task broadcast dispatched to nearby candidate riders.',
@@ -570,11 +538,11 @@ adminCompatibilityRouter.post('/riders/broadcast', optionalAuthenticate, async (
 /**
  * GET /api/admin/customers
  */
-adminCompatibilityRouter.get('/customers', optionalAuthenticate, async (_req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.get('/customers', authenticate, requireRole(AUDIT_VIEW_ROLES), async (_req: Request, res: Response): Promise<void> => {
   const pool = getPool();
   try {
     const custRes = await pool.query(`
-      SELECT u.id, u.name, u.phone, u.email, u.account_type, u.created_at, u.is_active,
+      SELECT u.id, u.name, u.phone, u.email, u.account_type, u.created_at, u.is_suspended,
              COUNT(o.id) as total_orders,
              COALESCE(SUM(o.total_amount), 0) as total_spend
       FROM users u
@@ -590,49 +558,131 @@ adminCompatibilityRouter.get('/customers', optionalAuthenticate, async (_req: Re
         id: c.id,
         name: c.name || 'Contractor Customer',
         phone: c.phone,
-        email: c.email || 'customer@qcom.in',
-        accountType: c.account_type || 'business',
-        status: c.is_active === false ? 'SUSPENDED' : 'ACTIVE',
+        email: c.email || null,
+        accountType: c.account_type || 'individual',
+        status: c.is_suspended ? 'SUSPENDED' : 'ACTIVE',
         totalOrders: parseInt(c.total_orders, 10) || 0,
         totalSpend: parseFloat(c.total_spend) || 0,
         createdAt: c.created_at,
       })),
     });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: 'CUSTOMER_FETCH_FAILED', message: err.message });
+    res.status(500).json({
+      success: false,
+      error: 'CUSTOMER_FETCH_FAILED',
+      message: safeErrorMessage(err, 'Failed to query customers.'),
+    });
   }
 });
 
-adminCompatibilityRouter.patch('/customers/:id/status', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.patch('/customers/:id/status', authenticate, requireRole(SELLER_OPS_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
-  const { status } = req.body;
+  const { status, reason } = req.body;
   const pool = getPool();
-  const isActive = status !== 'SUSPENDED';
+
+  if (status !== 'ACTIVE' && status !== 'SUSPENDED') {
+    res.status(400).json({
+      success: false,
+      error: 'INVALID_STATUS',
+      message: "status must be 'ACTIVE' or 'SUSPENDED'.",
+    });
+    return;
+  }
+
+  const isSuspended = status === 'SUSPENDED';
+  const suspensionReason = isSuspended ? (reason || 'Suspended by administrator.') : null;
+
   try {
-    await pool.query('UPDATE users SET is_active = $1, updated_at = NOW() WHERE id = $2', [isActive, id]);
+    const updateRes = await pool.query(
+      `UPDATE users SET is_suspended = $1, suspension_reason = $2, updated_at = NOW() WHERE id = $3 RETURNING id`,
+      [isSuspended, suspensionReason, id]
+    );
+    if (updateRes.rowCount === 0) {
+      res.status(404).json({ success: false, error: 'USER_NOT_FOUND', message: 'Target user not found.' });
+      return;
+    }
+
+    if (isSuspended) {
+      await pool.query(
+        `UPDATE auth_sessions SET status = 'REVOKED', revoked_at = NOW() WHERE user_id = $1 AND status = 'ACTIVE'`,
+        [id]
+      );
+      await pool.query(
+        `UPDATE refresh_tokens SET is_revoked = TRUE, revoked_at = NOW() WHERE user_id = $1 AND is_revoked = FALSE`,
+        [id]
+      );
+      realtimeGateway.handleUserLogoutAll(id);
+    }
+
+    await recordAuditEvent({
+      actorId: req.auth!.userId,
+      actorType: 'ADMIN',
+      action: isSuspended ? 'USER_SUSPENDED' : 'USER_REACTIVATED',
+      entityType: 'USER',
+      entityId: id,
+      newState: { status, reason: suspensionReason },
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] as string | undefined,
+    });
+
     res.status(200).json({ success: true, message: `Customer status updated to ${status}`, customerId: id, status });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: 'STATUS_UPDATE_FAILED', message: err.message });
+    res.status(500).json({
+      success: false,
+      error: 'STATUS_UPDATE_FAILED',
+      message: safeErrorMessage(err, 'Failed to update customer status.'),
+    });
   }
 });
 
-adminCompatibilityRouter.post('/customers/:id/fraud-controls', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/customers/:id/fraud-controls', authenticate, requireRole(SELLER_OPS_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  await recordAuditEvent({
+    actorId: req.auth!.userId,
+    actorType: 'ADMIN',
+    action: 'CUSTOMER_FRAUD_CONTROLS_UPDATED',
+    entityType: 'USER',
+    entityId: req.params.id,
+    ipAddress: req.ip,
+    userAgent: req.headers['user-agent'] as string | undefined,
+  });
   res.status(200).json({ success: true, message: 'Fraud controls updated successfully', customerId: req.params.id });
 });
 
-adminCompatibilityRouter.post('/customers/:id/notes', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/customers/:id/notes', authenticate, requireRole(OPS_ADMIN_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
   res.status(200).json({ success: true, message: 'Customer administrative note saved', customerId: req.params.id });
 });
 
-adminCompatibilityRouter.post('/customers/:id/reset-session', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/customers/:id/reset-session', authenticate, requireRole(SELLER_OPS_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
   const pool = getPool();
   try {
-    await pool.query('DELETE FROM auth_sessions WHERE user_id = $1', [id]);
-    await pool.query('DELETE FROM refresh_tokens WHERE user_id = $1', [id]);
+    await pool.query(
+      `UPDATE auth_sessions SET status = 'REVOKED', revoked_at = NOW() WHERE user_id = $1 AND status = 'ACTIVE'`,
+      [id]
+    );
+    await pool.query(
+      `UPDATE refresh_tokens SET is_revoked = TRUE, revoked_at = NOW() WHERE user_id = $1 AND is_revoked = FALSE`,
+      [id]
+    );
+    realtimeGateway.handleUserLogoutAll(id);
+
+    await recordAuditEvent({
+      actorId: req.auth!.userId,
+      actorType: 'ADMIN',
+      action: 'ADMIN_SESSION_RESET',
+      entityType: 'USER',
+      entityId: id,
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] as string | undefined,
+    });
+
     res.status(200).json({ success: true, message: 'Customer active sessions reset successfully', customerId: id });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: 'SESSION_RESET_FAILED', message: err.message });
+    res.status(500).json({
+      success: false,
+      error: 'SESSION_RESET_FAILED',
+      message: safeErrorMessage(err, 'Failed to reset user sessions.'),
+    });
   }
 });
 
@@ -650,24 +700,24 @@ const OPERATIONAL_ZONES = [
   { id: 'zone-del-noida', cityId: 'delhi_ncr', name: 'Noida Sector 62 & Construction Belt', status: 'ACTIVE', radiusKm: 9, maxDeliveryMins: 15 },
 ];
 
-adminCompatibilityRouter.get('/service-areas', optionalAuthenticate, async (_req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.get('/service-areas', authenticate, requireRole(ANY_ADMIN_ROLES), async (_req: Request, res: Response): Promise<void> => {
   res.status(200).json({ success: true, serviceAreas: OPERATIONAL_ZONES });
 });
 
-adminCompatibilityRouter.post('/service-areas', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/service-areas', authenticate, requireRole(SELLER_OPS_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const newZone = { id: `zone-${Date.now()}`, ...req.body, status: 'ACTIVE' };
   res.status(200).json({ success: true, message: 'Service area created', serviceArea: newZone });
 });
 
-adminCompatibilityRouter.post('/cities/:id/toggle', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/cities/:id/toggle', authenticate, requireRole(SELLER_OPS_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
   res.status(200).json({ success: true, message: 'City operational status toggled', cityId: req.params.id });
 });
 
-adminCompatibilityRouter.post('/service-areas/:id/toggle', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/service-areas/:id/toggle', authenticate, requireRole(SELLER_OPS_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
   res.status(200).json({ success: true, message: 'Service zone operational status toggled', zoneId: req.params.id });
 });
 
-adminCompatibilityRouter.post('/cities/:id/config', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/cities/:id/config', authenticate, requireRole(SELLER_OPS_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
   res.status(200).json({ success: true, message: 'City configuration saved', cityId: req.params.id });
 });
 
@@ -675,35 +725,35 @@ adminCompatibilityRouter.post('/cities/:id/config', optionalAuthenticate, async 
 // Roles, Permissions & Employee Management
 // ---------------------------------------------------------------------------
 
-adminCompatibilityRouter.get('/roles', optionalAuthenticate, async (_req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.get('/roles', authenticate, requireRole(AUDIT_VIEW_ROLES), async (_req: Request, res: Response): Promise<void> => {
   const pool = getPool();
   try {
     const rolesRes = await pool.query('SELECT id, code, name, description, is_system_role FROM roles ORDER BY id');
     res.status(200).json({ success: true, roles: rolesRes.rows });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: 'ROLES_FETCH_FAILED', message: err.message });
+    res.status(500).json({ success: false, error: 'ROLES_FETCH_FAILED', message: safeErrorMessage(err, 'Failed to fetch roles.') });
   }
 });
 
-adminCompatibilityRouter.get('/permissions', optionalAuthenticate, async (_req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.get('/permissions', authenticate, requireRole(AUDIT_VIEW_ROLES), async (_req: Request, res: Response): Promise<void> => {
   const pool = getPool();
   try {
     const permRes = await pool.query('SELECT id, key, module, name, description FROM permissions ORDER BY module, key');
     res.status(200).json({ success: true, permissions: permRes.rows });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: 'PERMISSIONS_FETCH_FAILED', message: err.message });
+    res.status(500).json({ success: false, error: 'PERMISSIONS_FETCH_FAILED', message: safeErrorMessage(err, 'Failed to fetch permissions.') });
   }
 });
 
-adminCompatibilityRouter.get('/employees/list', optionalAuthenticate, async (_req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.get('/employees/list', authenticate, requireRole(AUDIT_VIEW_ROLES), async (_req: Request, res: Response): Promise<void> => {
   const pool = getPool();
   try {
     const empRes = await pool.query(`
-      SELECT u.id, u.name, u.email, u.phone, r.code as role, r.name as role_name, u.is_active
+      SELECT u.id, u.name, u.email, u.phone, r.code as role, r.name as role_name, u.is_suspended
       FROM users u
       JOIN user_roles ur ON u.id = ur.user_id
       JOIN roles r ON ur.role_id = r.id
-      WHERE r.code IN ('SUPER_ADMIN', 'OPERATIONS', 'DISPATCHER', 'FINANCE_ADMIN')
+      WHERE r.code IN ('SUPER_ADMIN', 'OPERATIONS', 'DISPATCHER', 'FINANCE_ADMIN', 'MARKETING_ADMIN')
       ORDER BY u.created_at DESC
     `);
     res.status(200).json({
@@ -715,80 +765,195 @@ adminCompatibilityRouter.get('/employees/list', optionalAuthenticate, async (_re
         phone: e.phone,
         role: e.role,
         roleName: e.role_name,
-        status: e.is_active === false ? 'INACTIVE' : 'ACTIVE',
+        status: e.is_suspended ? 'SUSPENDED' : 'ACTIVE',
       })),
     });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: 'EMPLOYEES_FETCH_FAILED', message: err.message });
+    res.status(500).json({ success: false, error: 'EMPLOYEES_FETCH_FAILED', message: safeErrorMessage(err, 'Failed to list employees.') });
   }
 });
 
-adminCompatibilityRouter.post('/employees/create', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/employees/create', authenticate, requireRole(SUPER_ADMIN_ONLY), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const { name, email, phone, role } = req.body;
   const pool = getPool();
-  try {
-    const userRes = await pool.query(`
-      INSERT INTO users (name, email, phone, is_phone_verified, account_type)
-      VALUES ($1, $2, $3, true, 'individual')
-      ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name
-      RETURNING id
-    `, [name, email, phone]);
-    const empId = userRes.rows[0].id;
 
-    const roleRes = await pool.query('SELECT id FROM roles WHERE code = $1 LIMIT 1', [role || 'OPERATIONS']);
-    if (roleRes.rows.length > 0) {
-      await pool.query('INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [empId, roleRes.rows[0].id]);
+  if (!name || !phone || !role) {
+    res.status(400).json({ success: false, error: 'MISSING_FIELDS', message: 'name, phone, and role are required.' });
+    return;
+  }
+
+  try {
+    const roleRes = await pool.query('SELECT id, code FROM roles WHERE code = $1 LIMIT 1', [String(role).toUpperCase()]);
+    if (roleRes.rows.length === 0) {
+      res.status(400).json({ success: false, error: 'INVALID_ROLE', message: `Role '${role}' does not exist.` });
+      return;
     }
 
-    res.status(200).json({ success: true, message: 'Employee created successfully', employee: { id: empId, name, email, phone, role } });
+    const userRes = await pool.query(`
+      INSERT INTO users (name, email, phone, is_phone_verified, account_type)
+      VALUES ($1, $2, $3, true, 'business')
+      ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name, email = COALESCE(EXCLUDED.email, users.email)
+      RETURNING id
+    `, [String(name).trim(), email ? String(email).trim() : null, String(phone).trim()]);
+    const empId = userRes.rows[0].id;
+
+    await pool.query(
+      'INSERT INTO user_roles (user_id, role_id, assigned_by, assigned_at) VALUES ($1, $2, $3, NOW()) ON CONFLICT (user_id, role_id) DO NOTHING',
+      [empId, roleRes.rows[0].id, req.auth!.userId]
+    );
+
+    await recordAuditEvent({
+      actorId: req.auth!.userId,
+      actorType: 'ADMIN',
+      action: 'ADMIN_EMPLOYEE_CREATED',
+      entityType: 'USER',
+      entityId: empId,
+      newState: { role: roleRes.rows[0].code },
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] as string | undefined,
+    });
+
+    res.status(200).json({ success: true, message: 'Employee created successfully', employee: { id: empId, name, email, phone, role: roleRes.rows[0].code } });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: 'EMPLOYEE_CREATE_FAILED', message: err.message });
+    res.status(500).json({ success: false, error: 'EMPLOYEE_CREATE_FAILED', message: safeErrorMessage(err, 'Failed to create employee.') });
   }
 });
 
-adminCompatibilityRouter.post('/employees/:id/assign-roles', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
-  res.status(200).json({ success: true, message: 'Roles updated for employee', employeeId: req.params.id });
+adminCompatibilityRouter.post('/employees/:id/assign-roles', authenticate, requireRole(SUPER_ADMIN_ONLY), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  const { id } = req.params;
+  const { role, roles } = req.body;
+  const pool = getPool();
+
+  if (id === req.auth!.userId) {
+    await recordAuditEvent({
+      actorId: req.auth!.userId,
+      actorType: 'ADMIN',
+      action: 'PRIVILEGE_ESCALATION_BLOCKED',
+      entityType: 'USER',
+      entityId: id,
+      newState: { attemptedSelfRoleMutation: true, requestedBody: req.body },
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] as string | undefined,
+    });
+    res.status(403).json({ success: false, error: 'SELF_ROLE_MUTATION_DENIED', message: 'Administrators cannot self-assign roles.' });
+    return;
+  }
+
+  const targetRoles: string[] = Array.isArray(roles)
+    ? roles.map((r: any) => String(r).toUpperCase())
+    : role
+    ? [String(role).toUpperCase()]
+    : [];
+
+  if (targetRoles.length === 0) {
+    res.status(400).json({ success: false, error: 'MISSING_ROLES', message: 'role or roles array is required.' });
+    return;
+  }
+
+  try {
+    const userCheck = await pool.query(`SELECT id FROM users WHERE id = $1`, [id]);
+    if (userCheck.rows.length === 0) {
+      res.status(404).json({ success: false, error: 'USER_NOT_FOUND', message: 'Employee user not found.' });
+      return;
+    }
+
+    const roleRows = await pool.query(`SELECT id, code FROM roles WHERE code = ANY($1::text[])`, [targetRoles]);
+    if (roleRows.rows.length === 0) {
+      res.status(400).json({ success: false, error: 'INVALID_ROLE', message: 'No matching roles found.' });
+      return;
+    }
+
+    for (const r of roleRows.rows) {
+      await pool.query(
+        `INSERT INTO user_roles (user_id, role_id, assigned_by, assigned_at) VALUES ($1, $2, $3, NOW()) ON CONFLICT (user_id, role_id) DO NOTHING`,
+        [id, r.id, req.auth!.userId]
+      );
+    }
+
+    await recordAuditEvent({
+      actorId: req.auth!.userId,
+      actorType: 'ADMIN',
+      action: 'ADMIN_ROLES_UPDATED',
+      entityType: 'USER',
+      entityId: id,
+      newState: { assignedRoles: roleRows.rows.map(r => r.code) },
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] as string | undefined,
+    });
+
+    res.status(200).json({ success: true, message: 'Roles updated for employee', employeeId: id, roles: roleRows.rows.map(r => r.code) });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: 'ASSIGN_ROLES_FAILED', message: safeErrorMessage(err, 'Failed to update employee roles.') });
+  }
 });
 
 // ---------------------------------------------------------------------------
 // Seller Lifecycle & Compliance Actions
 // ---------------------------------------------------------------------------
 
-adminCompatibilityRouter.post('/sellers/:id/suspend', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/sellers/:id/suspend', authenticate, requireRole(SELLER_OPS_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
   const { reason } = req.body;
   const pool = getPool();
   try {
     await pool.query(`UPDATE merchants SET status = 'SUSPENDED', updated_at = NOW() WHERE id = $1`, [id]);
+    await recordAuditEvent({
+      actorId: req.auth!.userId,
+      actorType: 'ADMIN',
+      action: 'SELLER_SUSPENDED',
+      entityType: 'MERCHANT',
+      entityId: id,
+      newState: { reason },
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] as string | undefined,
+    });
     res.status(200).json({ success: true, message: 'Seller suspended successfully', sellerId: id, reason });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: 'SUSPEND_FAILED', message: err.message });
+    res.status(500).json({ success: false, error: 'SUSPEND_FAILED', message: safeErrorMessage(err, 'Failed to suspend seller.') });
   }
 });
 
-adminCompatibilityRouter.post('/sellers/:id/reactivate', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/sellers/:id/reactivate', authenticate, requireRole(SELLER_OPS_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
   const pool = getPool();
   try {
     await pool.query(`UPDATE merchants SET status = 'ACTIVE', updated_at = NOW() WHERE id = $1`, [id]);
+    await recordAuditEvent({
+      actorId: req.auth!.userId,
+      actorType: 'ADMIN',
+      action: 'SELLER_REACTIVATED',
+      entityType: 'MERCHANT',
+      entityId: id,
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] as string | undefined,
+    });
     res.status(200).json({ success: true, message: 'Seller reactivated successfully', sellerId: id });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: 'REACTIVATE_FAILED', message: err.message });
+    res.status(500).json({ success: false, error: 'REACTIVATE_FAILED', message: safeErrorMessage(err, 'Failed to reactivate seller.') });
   }
 });
 
-adminCompatibilityRouter.put('/sellers/:id', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.put('/sellers/:id', authenticate, requireRole(SELLER_OPS_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
   res.status(200).json({ success: true, message: 'Seller details updated', sellerId: req.params.id });
 });
 
-adminCompatibilityRouter.delete('/sellers/:id', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.delete('/sellers/:id', authenticate, requireRole(SELLER_OPS_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
   const pool = getPool();
   try {
     await pool.query(`UPDATE merchants SET status = 'INACTIVE', updated_at = NOW() WHERE id = $1`, [id]);
+    await recordAuditEvent({
+      actorId: req.auth!.userId,
+      actorType: 'ADMIN',
+      action: 'SELLER_DEACTIVATED',
+      entityType: 'MERCHANT',
+      entityId: id,
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] as string | undefined,
+    });
     res.status(200).json({ success: true, message: 'Seller deactivated', sellerId: id });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: 'DELETE_SELLER_FAILED', message: err.message });
+    res.status(500).json({ success: false, error: 'DELETE_SELLER_FAILED', message: safeErrorMessage(err, 'Failed to deactivate seller.') });
   }
 });
 
@@ -796,27 +961,34 @@ adminCompatibilityRouter.delete('/sellers/:id', optionalAuthenticate, async (req
 // Refund Actions & Dispute Resolution
 // ---------------------------------------------------------------------------
 
-adminCompatibilityRouter.post('/refunds/:id/approve', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/refunds/:id/approve', authenticate, requireRole(FINANCE_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  await recordAuditEvent({ actorId: req.auth!.userId, actorType: 'ADMIN', action: 'ADMIN_REFUND_APPROVED', entityType: 'REFUND', entityId: req.params.id, ipAddress: req.ip });
   res.status(200).json({ success: true, message: 'Refund approved for processing', refundId: req.params.id, status: 'APPROVED' });
 });
 
-adminCompatibilityRouter.post('/refunds/:id/reject', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/refunds/:id/reject', authenticate, requireRole(FINANCE_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  await recordAuditEvent({ actorId: req.auth!.userId, actorType: 'ADMIN', action: 'ADMIN_REFUND_REJECTED', entityType: 'REFUND', entityId: req.params.id, ipAddress: req.ip });
   res.status(200).json({ success: true, message: 'Refund rejected', refundId: req.params.id, status: 'REJECTED' });
 });
 
-adminCompatibilityRouter.post('/refunds/:id/hold', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/refunds/:id/hold', authenticate, requireRole(FINANCE_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  await recordAuditEvent({ actorId: req.auth!.userId, actorType: 'ADMIN', action: 'ADMIN_REFUND_HELD', entityType: 'REFUND', entityId: req.params.id, ipAddress: req.ip });
   res.status(200).json({ success: true, message: 'Refund placed on administrative hold', refundId: req.params.id, status: 'ON_HOLD' });
 });
 
-adminCompatibilityRouter.post('/refunds/:id/retry', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/refunds/:id/retry', authenticate, requireRole(FINANCE_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  await recordAuditEvent({ actorId: req.auth!.userId, actorType: 'ADMIN', action: 'ADMIN_REFUND_RETRIED', entityType: 'REFUND', entityId: req.params.id, ipAddress: req.ip });
   res.status(200).json({ success: true, message: 'Refund retry queued', refundId: req.params.id, status: 'RETRYING' });
 });
 
-adminCompatibilityRouter.post('/refunds/create', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
-  res.status(200).json({ success: true, message: 'Manual refund created', refundId: `ref_${Date.now()}` });
+adminCompatibilityRouter.post('/refunds/create', authenticate, requireRole(FINANCE_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  const refundId = `ref_${Date.now()}`;
+  await recordAuditEvent({ actorId: req.auth!.userId, actorType: 'ADMIN', action: 'ADMIN_MANUAL_REFUND_CREATED', entityType: 'REFUND', entityId: refundId, ipAddress: req.ip });
+  res.status(200).json({ success: true, message: 'Manual refund created', refundId });
 });
 
-adminCompatibilityRouter.post('/refunds/disputes/:id/resolve', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/refunds/disputes/:id/resolve', authenticate, requireRole(FINANCE_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  await recordAuditEvent({ actorId: req.auth!.userId, actorType: 'ADMIN', action: 'ADMIN_DISPUTE_RESOLVED', entityType: 'DISPUTE', entityId: req.params.id, ipAddress: req.ip });
   res.status(200).json({ success: true, message: 'Dispute resolved successfully', disputeId: req.params.id });
 });
 
@@ -829,15 +1001,15 @@ const SUPPORT_TICKETS = [
   { id: 'tkt-102', customerName: 'Sunil Electricals', phone: '+91 9876543211', orderId: 'ORD-102', subject: 'Tax invoice GSTIN mismatch verification', priority: 'MEDIUM', status: 'RESOLVED', createdAt: new Date().toISOString() },
 ];
 
-adminCompatibilityRouter.get('/support/tickets', optionalAuthenticate, async (_req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.get('/support/tickets', authenticate, requireRole(OPS_ADMIN_ROLES), async (_req: Request, res: Response): Promise<void> => {
   res.status(200).json({ success: true, tickets: SUPPORT_TICKETS });
 });
 
-adminCompatibilityRouter.post('/support/tickets/create', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/support/tickets/create', authenticate, requireRole(OPS_ADMIN_ROLES), async (_req: Request, res: Response): Promise<void> => {
   res.status(200).json({ success: true, message: 'Ticket created', ticketId: `tkt-${Date.now()}` });
 });
 
-adminCompatibilityRouter.post('/support/tickets/:id/update', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/support/tickets/:id/update', authenticate, requireRole(OPS_ADMIN_ROLES), async (req: Request, res: Response): Promise<void> => {
   res.status(200).json({ success: true, message: 'Ticket updated', ticketId: req.params.id });
 });
 
@@ -845,17 +1017,17 @@ adminCompatibilityRouter.post('/support/tickets/:id/update', optionalAuthenticat
 // Promotions & Dynamic Coupons
 // ---------------------------------------------------------------------------
 
-adminCompatibilityRouter.get('/promotions', optionalAuthenticate, async (_req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.get('/promotions', authenticate, requireRole(PROMO_ROLES), async (_req: Request, res: Response): Promise<void> => {
   const pool = getPool();
   try {
     const promoRes = await pool.query('SELECT * FROM coupons ORDER BY created_at DESC');
     res.status(200).json({ success: true, promotions: promoRes.rows });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: 'PROMOTIONS_FETCH_FAILED', message: err.message });
+    res.status(500).json({ success: false, error: 'PROMOTIONS_FETCH_FAILED', message: safeErrorMessage(err, 'Failed to query promotions.') });
   }
 });
 
-adminCompatibilityRouter.post('/promotions/create', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/promotions/create', authenticate, requireRole(PROMO_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const { code, title, discountType, discountValue, minOrderValue, maxDiscount } = req.body;
   const pool = getPool();
   try {
@@ -866,18 +1038,18 @@ adminCompatibilityRouter.post('/promotions/create', optionalAuthenticate, async 
     `, [code || `PROMO_${Date.now()}`, title || 'Special Discount', discountType || 'FLAT', discountValue || 50, minOrderValue || 500, maxDiscount || 100]);
     res.status(200).json({ success: true, message: 'Promotion created successfully', promotion: ins.rows[0] });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: 'PROMOTION_CREATE_FAILED', message: err.message });
+    res.status(500).json({ success: false, error: 'PROMOTION_CREATE_FAILED', message: safeErrorMessage(err, 'Failed to create promotion.') });
   }
 });
 
-adminCompatibilityRouter.delete('/promotions/:id', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.delete('/promotions/:id', authenticate, requireRole(PROMO_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
   const pool = getPool();
   try {
     await pool.query('UPDATE coupons SET is_active = false WHERE id = $1', [id]);
     res.status(200).json({ success: true, message: 'Promotion disabled successfully', promotionId: id });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: 'PROMOTION_DELETE_FAILED', message: err.message });
+    res.status(500).json({ success: false, error: 'PROMOTION_DELETE_FAILED', message: safeErrorMessage(err, 'Failed to disable promotion.') });
   }
 });
 
@@ -885,29 +1057,50 @@ adminCompatibilityRouter.delete('/promotions/:id', optionalAuthenticate, async (
 // Catalog & Inventory Controls
 // ---------------------------------------------------------------------------
 
-adminCompatibilityRouter.get('/catalog/products', optionalAuthenticate, catalogSearchRateLimiter, async (_req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.get('/catalog/products', authenticate, requireRole(ANY_ADMIN_ROLES), catalogSearchRateLimiter, async (_req: Request, res: Response): Promise<void> => {
   const pool = getPool();
   try {
     const pRes = await pool.query('SELECT * FROM products ORDER BY name ASC LIMIT 100');
     res.status(200).json({ success: true, products: pRes.rows });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: 'CATALOG_FETCH_FAILED', message: err.message });
+    res.status(500).json({ success: false, error: 'CATALOG_FETCH_FAILED', message: safeErrorMessage(err, 'Failed to fetch catalog products.') });
   }
 });
 
-adminCompatibilityRouter.post('/inventory/:id/adjust-seller-stock', optionalAuthenticate, sellerActionRateLimiter, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/inventory/:id/adjust-seller-stock', authenticate, requireRole(SELLER_OPS_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
   const { newStock } = req.body;
+  const parsedStock = Number(newStock);
+  if (Number.isNaN(parsedStock) || parsedStock < 0) {
+    res.status(400).json({ success: false, error: 'INVALID_STOCK', message: 'newStock must be a non-negative number.' });
+    return;
+  }
   const pool = getPool();
   try {
-    await pool.query('UPDATE store_inventory SET stock_count = $1, updated_at = NOW() WHERE id = $2', [newStock || 10, id]);
-    res.status(200).json({ success: true, message: 'Stock updated', inventoryId: id, newStock });
+    await pool.query('UPDATE store_inventory SET stock_count = $1, updated_at = NOW() WHERE id = $2', [parsedStock, id]);
+    await recordAuditEvent({
+      actorId: req.auth!.userId,
+      actorType: 'ADMIN',
+      action: 'ADMIN_SELLER_STOCK_ADJUSTED',
+      entityType: 'STORE_INVENTORY',
+      entityId: id,
+      newState: { newStock: parsedStock },
+      ipAddress: req.ip,
+    });
+    res.status(200).json({ success: true, message: 'Stock updated', inventoryId: id, newStock: parsedStock });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: 'STOCK_ADJUST_FAILED', message: err.message });
+    res.status(500).json({ success: false, error: 'STOCK_ADJUST_FAILED', message: safeErrorMessage(err, 'Failed to adjust stock.') });
   }
 });
 
-adminCompatibilityRouter.post('/inventory/:id/adjust-stock', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+adminCompatibilityRouter.post('/inventory/:id/adjust-stock', authenticate, requireRole(SELLER_OPS_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  await recordAuditEvent({
+    actorId: req.auth!.userId,
+    actorType: 'ADMIN',
+    action: 'ADMIN_CATALOG_STOCK_ADJUSTED',
+    entityType: 'PRODUCT',
+    entityId: req.params.id,
+    ipAddress: req.ip,
+  });
   res.status(200).json({ success: true, message: 'Master catalog stock adjustment recorded', productId: req.params.id });
 });
-

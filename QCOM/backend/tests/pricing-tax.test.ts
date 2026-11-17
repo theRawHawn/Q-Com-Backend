@@ -46,7 +46,7 @@ export async function testPricingAndTaxEngine() {
     const custBSession = await authService.verifyOtp('+91-9876543211', custBOtp.debugOtp!, 'LOGIN', '127.0.0.1', 'CustomerApp', undefined, pool);
     const customerBToken = custBSession.accessToken;
 
-    const adminSession = await authService.adminLogin('EMP-001', undefined, '127.0.0.1', 'AdminPortal', pool);
+    const adminSession = await authService.adminLogin('EMP-001', process.env.SEED_ADMIN_PASSWORD || 'QcomSeedAdmin#2026', '127.0.0.1', 'AdminPortal', pool);
     const adminToken = adminSession.accessToken;
 
     const app = createApp();

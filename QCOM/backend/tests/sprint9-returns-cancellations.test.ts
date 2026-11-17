@@ -40,7 +40,7 @@ export async function runSprint9ReturnsCancellationsTests(): Promise<void> {
 
   try {
     // Setup Admin
-    const adminAuth = await authService.adminLogin('EMP-001', undefined, '127.0.0.1', 'AdminPortal', pool);
+    const adminAuth = await authService.adminLogin('EMP-001', process.env.SEED_ADMIN_PASSWORD || 'QcomSeedAdmin#2026', '127.0.0.1', 'AdminPortal', pool);
     const adminToken = adminAuth.accessToken;
 
     // Setup Customer 1

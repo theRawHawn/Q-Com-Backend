@@ -14,6 +14,7 @@ QCOM is an enterprise-grade backend platform powering a 10-to-20 minute quick-co
 | [DATABASE.md](./DATABASE.md) | PostgreSQL 16 schema, migrations (001-026), and invariants |
 | [API.md](./API.md) | HTTP and WebSocket API contracts and error schemas |
 | [AUTH.md](./AUTH.md) | Authentication flows, session lifecycle, and IDOR protection |
+| [SECURITY.md](./SECURITY.md) | Defense-in-depth security & access-control hardening architecture |
 | [PLAN.md](./PLAN.md) | Engineering milestones and forward roadmap |
 | [SETUP.md](./SETUP.md) | Local development setup and environment configuration |
 | [FEATURES.md](./FEATURES.md) | Feature matrix and implementation status |
@@ -63,7 +64,7 @@ npm --prefix QCOM/backend run db:seed
 npm --prefix QCOM/backend run dev
 ```
 
-### 5. Running the Complete Automated Test Suite (54 Suites)
+### 5. Running the Complete Automated Test Suite (55 Suites)
 ```bash
 npm --prefix QCOM/backend test
 ```

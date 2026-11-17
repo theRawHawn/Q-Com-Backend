@@ -88,7 +88,7 @@ export async function testIdorAndResourceOwnership() {
     const riderASession = await authService.verifyOtp('+91-9812345678', riderAOtp.debugOtp!, 'LOGIN', '127.0.0.1', 'DeliveryApp', undefined, pool);
 
     // (F) Super Admin
-    const adminSession = await authService.adminLogin('EMP-001', undefined, '127.0.0.1', 'AdminPortal', pool);
+    const adminSession = await authService.adminLogin('EMP-001', process.env.SEED_ADMIN_PASSWORD || 'QcomSeedAdmin#2026', '127.0.0.1', 'AdminPortal', pool);
 
     const app = createApp();
 

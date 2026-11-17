@@ -247,10 +247,10 @@ export async function runSprint14_3StagingReleaseCandidateTests(): Promise<void>
   const acceptRes = await apiCall(`/api/tasks/${tripId}/accept`, { method: 'POST', token: riderToken });
   assert.strictEqual(acceptRes.status, 200);
 
-  const arriveRes = await apiCall(`/api/tasks/${tripId}/arrived-pickup`, { method: 'POST' });
+  const arriveRes = await apiCall(`/api/tasks/${tripId}/arrived-pickup`, { method: 'POST', token: riderToken });
   assert.strictEqual(arriveRes.status, 200);
 
-  const confirmPickupRes = await apiCall(`/api/tasks/${tripId}/pickup-confirm`, { method: 'POST' });
+  const confirmPickupRes = await apiCall(`/api/tasks/${tripId}/pickup-confirm`, { method: 'POST', token: riderToken });
   assert.strictEqual(confirmPickupRes.status, 200);
 
   // 8. Delivery OTP Verification & Handover
@@ -259,6 +259,7 @@ export async function runSprint14_3StagingReleaseCandidateTests(): Promise<void>
 
   const verifyDeliveryRes = await apiCall(`/api/tasks/${tripId}/verify-otp`, {
     method: 'POST',
+    token: riderToken,
     body: { otp: deliveryOtp, cashCollected: 500 },
   });
   assert.strictEqual(verifyDeliveryRes.status, 200);
@@ -268,8 +269,18 @@ export async function runSprint14_3StagingReleaseCandidateTests(): Promise<void>
   const finalOrder = finalOrdersRes.data.orders.find((o: any) => o.id === orderId);
   assert.strictEqual(finalOrder.status, 'delivered', 'Order must transition to terminal delivered state');
 
-  // 10. Admin Operational Oversight
-  const adminRes = await apiCall('/api/admin/orders', { headers: { 'x-admin-role': 'SUPER_ADMIN' } });
+  // 10. Admin Operational Oversight (JWT authenticated)
+  const adminLoginRes = await apiCall('/api/auth/admin/login', {
+    method: 'POST',
+    body: {
+      employeeCode: 'EMP-001',
+      password: process.env.SEED_ADMIN_PASSWORD || 'QcomSeedAdmin#2026',
+    },
+  });
+  assert.strictEqual(adminLoginRes.status, 200);
+  const adminToken = adminLoginRes.data.accessToken;
+
+  const adminRes = await apiCall('/api/admin/orders', { token: adminToken });
   assert.strictEqual(adminRes.status, 200);
   assert.ok(adminRes.data.orders.length > 0, 'Admin can inspect orders');
 
@@ -459,23 +470,23 @@ export async function runSprint14_3StagingReleaseCandidateTests(): Promise<void>
   console.log('\n--- Scenario G: Admin Operations ---');
 
   // 1. Admin Me handshake
-  const adminMe = await apiCall('/api/admin/me', { headers: { 'x-admin-role': 'SUPER_ADMIN' } });
+  const adminMe = await apiCall('/api/admin/me', { token: adminToken });
   assert.strictEqual(adminMe.status, 200);
 
   // 2. Admin Cities and Service Areas
-  const adminCities = await apiCall('/api/admin/cities', { headers: { 'x-admin-role': 'SUPER_ADMIN' } });
+  const adminCities = await apiCall('/api/admin/cities', { token: adminToken });
   assert.strictEqual(adminCities.status, 200);
 
   // 3. Admin Sellers List
-  const adminSellers = await apiCall('/api/admin/sellers', { headers: { 'x-admin-role': 'SUPER_ADMIN' } });
+  const adminSellers = await apiCall('/api/admin/sellers', { token: adminToken });
   assert.strictEqual(adminSellers.status, 200);
 
   // 4. Admin Settlements
-  const adminSettlements = await apiCall('/api/admin/settlements', { headers: { 'x-admin-role': 'SUPER_ADMIN' } });
+  const adminSettlements = await apiCall('/api/admin/settlements', { token: adminToken });
   assert.strictEqual(adminSettlements.status, 200);
 
   // 5. Admin Audit Logs
-  const adminAuditLogs = await apiCall('/api/admin/audit-logs', { headers: { 'x-admin-role': 'SUPER_ADMIN' } });
+  const adminAuditLogs = await apiCall('/api/admin/audit-logs', { token: adminToken });
   assert.strictEqual(adminAuditLogs.status, 200);
   console.log('✓ Scenario G: Admin operational endpoints verified on staging environment.');
 

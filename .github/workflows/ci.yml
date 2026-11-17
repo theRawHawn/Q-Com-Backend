@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    name: All 54 Test Suites & Infrastructure Verification
+    name: All 55 Test Suites & Infrastructure Verification
     runs-on: ubuntu-latest
 
     services:
@@ -80,12 +80,60 @@ jobs:
           NODE_PATH: ${{ github.workspace }}/node_modules:${{ github.workspace }}/QCOM/backend/node_modules
         run: npx tsx QCOM/backend/scripts/seed.ts
 
-      - name: Run all 54 backend automated test suites
+      - name: Run all 55 backend automated test suites
         env:
           NODE_PATH: ${{ github.workspace }}/node_modules:${{ github.workspace }}/QCOM/backend/node_modules
         run: npx tsx QCOM/backend/tests/run-all-tests.ts
 
-      - name: Run typecheck (root and backend)
+      - name: Run typecheck, lint and build (root and backend)
         run: |
           npx tsc --noEmit
+          npm run lint
           npm --prefix QCOM/backend run build
+          npm run build
+
+  real-services-integration:
+    name: Real-Services Integration Harness (PG 16 & Redis 7.0.15)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install root and backend dependencies
+        run: |
+          npm ci --legacy-peer-deps
+          npm ci --prefix QCOM/backend --legacy-peer-deps
+
+      - name: Start isolated PostgreSQL 16.6 & Redis 7.0.15 integration containers
+        run: |
+          PG_PW=$(openssl rand -hex 16)
+          RD_PW=$(openssl rand -hex 16)
+          echo "QCOM_IT_POSTGRES_PASSWORD=$PG_PW" >> "$GITHUB_ENV"
+          echo "QCOM_IT_REDIS_PASSWORD=$RD_PW" >> "$GITHUB_ENV"
+          echo "::add-mask::$PG_PW"
+          echo "::add-mask::$RD_PW"
+          docker compose -f QCOM/backend/docker-compose.integration.yml up -d --wait
+
+      - name: Verify exact Redis 7.0.15 & PostgreSQL 16 versions
+        run: |
+          docker compose -f QCOM/backend/docker-compose.integration.yml exec -T postgres psql -U qcom_it_admin -d postgres -tAc "SELECT version();"
+          docker compose -f QCOM/backend/docker-compose.integration.yml exec -T redis sh -c 'REDISCLI_AUTH="$QCOM_IT_REDIS_PASSWORD" redis-cli INFO server | grep "^redis_version:"'
+
+      - name: Run real-services integration suite
+        env:
+          NODE_PATH: ${{ github.workspace }}/node_modules:${{ github.workspace }}/QCOM/backend/node_modules
+        run: |
+          QCOM_IT_POSTGRES_URL="postgresql://qcom_it_admin:${QCOM_IT_POSTGRES_PASSWORD}@127.0.0.1:55432/postgres" \
+          QCOM_IT_REDIS_URL="redis://:${QCOM_IT_REDIS_PASSWORD}@127.0.0.1:56379/0" \
+          npm --prefix QCOM/backend run test:integration:real-services
+
+      - name: Tear down isolated integration containers
+        if: always()
+        run: docker compose -f QCOM/backend/docker-compose.integration.yml down -v

@@ -1,7 +1,9 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { getPool } from '../database/connection.js';
 import { authenticate, optionalAuthenticate } from '../middleware/auth.js';
-import { requirePermission } from '../middleware/rbac.js';
+import { requirePermission, requireRole } from '../middleware/rbac.js';
+import { requireMerchantOwnership } from '../middleware/resourceOwnership.js';
+import { adminSensitiveRateLimiter, sellerActionRateLimiter } from '../middleware/rateLimiter.js';
 import { pricingEngine, PricingEngineError } from '../modules/pricing/pricingEngine.js';
 import { taxEngine, TaxEngineError } from '../modules/pricing/taxEngine.js';
 import { recordAuditEvent } from '../modules/audit/auditService.js';
@@ -812,7 +814,12 @@ pricingRouter.get('/pricing-config', async (req: Request, res: Response): Promis
 /**
  * POST /pricing-config & POST /checkout/pricing-config
  */
-pricingRouter.post('/pricing-config', async (req: Request, res: Response): Promise<void> => {
+pricingRouter.post(
+  '/pricing-config',
+  authenticate,
+  adminSensitiveRateLimiter,
+  requireRole(['SUPER_ADMIN', 'FINANCE_ADMIN', 'OPERATIONS']),
+  async (req: Request, res: Response): Promise<void> => {
   const { freeDeliveryThreshold, handlingFee, baseCommissionPercent, version } = req.body;
   const pool = getPool();
   try {
@@ -873,7 +880,12 @@ pricingRouter.get('/sellers-geofence', async (req: Request, res: Response): Prom
 /**
  * POST /sellers-geofence/:sellerId & POST /checkout/sellers-geofence/:sellerId
  */
-pricingRouter.post('/sellers-geofence/:sellerId', async (req: Request, res: Response): Promise<void> => {
+pricingRouter.post(
+  '/sellers-geofence/:sellerId',
+  authenticate,
+  sellerActionRateLimiter,
+  requireMerchantOwnership('sellerId'),
+  async (req: Request, res: Response): Promise<void> => {
   try {
     const { sellerId } = req.params;
     const updated = await sellerService.updateSellerGeofence(sellerId, req.body);
@@ -914,17 +926,44 @@ pricingRouter.post(
     } = req.body;
     const requestId = (req as any).requestId || req.headers['x-request-id'] || 'req-settlement';
 
-    if (sellerGoodsTaxable === undefined || sellerGstRatePercent === undefined) {
-      res.status(400).json({
-        success: false,
-        error: 'MISSING_FIELDS',
-        message: 'sellerGoodsTaxable and sellerGstRatePercent are required.',
-        requestId,
-      });
-      return;
-    }
-
     try {
+      if (merchantId) {
+        const targetMerchantId = String(merchantId);
+        const isGlobalAdmin =
+          Boolean(req.auth!.isSuperAdmin) ||
+          Boolean(req.auth!.roles?.some((r: string) => ['SUPER_ADMIN', 'FINANCE_ADMIN', 'OPERATIONS'].includes(r)));
+        const isAuthorizedMerchant = Boolean(req.auth!.merchantIds?.includes(targetMerchantId));
+
+        if (!isGlobalAdmin && !isAuthorizedMerchant) {
+          await recordAuditEvent({
+            actorId: req.auth!.userId,
+            actorType: 'USER',
+            action: 'CROSS_MERCHANT_SETTLEMENT_PREVIEW_BLOCKED',
+            entityType: 'MERCHANT',
+            entityId: targetMerchantId,
+            ipAddress: req.ip,
+            userAgent: req.headers['user-agent'],
+          });
+          res.status(403).json({
+            success: false,
+            error: 'TENANT_ACCESS_DENIED',
+            message: 'Access forbidden: You are not authorized to view settlement previews for another merchant.',
+            requestId,
+          });
+          return;
+        }
+      }
+
+      if (sellerGoodsTaxable === undefined || sellerGstRatePercent === undefined) {
+        res.status(400).json({
+          success: false,
+          error: 'MISSING_FIELDS',
+          message: 'sellerGoodsTaxable and sellerGstRatePercent are required.',
+          requestId,
+        });
+        return;
+      }
+
       let settlement;
       if (merchantId) {
         // Real-life merchant settlement: picks actual live commission rate, PAN status, constitution from database

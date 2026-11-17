@@ -87,7 +87,7 @@ export class InvoiceService {
     const irnSeller = this.generateIrn(sellerGstin, invSellerNumber, '2026-27');
     const irnQcom = this.generateIrn(qcomGstin, invQcomNumber, '2026-27');
 
-    return transaction(async (client) => {
+    await transaction(async (client) => {
       // 1. Form GST INV-1 (Seller Goods Tax Invoice)
       const insSellerInv = await client.query(`
         INSERT INTO invoices (
@@ -186,9 +186,9 @@ export class InvoiceService {
           VALUES ($1, 'Site Logistics Handling & Staging Charge', '998319', 1, $2, $2, 18.00, $3, $4, 0.00, $5)
         `, [qcomInvId, handlingFee, (handlingFee * 0.09).toFixed(2), (handlingFee * 0.09).toFixed(2), (handlingFee * 1.18).toFixed(2)]);
       }
-
-      return this.getOrCreateOrderInvoices(orderId);
     });
+
+    return this.getOrCreateOrderInvoices(orderId);
   }
 }
 

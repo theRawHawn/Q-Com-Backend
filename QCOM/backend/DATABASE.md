@@ -2,7 +2,7 @@
 
 **Engine Requirement:** PostgreSQL 16+  
 **Migration Tool:** Custom Idempotent Advisory-Locked Migrator (`scripts/migrate.ts`)  
-**Migrations Applied:** 001 through 024 (Verified & Tested)  
+**Migrations Applied:** 001 through 026 (Verified & Tested)  
 
 ---
 
@@ -12,9 +12,9 @@
 | :--- | :--- | :--- |
 | **001** | `001_enable_extensions.sql` | `uuid-ossp`, `pgcrypto`, `btree_gist` |
 | **002** | `002_create_users_and_auth.sql` | `users`, `roles`, `permissions`, `role_permissions`, `user_roles` |
-| **003** | `003_create_merchants_and_catalog.sql`| `merchants`, `stores`, `categories`, `products`, `merchant_inventory` |
-| **004** | `004_create_orders_and_trips.sql` | `orders`, `order_items`, `delivery_trips`, `rider_locations` |
-| **005** | `005_create_financial_ledgers.sql` | `accounts`, `journal_batches`, `journal_entries` |
+| **003** | `003_create_merchants_and_catalog.sql`| `merchants`, `merchant_stores`, `store_staff`, `products`, `store_inventory` |
+| **004** | `004_create_orders_and_trips.sql` | `orders`, `order_items`, `riders`, `delivery_trips` |
+| **005** | `005_create_financial_ledgers.sql` | `general_ledger_accounts`, `general_ledger_entries`, `seller_ledgers`, `rider_ledgers` |
 | **006** | `006_create_idempotency_and_webhooks.sql`| `idempotency_keys`, `webhook_events` (UNIQUE `event_id`) |
 | **007** | `007_create_statutory_tax_rules.sql` | `statutory_tax_rules`, `withholding_rules` |
 | **008** | `008_create_auth_and_sessions.sql` | `auth_sessions`, `otp_challenges` |
@@ -26,27 +26,32 @@
 | **014** | `014_update_payment_state_machine.sql`| `payment_intents` state enum expansion |
 | **015** | `015_create_settlement_and_payout_tables.sql`| `seller_payouts`, `rider_payouts` |
 | **016** | `016_create_realtime_outbox_and_notifications.sql`| `outbox_events`, `notifications` |
-| **017** | `017_create_returns_and_refunds.sql` | `return_requests`, `refunds` |
-| **018** | `018_enforce_general_ledger_uniqueness.sql` | UNIQUE constraint on `journal_entries(journal_batch_id, line_number)` |
+| **017** | `017_create_returns_and_refunds.sql` | `refunds`, `order_returns`, `order_return_items` |
+| **018** | `018_enforce_general_ledger_uniqueness.sql` | Idempotent unique ledger constraints on `general_ledger_entries` |
 | **019** | `019_enforce_payout_idempotency_uniqueness.sql` | UNIQUE constraint on `seller_payouts(idempotency_key)` & `rider_payouts(idempotency_key)` |
 | **020** | `020_add_financial_recovery_metadata.sql` | Stalled state recovery columns and retry counters |
-| **021** | `021_create_selective_reservations_and_stock_alerts.sql` | `inventory_reservations`, `stock_alerts` |
+| **021** | `021_create_selective_reservations_and_stock_alerts.sql` | `seller_stock_alerts` and reservation expiry metadata |
 | **022** | `022_create_payment_attempts_and_provider_agnostic_schema.sql`| `payment_attempts` with `UNIQUE (order_id, attempt_number)` |
 | **023** | `023_add_payment_intent_recovery_leases.sql`| `payment_intent_recovery_leases` for distributed worker fencing |
 | **024** | `024_add_password_hash_and_otp_salt.sql`| `salt` on `otp_challenges`; `password_hash`, `password_updated_at`, `failed_password_attempts`, `password_locked_until` on `users` |
+| **025** | `025_add_outbox_worker_leases.sql` | Durable outbox relay leases across workers |
+| **026** | `026_sprint15_2_capacity_indexes_and_concurrency.sql` | Hot-path indexes and capacity concurrency optimizations |
 
 ---
 
 ## 2. Critical Database Invariants
 
 1. **Zero Oversell Invariant:**  
-   Store inventory quantity check: `CHECK (available_quantity >= 0)`. Concurrency is managed via `SELECT ... FOR UPDATE` row locks inside explicit transactions during checkout.
+   Store inventory quantity check: `CHECK (stock_count >= 0)`, `CHECK (reserved_count >= 0)`, and `CONSTRAINT chk_reserved_le_stock CHECK (reserved_count <= stock_count)` on `store_inventory`. Concurrency is managed via `SELECT ... FOR UPDATE` row locks inside explicit transactions during checkout.
 2. **Double-Entry General Ledger Balance:**  
-   Every `journal_batches` record must contain journal entries where:
-   $$\sum \text{Debit Amounts} == \sum \text{Credit Amounts}$$
+   Every posted transaction batch in `general_ledger_entries` enforces:
+   $$\sum \text{DEBIT Amounts} == \sum \text{CREDIT Amounts}$$
 3. **Idempotency Guarantees:**  
    - Webhook events: `UNIQUE (event_id)`.
    - Payment attempts: `UNIQUE (order_id, attempt_number)` and `UNIQUE (provider_id, provider_reference)`.
    - Payout releases: `UNIQUE (idempotency_key)`.
 4. **Advisory Lock Migrations:**  
    Migrations use a serialized advisory lock (`SELECT pg_advisory_lock(42424242)`) to ensure multiple backend instances starting concurrently do not run race-conditioned migrations.
+5. **Security & Suspension Schema:**  
+   User suspension state is stored authoritatively on `users.is_suspended` / `users.suspension_reason`, session versioning on `auth_sessions.token_version`, return requests on `order_returns`, and refund records on `refunds`.
+

@@ -164,7 +164,8 @@ export function requireRiderOwnership(riderIdParam: string = 'riderId') {
 
     const isGlobalAdmin = req.auth.isSuperAdmin || 
       req.auth.roles.includes('SUPER_ADMIN') || 
-      req.auth.roles.includes('OPERATIONS');
+      req.auth.roles.includes('OPERATIONS') ||
+      req.auth.roles.includes('FINANCE_ADMIN');
 
     if (isGlobalAdmin) {
       return next();

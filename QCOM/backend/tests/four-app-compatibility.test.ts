@@ -117,8 +117,22 @@ export async function runFourAppCompatibilityTests(): Promise<void> {
     assert.strictEqual(geofencesRes.status, 200);
     assert.ok(Array.isArray(geofencesRes.body.sellers));
 
+    const geofenceStaffRes = await pool.query(
+      `SELECT u.phone FROM store_staff ss JOIN users u ON ss.user_id = u.id WHERE ss.merchant_id = $1 LIMIT 1`,
+      [testMerchantId]
+    );
+    const geofenceSellerPhone = geofenceStaffRes.rows[0]?.phone || '+91-9845012345';
+    await pool.query(`DELETE FROM otp_challenges WHERE phone = $1`, [geofenceSellerPhone]);
+    const gfOtpReq = await apiRequest('/api/auth/request-otp', { method: 'POST', body: { phone: geofenceSellerPhone } });
+    const gfAuthRes = await apiRequest('/api/auth/verify-otp', {
+      method: 'POST',
+      body: { phone: geofenceSellerPhone, otp: gfOtpReq.body.debugOtp || '123456' },
+    });
+    const geofenceSellerToken = gfAuthRes.body.token || gfAuthRes.body.accessToken;
+
     const updateGeofenceRes = await apiRequest(`/api/checkout/sellers-geofence/${testMerchantId}`, {
       method: 'POST',
+      token: geofenceSellerToken,
       body: { isOpen: true, geofenceRadiusMeters: 7500 },
     });
     assert.strictEqual(updateGeofenceRes.status, 200);
@@ -176,19 +190,23 @@ export async function runFourAppCompatibilityTests(): Promise<void> {
       `SELECT u.phone FROM store_staff ss JOIN users u ON ss.user_id = u.id WHERE ss.merchant_id = $1 LIMIT 1`,
       [testMerchantId]
     );
-    const sellerPhone = staffRes.rows[0]?.phone || '+91 98450 12345';
+    const sellerPhone = staffRes.rows[0]?.phone || '+91-9845012345';
 
-    const sellerOtpReqRes = await apiRequest('/api/auth/request-otp', {
-      method: 'POST',
-      body: { phone: sellerPhone },
-    });
-    const sellerOtp = sellerOtpReqRes.body.debugOtp || '123456';
+    let sellerToken = geofenceSellerToken;
+    if (sellerPhone !== geofenceSellerPhone) {
+      await pool.query(`DELETE FROM otp_challenges WHERE phone = $1`, [sellerPhone]);
+      const sellerOtpReqRes = await apiRequest('/api/auth/request-otp', {
+        method: 'POST',
+        body: { phone: sellerPhone },
+      });
+      const sellerOtp = sellerOtpReqRes.body.debugOtp || '123456';
 
-    const sellerAuthRes = await apiRequest('/api/auth/verify-otp', {
-      method: 'POST',
-      body: { phone: sellerPhone, otp: sellerOtp },
-    });
-    const sellerToken = sellerAuthRes.body.token;
+      const sellerAuthRes = await apiRequest('/api/auth/verify-otp', {
+        method: 'POST',
+        body: { phone: sellerPhone, otp: sellerOtp },
+      });
+      sellerToken = sellerAuthRes.body.token || sellerAuthRes.body.accessToken;
+    }
 
     const sellerInventoryRes = await apiRequest(`/api/merchants/${testMerchantId}/inventory`, {
       method: 'GET',
@@ -212,27 +230,8 @@ export async function runFourAppCompatibilityTests(): Promise<void> {
 
     console.log('\n[Workstream 3] Verifying Delivery Partner App Contract Compatibility...');
 
-    // 1. Duty Status Toggle
-    const dutyStatusRes = await apiRequest('/api/partner/duty-status', {
-      method: 'POST',
-      body: { isOnline: true, batteryLevel: 92 },
-    });
-    assert.strictEqual(dutyStatusRes.status, 200);
-    assert.strictEqual(dutyStatusRes.body.status, 'ONLINE');
-    console.log('✓ Partner duty status toggle verified (POST /api/partner/duty-status)');
-
-    // 2. Task Accept
-    const riderRes = await pool.query(`SELECT id FROM riders LIMIT 1`);
-    const riderId = riderRes.rows[0].id;
-
-    const tripInsertRes = await pool.query(`
-      INSERT INTO delivery_trips (order_id, rider_id, status, base_fare, distance_fare, surge_fare, total_rider_payout)
-      VALUES ($1, $2, 'BROADCASTING', 35, 15, 0, 50)
-      RETURNING id
-    `, [createdOrderId, riderId]);
-    const tripId = tripInsertRes.rows[0].id;
-
-    // Authenticate delivery partner
+    // Authenticate delivery partner before duty & task calls
+    await pool.query(`DELETE FROM otp_challenges WHERE phone = $1`, ['+91-9812345678']);
     const riderOtpReq = await apiRequest('/api/auth/request-otp', {
       method: 'POST',
       body: { phone: '+91-9812345678' },
@@ -242,6 +241,28 @@ export async function runFourAppCompatibilityTests(): Promise<void> {
       body: { phone: '+91-9812345678', otp: riderOtpReq.body?.debugOtp || '123456', role: 'DELIVERY_PARTNER', name: 'Arjun Teja' },
     });
     const riderToken = riderAuthRes.body.token || riderAuthRes.body.accessToken;
+
+    // 1. Duty Status Toggle
+    const dutyStatusRes = await apiRequest('/api/partner/duty-status', {
+      method: 'POST',
+      token: riderToken,
+      body: { isOnline: true, batteryLevel: 92 },
+    });
+    assert.strictEqual(dutyStatusRes.status, 200);
+    assert.strictEqual(dutyStatusRes.body.status, 'ONLINE');
+    console.log('✓ Partner duty status toggle verified (POST /api/partner/duty-status)');
+
+    // 2. Task Accept
+    const riderRes = await pool.query(`SELECT id FROM riders WHERE phone = $1 LIMIT 1`, ['+91-9812345678']);
+    const fallbackRiderRes = riderRes.rows.length > 0 ? riderRes : await pool.query(`SELECT id FROM riders LIMIT 1`);
+    const riderId = fallbackRiderRes.rows[0].id;
+
+    const tripInsertRes = await pool.query(`
+      INSERT INTO delivery_trips (order_id, rider_id, status, base_fare, distance_fare, surge_fare, total_rider_payout)
+      VALUES ($1, $2, 'BROADCASTING', 35, 15, 0, 50)
+      RETURNING id
+    `, [createdOrderId, riderId]);
+    const tripId = tripInsertRes.rows[0].id;
 
     const taskAcceptRes = await apiRequest(`/api/tasks/${tripId}/accept`, {
       method: 'POST',
@@ -253,10 +274,10 @@ export async function runFourAppCompatibilityTests(): Promise<void> {
     console.log('✓ Partner task acceptance verified (POST /api/tasks/:id/accept)');
 
     // 3. Arrived at pickup & pickup confirm
-    const arrivedRes = await apiRequest(`/api/tasks/${tripId}/arrived-pickup`, { method: 'POST', body: {} });
+    const arrivedRes = await apiRequest(`/api/tasks/${tripId}/arrived-pickup`, { method: 'POST', token: riderToken, body: {} });
     assert.strictEqual(arrivedRes.status, 200);
 
-    const pickupRes = await apiRequest(`/api/tasks/${tripId}/pickup-confirm`, { method: 'POST', body: {} });
+    const pickupRes = await apiRequest(`/api/tasks/${tripId}/pickup-confirm`, { method: 'POST', token: riderToken, body: {} });
     assert.strictEqual(pickupRes.status, 200);
     console.log('✓ Partner pickup flow verified (POST /api/tasks/:id/arrived-pickup, pickup-confirm)');
 
@@ -266,6 +287,7 @@ export async function runFourAppCompatibilityTests(): Promise<void> {
 
     const verifyOtpRes = await apiRequest(`/api/tasks/${tripId}/verify-otp`, {
       method: 'POST',
+      token: riderToken,
       body: { otp: validOtp, cashCollected: 50 },
     });
     assert.strictEqual(verifyOtpRes.status, 200);
@@ -275,13 +297,21 @@ export async function runFourAppCompatibilityTests(): Promise<void> {
 
     console.log('\n[Workstream 4] Verifying Admin Panel API Contract Compatibility...');
 
-    // 1. Admin Me Handshake
+    // Authenticate seeded SUPER_ADMIN via JWT login
+    const adminLoginRes = await apiRequest('/api/auth/admin/login', {
+      method: 'POST',
+      body: {
+        employeeCode: 'EMP-001',
+        password: process.env.SEED_ADMIN_PASSWORD || 'QcomSeedAdmin#2026',
+      },
+    });
+    assert.strictEqual(adminLoginRes.status, 200);
+    const adminToken = adminLoginRes.body.accessToken;
+
+    // 1. Admin Me Handshake (JWT authenticated)
     const adminMeRes = await apiRequest('/api/admin/me', {
       method: 'GET',
-      headers: {
-        'x-admin-role': 'SUPER_ADMIN',
-        'x-admin-id': 'emp-001',
-      },
+      token: adminToken,
     });
     assert.strictEqual(adminMeRes.status, 200);
     assert.strictEqual(adminMeRes.body.success, true);
@@ -290,7 +320,7 @@ export async function runFourAppCompatibilityTests(): Promise<void> {
     console.log('✓ Admin handshake & permissions verified (GET /api/admin/me)');
 
     // 2. Admin Operational Cities
-    const citiesRes = await apiRequest('/api/admin/cities', { method: 'GET' });
+    const citiesRes = await apiRequest('/api/admin/cities', { method: 'GET', token: adminToken });
     assert.strictEqual(citiesRes.status, 200);
     assert.strictEqual(citiesRes.body.success, true);
     assert.ok(Array.isArray(citiesRes.body.cities));
@@ -298,31 +328,31 @@ export async function runFourAppCompatibilityTests(): Promise<void> {
     console.log('✓ Admin operational cities verified (GET /api/admin/cities)');
 
     // 3. Admin Orders Central View
-    const adminOrdersRes = await apiRequest('/api/admin/orders', { method: 'GET' });
+    const adminOrdersRes = await apiRequest('/api/admin/orders', { method: 'GET', token: adminToken });
     assert.strictEqual(adminOrdersRes.status, 200);
     assert.ok(Array.isArray(adminOrdersRes.body.orders));
     console.log('✓ Admin central orders monitoring verified (GET /api/admin/orders)');
 
     // 4. Admin Riders Fleet View
-    const adminRidersRes = await apiRequest('/api/admin/riders', { method: 'GET' });
+    const adminRidersRes = await apiRequest('/api/admin/riders', { method: 'GET', token: adminToken });
     assert.strictEqual(adminRidersRes.status, 200);
     assert.ok(Array.isArray(adminRidersRes.body.riders));
     console.log('✓ Admin fleet management verified (GET /api/admin/riders)');
 
     // 5. Admin Sellers View
-    const adminSellersRes = await apiRequest('/api/admin/sellers', { method: 'GET' });
+    const adminSellersRes = await apiRequest('/api/admin/sellers', { method: 'GET', token: adminToken });
     assert.strictEqual(adminSellersRes.status, 200);
     assert.ok(Array.isArray(adminSellersRes.body.sellers));
     console.log('✓ Admin sellers compliance management verified (GET /api/admin/sellers)');
 
     // 6. Admin Settlements View
-    const adminSettlementsRes = await apiRequest('/api/admin/settlements', { method: 'GET' });
+    const adminSettlementsRes = await apiRequest('/api/admin/settlements', { method: 'GET', token: adminToken });
     assert.strictEqual(adminSettlementsRes.status, 200);
     assert.ok(Array.isArray(adminSettlementsRes.body.settlements));
     console.log('✓ Admin settlements accounting verified (GET /api/admin/settlements)');
 
     // 7. Admin Audit Logs
-    const adminAuditRes = await apiRequest('/api/admin/audit-logs', { method: 'GET' });
+    const adminAuditRes = await apiRequest('/api/admin/audit-logs', { method: 'GET', token: adminToken });
     assert.strictEqual(adminAuditRes.status, 200);
     assert.ok(Array.isArray(adminAuditRes.body.logs));
     console.log('✓ Admin immutable audit logs verified (GET /api/admin/audit-logs)');
@@ -330,6 +360,7 @@ export async function runFourAppCompatibilityTests(): Promise<void> {
     // 8. Admin Rider Payout Release
     const releasePayoutRes = await apiRequest(`/api/admin/riders/${riderId}/release-payout`, {
       method: 'POST',
+      token: adminToken,
       body: { amount: 500 },
     });
     assert.strictEqual(releasePayoutRes.status, 200);

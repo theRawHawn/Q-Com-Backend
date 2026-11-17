@@ -1,7 +1,9 @@
 import { Router, Request, Response } from 'express';
 import { returnService } from '../modules/orders/returnService.js';
 import { authenticate } from '../middleware/auth.js';
+import { requireOrderOwnership } from '../middleware/resourceOwnership.js';
 import { bloomFilterService } from '../modules/resilience/bloomFilterService.js';
+import { recordAuditEvent } from '../modules/audit/auditService.js';
 
 function isDatabaseUnavailable(err: any): boolean {
   if (!err) return false;
@@ -24,6 +26,55 @@ function isDatabaseUnavailable(err: any): boolean {
     msg.includes('cannot connect') ||
     msg.includes('timeout')
   );
+}
+
+function isReturnAdmin(req: Request): boolean {
+  return Boolean(
+    req.auth?.isSuperAdmin ||
+      req.auth?.roles?.some((r: string) => ['SUPER_ADMIN', 'OPERATIONS', 'FINANCE_ADMIN'].includes(r))
+  );
+}
+
+async function authorizeReturnMerchantAction(
+  req: Request,
+  res: Response,
+  returnId: string
+): Promise<{ authorized: true; merchantId: string } | { authorized: false }> {
+  const ret = await returnService.getReturnById(returnId);
+  if (!ret) {
+    res.status(404).json({ success: false, error: 'RETURN_NOT_FOUND', message: 'Return not found.' });
+    return { authorized: false };
+  }
+
+  const globalAdmin = isReturnAdmin(req);
+  const authorizedMerchant = Boolean(req.auth?.merchantIds?.includes(ret.merchantId));
+  const bodyMerchantId = req.body?.merchantId ? String(req.body.merchantId) : undefined;
+  const forgedBodyMerchant = Boolean(bodyMerchantId && !globalAdmin && bodyMerchantId !== ret.merchantId);
+
+  if ((!globalAdmin && !authorizedMerchant) || forgedBodyMerchant) {
+    await recordAuditEvent({
+      actorId: req.auth!.userId,
+      actorType: 'USER',
+      action: 'CROSS_MERCHANT_RETURN_MUTATION_BLOCKED',
+      entityType: 'ORDER_RETURN',
+      entityId: returnId,
+      newState: {
+        returnMerchantId: ret.merchantId,
+        attemptedBodyMerchantId: bodyMerchantId || null,
+        callerMerchants: req.auth?.merchantIds || [],
+      },
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+    });
+    res.status(403).json({
+      success: false,
+      error: 'TENANT_ACCESS_DENIED',
+      message: 'Access forbidden: You are not authorized to process returns for this merchant.',
+    });
+    return { authorized: false };
+  }
+
+  return { authorized: true, merchantId: ret.merchantId };
 }
 
 export const returnRouter = Router();
@@ -87,9 +138,9 @@ returnRouter.post('/orders/:orderId/returns', authenticate, async (req: Request,
 
 /**
  * GET /api/v1/orders/:orderId/returns
- * List all returns for an order
+ * List all returns for an order (strictly order-owner, merchant-owner, assigned rider, or admin)
  */
-returnRouter.get('/orders/:orderId/returns', authenticate, async (req: Request, res: Response): Promise<void> => {
+returnRouter.get('/orders/:orderId/returns', authenticate, requireOrderOwnership('orderId'), async (req: Request, res: Response): Promise<void> => {
   try {
     const { orderId } = req.params;
     if (!(await bloomFilterService.mightContainSafe('orders', orderId))) {
@@ -112,7 +163,7 @@ returnRouter.get('/orders/:orderId/returns', authenticate, async (req: Request, 
 
 /**
  * GET /api/v1/returns/:returnId
- * Get details of a specific return request
+ * Get details of a specific return request with strict ownership check
  */
 returnRouter.get('/returns/:returnId', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
@@ -122,6 +173,29 @@ returnRouter.get('/returns/:returnId', authenticate, async (req: Request, res: R
       res.status(404).json({ success: false, error: 'RETURN_NOT_FOUND', message: 'Return not found.' });
       return;
     }
+
+    const globalAdmin = isReturnAdmin(req);
+    const isCustomerOwner = ret.userId === req.auth!.userId;
+    const isMerchantOwner = Boolean(req.auth!.merchantIds?.includes(ret.merchantId));
+
+    if (!globalAdmin && !isCustomerOwner && !isMerchantOwner) {
+      await recordAuditEvent({
+        actorId: req.auth!.userId,
+        actorType: 'USER',
+        action: 'CROSS_TENANT_RETURN_INSPECTION_BLOCKED',
+        entityType: 'ORDER_RETURN',
+        entityId: returnId,
+        ipAddress: req.ip,
+        userAgent: req.headers['user-agent'],
+      });
+      res.status(403).json({
+        success: false,
+        error: 'RESOURCE_ACCESS_DENIED',
+        message: 'Access forbidden: You are not authorized to inspect this return request.',
+      });
+      return;
+    }
+
     res.status(200).json({ success: true, returnRequest: ret });
   } catch (err: any) {
     if (isDatabaseUnavailable(err)) {
@@ -139,17 +213,19 @@ returnRouter.get('/returns/:returnId', authenticate, async (req: Request, res: R
 returnRouter.post('/returns/:returnId/review', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
     const { returnId } = req.params;
-    const { action, reasonNotes, merchantId } = req.body;
+    const { action, reasonNotes } = req.body;
+
+    const authz = await authorizeReturnMerchantAction(req, res, returnId);
+    if (!authz.authorized) return;
 
     if (!action || !['APPROVE', 'REJECT'].includes(action)) {
       res.status(400).json({ success: false, error: 'INVALID_ACTION', message: 'action must be APPROVE or REJECT.' });
       return;
     }
 
-    const effectiveMerchantId = merchantId || (req.auth as any)?.merchantId;
     const updated = await returnService.reviewReturn({
       returnId,
-      merchantId: effectiveMerchantId,
+      merchantId: authz.merchantId,
       adminId: req.auth!.userId,
       action,
       reasonNotes,
@@ -177,17 +253,12 @@ returnRouter.post('/returns/:returnId/review', authenticate, async (req: Request
 returnRouter.post('/returns/:returnId/receive', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
     const { returnId } = req.params;
-    const { merchantId } = req.body;
-    const effectiveMerchantId = merchantId || (req.auth as any)?.merchantId;
-
-    if (!effectiveMerchantId) {
-      res.status(400).json({ success: false, error: 'MISSING_MERCHANT_ID', message: 'merchantId is required.' });
-      return;
-    }
+    const authz = await authorizeReturnMerchantAction(req, res, returnId);
+    if (!authz.authorized) return;
 
     const updated = await returnService.receiveAtStore({
       returnId,
-      merchantId: effectiveMerchantId,
+      merchantId: authz.merchantId,
     });
 
     res.status(200).json({
@@ -211,13 +282,10 @@ returnRouter.post('/returns/:returnId/receive', authenticate, async (req: Reques
 returnRouter.post('/returns/:returnId/qc-inspect', authenticate, async (req: Request, res: Response): Promise<void> => {
   try {
     const { returnId } = req.params;
-    const { merchantId, itemDecisions, qcNotes } = req.body;
-    const effectiveMerchantId = merchantId || (req.auth as any)?.merchantId;
+    const { itemDecisions, qcNotes } = req.body;
 
-    if (!effectiveMerchantId) {
-      res.status(400).json({ success: false, error: 'MISSING_MERCHANT_ID', message: 'merchantId is required.' });
-      return;
-    }
+    const authz = await authorizeReturnMerchantAction(req, res, returnId);
+    if (!authz.authorized) return;
 
     if (!itemDecisions || !Array.isArray(itemDecisions) || itemDecisions.length === 0) {
       res.status(400).json({ success: false, error: 'MISSING_DECISIONS', message: 'itemDecisions array is required.' });
@@ -226,7 +294,7 @@ returnRouter.post('/returns/:returnId/qc-inspect', authenticate, async (req: Req
 
     const result = await returnService.qcInspectAndResolve({
       returnId,
-      merchantId: effectiveMerchantId,
+      merchantId: authz.merchantId,
       itemDecisions,
       qcNotes,
     });

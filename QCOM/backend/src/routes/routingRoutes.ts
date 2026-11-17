@@ -1,7 +1,12 @@
 import { Router, Request, Response } from 'express';
 import { routingService } from '../modules/routing/routingService.js';
+import { authenticate } from '../middleware/auth.js';
+import { requireRole } from '../middleware/rbac.js';
+import { riderTelemetryRateLimiter } from '../middleware/rateLimiter.js';
 
 export const routingRouter = Router();
+
+const ROUTING_MUTATION_ROLES = ['RIDER', 'STORE_OWNER', 'STORE_MANAGER', 'DISPATCHER', 'OPERATIONS', 'SUPER_ADMIN'];
 
 /**
  * POST /api/routing/calculate & POST /api/v1/routing/calculate
@@ -40,112 +45,144 @@ routingRouter.post('/calculate', async (req: Request, res: Response): Promise<vo
 /**
  * POST /api/routing/reroute & POST /api/v1/routing/reroute
  */
-routingRouter.post('/reroute', async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { orderId, currentRiderLocation, destinationLocation } = req.body;
-    if (!currentRiderLocation || !destinationLocation) {
-      res.status(400).json({
-        success: false,
-        error: 'MISSING_COORDINATES',
-        message: 'currentRiderLocation and destinationLocation are required.',
-      });
-      return;
-    }
+routingRouter.post(
+  '/reroute',
+  authenticate,
+  riderTelemetryRateLimiter,
+  requireRole(ROUTING_MUTATION_ROLES),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { orderId, currentRiderLocation, destinationLocation } = req.body;
+      if (!currentRiderLocation || !destinationLocation) {
+        res.status(400).json({
+          success: false,
+          error: 'MISSING_COORDINATES',
+          message: 'currentRiderLocation and destinationLocation are required.',
+        });
+        return;
+      }
 
-    const result = await routingService.rerouteCourier(orderId, currentRiderLocation, destinationLocation);
-    res.status(200).json({
-      success: true,
-      message: 'Rider corridor dynamically recalculated on deviation.',
-      recalculatedRoute: result.recalculatedRoute,
-      summary: result.summary,
-    });
-  } catch (err: any) {
-    res.status(500).json({
-      success: false,
-      error: 'REROUTE_FAILED',
-      message: err.message || 'Failed to recalculate route.',
-    });
+      const result = await routingService.rerouteCourier(orderId, currentRiderLocation, destinationLocation);
+      res.status(200).json({
+        success: true,
+        message: 'Rider corridor dynamically recalculated on deviation.',
+        recalculatedRoute: result.recalculatedRoute,
+        summary: result.summary,
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        success: false,
+        error: 'REROUTE_FAILED',
+        message: err.message || 'Failed to recalculate route.',
+      });
+    }
   }
-});
+);
 
 /**
  * POST /api/routing/entrance-correction & POST /api/v1/routing/entrance-correction
  */
-routingRouter.post('/entrance-correction', async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { locationType, originalCoords, accessibleEntranceCoords, notes } = req.body;
-    if (!locationType || !originalCoords || !accessibleEntranceCoords) {
-      res.status(400).json({
-        success: false,
-        error: 'MISSING_FIELDS',
-        message: 'locationType, originalCoords, and accessibleEntranceCoords are required.',
+routingRouter.post(
+  '/entrance-correction',
+  authenticate,
+  riderTelemetryRateLimiter,
+  requireRole(ROUTING_MUTATION_ROLES),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { locationType, originalCoords, accessibleEntranceCoords, notes } = req.body;
+      if (!locationType || !originalCoords || !accessibleEntranceCoords) {
+        res.status(400).json({
+          success: false,
+          error: 'MISSING_FIELDS',
+          message: 'locationType, originalCoords, and accessibleEntranceCoords are required.',
+        });
+        return;
+      }
+
+      const locationKey = `${locationType}_${originalCoords.latitude.toFixed(5)}_${originalCoords.longitude.toFixed(5)}`;
+      await routingService.saveEntranceCorrection({
+        locationKey,
+        locationType,
+        originalCoords,
+        accessibleEntranceCoords,
+        notes,
       });
-      return;
+
+      res.status(200).json({
+        success: true,
+        message: 'Accessible loading entrance snapped and saved.',
+        locationKey,
+        accessibleEntranceCoords,
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        success: false,
+        error: 'SAVE_FAILED',
+        message: err.message || 'Failed to save entrance correction.',
+      });
     }
-
-    const locationKey = `${locationType}_${originalCoords.latitude.toFixed(5)}_${originalCoords.longitude.toFixed(5)}`;
-    await routingService.saveEntranceCorrection({
-      locationKey,
-      locationType,
-      originalCoords,
-      accessibleEntranceCoords,
-      notes,
-    });
-
-    res.status(200).json({
-      success: true,
-      message: 'Accessible loading entrance snapped and saved.',
-      locationKey,
-      accessibleEntranceCoords,
-    });
-  } catch (err: any) {
-    res.status(500).json({
-      success: false,
-      error: 'SAVE_FAILED',
-      message: err.message || 'Failed to save entrance correction.',
-    });
   }
-});
+);
 
 /**
  * POST /api/routing/telemetry & POST /api/v1/routing/telemetry
  */
-routingRouter.post('/telemetry', async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { orderId, sellerId, riderId, originCoords, destinationCoords, plannedDistanceM, plannedDurationSec, actualDistanceM, actualDurationSec, deviationsCount } = req.body;
+routingRouter.post(
+  '/telemetry',
+  authenticate,
+  riderTelemetryRateLimiter,
+  requireRole(ROUTING_MUTATION_ROLES),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const { orderId, sellerId, riderId, originCoords, destinationCoords, plannedDistanceM, plannedDurationSec, actualDistanceM, actualDurationSec, deviationsCount } = req.body;
 
-    if (!originCoords || !destinationCoords || !plannedDistanceM || !plannedDurationSec) {
-      res.status(400).json({
-        success: false,
-        error: 'MISSING_FIELDS',
-        message: 'originCoords, destinationCoords, plannedDistanceM, and plannedDurationSec are required.',
+      const isAdmin =
+        Boolean(req.auth?.isSuperAdmin) ||
+        Boolean(req.auth?.roles?.some((r: string) => ['DISPATCHER', 'OPERATIONS', 'SUPER_ADMIN'].includes(r)));
+      if (!isAdmin && riderId && (!req.auth?.riderId || String(riderId) !== req.auth.riderId)) {
+        res.status(403).json({
+          success: false,
+          error: 'RIDER_ACCESS_DENIED',
+          message: 'Access forbidden: You cannot submit routing telemetry for another rider.',
+        });
+        return;
+      }
+
+      if (!originCoords || !destinationCoords || !plannedDistanceM || !plannedDurationSec) {
+        res.status(400).json({
+          success: false,
+          error: 'MISSING_FIELDS',
+          message: 'originCoords, destinationCoords, plannedDistanceM, and plannedDurationSec are required.',
+        });
+        return;
+      }
+
+      const effectiveRiderId = !isAdmin && req.auth?.riderId ? req.auth.riderId : riderId;
+
+      const recordId = await routingService.recordTelemetry({
+        orderId,
+        sellerId,
+        riderId: effectiveRiderId,
+        originCoords,
+        destinationCoords,
+        plannedDistanceM,
+        plannedDurationSec,
+        actualDistanceM,
+        actualDurationSec,
+        deviationsCount,
       });
-      return;
+
+      res.status(200).json({
+        success: true,
+        message: 'Telemetry trace logged successfully.',
+        recordId,
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        success: false,
+        error: 'LOG_FAILED',
+        message: err.message || 'Failed to record routing telemetry.',
+      });
     }
-
-    const recordId = await routingService.recordTelemetry({
-      orderId,
-      sellerId,
-      riderId,
-      originCoords,
-      destinationCoords,
-      plannedDistanceM,
-      plannedDurationSec,
-      actualDistanceM,
-      actualDurationSec,
-      deviationsCount,
-    });
-
-    res.status(200).json({
-      success: true,
-      message: 'Telemetry trace logged successfully.',
-      recordId,
-    });
-  } catch (err: any) {
-    res.status(500).json({
-      success: false,
-      error: 'LOG_FAILED',
-      message: err.message || 'Failed to record routing telemetry.',
-    });
   }
-});
+);

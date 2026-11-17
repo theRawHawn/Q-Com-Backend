@@ -21,7 +21,7 @@ graph TD
 
     subgraph QCOM_Backend_Modular_Monolith [QCOM Backend Engine]
         API_GW[Express REST Router & Security Middleware]
-        WS_GW[WebSocket Gateway /ws/v1]
+        WS_GW[WebSocket Gateway /ws]
         
         subgraph Domain_Modules [Domain Modules]
             AUTH[Auth & RBAC Module]
@@ -69,27 +69,27 @@ graph TD
 
 | Module | Source Path | Primary Responsibility | Authoritative Tables |
 | :--- | :--- | :--- | :--- |
-| **Auth & RBAC** | `src/modules/auth`, `src/modules/rbac` | Phone OTP authentication, JWT generation, user sessions, role permissions | `users`, `auth_sessions`, `otp_challenges`, `roles`, `permissions` |
-| **Catalog & Pricing** | `src/modules/catalog`, `src/modules/pricing` | Product master, merchant store catalog, dynamic delivery and tax pricing calculation | `products`, `merchants`, `pricing_rules`, `statutory_tax_rules` |
-| **Inventory** | `src/modules/inventory` | Multi-store stock tracking, selective reservations, zero-oversell row locking | `merchant_inventory`, `inventory_reservations`, `stock_alerts` |
-| **Orders** | `src/modules/orders` | Checkout orchestration, order state machine, cancellation & compensation | `orders`, `order_items` |
-| **Dispatch & Delivery**| `src/modules/dispatch`, `src/modules/delivery` | Rider proximity discovery, trip broadcasting, delivery OTP handshakes | `delivery_trips`, `rider_profiles`, `rider_locations` |
+| **Auth & RBAC** | `src/modules/auth`, `src/modules/rbac` | Phone OTP / Admin Scrypt authentication, JWT & session versioning, dynamic RBAC | `users`, `auth_sessions`, `refresh_tokens`, `otp_challenges`, `roles`, `permissions` |
+| **Catalog & Pricing** | `src/modules/catalog`, `src/modules/pricing` | Product master, merchant store catalog, dynamic delivery and tax pricing calculation | `products`, `merchants`, `pricing_delivery_rules`, `statutory_tax_rules` |
+| **Inventory** | `src/modules/inventory` | Multi-store stock tracking, selective reservations, zero-oversell row locking | `store_inventory`, `inventory_reservations`, `seller_stock_alerts` |
+| **Orders** | `src/modules/orders` | Checkout orchestration, order state machine, cancellation & compensation | `orders`, `order_items`, `order_returns`, `order_return_items` |
+| **Dispatch & Delivery**| `src/modules/dispatch`, `src/modules/delivery` | Rider proximity discovery, trip broadcasting, delivery OTP handshakes | `delivery_trips`, `riders`, `dispatch_assignments`, `dispatch_offers` |
 | **Payments** | `src/modules/payments` | Payment provider abstraction, durable webhook deduplication, refund state machine | `payment_intents`, `payment_attempts`, `webhook_events`, `refunds` |
-| **Settlement & Ledger**| `src/modules/settlements`, `src/modules/ledger` | Double-entry journal accounting, merchant payouts, rider earnings, statutory withholding (TDS/TCS) | `journal_batches`, `journal_entries`, `accounts`, `seller_payouts`, `rider_payouts` |
-| **Outbox & Events** | `src/modules/outbox`, `src/modules/notifications` | Transactional outbox event publishing, SMS/push notification queues | `outbox_events`, `notifications` |
+| **Settlement & Ledger**| `src/modules/settlements`, `src/modules/ledger` | Double-entry journal accounting, merchant payouts, rider earnings, statutory withholding (TDS/TCS) | `general_ledger_accounts`, `general_ledger_entries`, `order_settlement_allocations`, `seller_payouts`, `rider_payouts` |
+| **Outbox & Events** | `src/modules/outbox`, `src/modules/notifications` | Transactional outbox event publishing, push notification queues | `outbox_events`, `notification_campaigns`, `notification_deliveries` |
 | **Realtime** | `src/modules/realtime` | WebSocket connection lifecycle, private channel authorization, ephemeral GPS telemetry | Ephemeral (Redis / Memory) |
-| **Recovery** | `src/modules/recovery` | Lease-based financial recovery worker for stalled transactions and reconciliation | `payment_intent_recovery_leases` |
+| **Recovery** | `src/modules/recovery` | Lease-based financial recovery worker for stalled transactions and reconciliation | `payment_intents` (recovery lease metadata) |
 
 ---
 
 ## 3. Request Flow & Transaction Boundaries
 
-1. **Client Request:** Validated against input schemas (Zod/custom validators) in Express route controllers.
-2. **Authentication Middleware:** Validates JWT signature and active session record in `auth_sessions`.
-3. **RBAC Authorization:** Evaluates granular permissions (`orders:create`, `merchants:inventory:read`, etc.) and enforces tenant isolation (`merchant_id`).
-4. **Service Execution & Atomic DB Transaction:** Services execute within `transaction(async (client) => { ... })`. For critical updates, row-level locks (`FOR UPDATE`) are acquired.
+1. **Client Request & Transport Guards:** Requests pass Helmet headers, fail-closed CORS (`credentials: false` when wildcard `*`), CIDR-verified IP resolution (`TRUST_PROXY_CIDRS`), Redis-backed sliding-window rate limiters, and input sanitization.
+2. **Authentication & `token_version` Middleware:** Validates JWT signature (`JWT_ACCESS_SECRET` / `JWT_SECRET` alias), checks active `auth_sessions` record, enforces `is_suspended = FALSE`, and validates `token_version` across both HTTP and WebSocket upgrades.
+3. **RBAC & Object-Level Authorization:** Evaluates granular permissions (`RequirePermission` / `requireRole`), privilege-escalation boundaries (`SUPER_ADMIN` protection), and strict object ownership (`requireOrderOwnership`, `requireMerchantOwnership`, `requireRiderOwnership`).
+4. **Service Execution & Atomic DB Transaction:** Services execute within `transaction(async (client) => { ... })`. For critical updates (inventory, OTP consumption, refresh rotation, payouts), row-level locks (`FOR UPDATE`) are acquired.
 5. **Outbox Emission:** Event payloads are inserted into `outbox_events` as part of the same SQL transaction.
-6. **Response Dispatch:** HTTP 200/201 response emitted to client; background worker picks up outbox records asynchronously.
+6. **Response Dispatch & Error Sanitization:** Production HTTP 500 errors return sanitized messages (`safeErrorMessage`); audit logs automatically scrub credentials and tokens before persistence.
 
 ---
 
@@ -97,4 +97,6 @@ graph TD
 
 - **Stateless HTTP Layer:** Backend instances run statelessly behind a standard load balancer.
 - **Distributed Lock Management:** PostgreSQL advisory locks (`pg_advisory_lock`) and leasing tables prevent concurrent worker conflicts across instances.
-- **Redis Pub/Sub Backplane:** Multi-instance WebSocket broadcasting uses Redis Pub/Sub channels to ensure real-time messages reach clients connected to any node.
+- **Redis Pub/Sub Backplane:** Multi-instance WebSocket broadcasting uses Redis Pub/Sub (`qcom:ws:broadcast`) both for real-time order telemetry and cross-instance `SESSION_REVOKED` / `USER_LOGOUT_ALL` WebSocket disconnect propagation.
+- **Related Security Specification:** See [SECURITY.md](./SECURITY.md).
+

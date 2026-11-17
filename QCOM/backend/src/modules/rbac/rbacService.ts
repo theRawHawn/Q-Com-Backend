@@ -36,6 +36,15 @@ export interface UserAuthContext {
   isSuperAdmin: boolean;
 }
 
+const PROTECTED_ADMIN_ROLE_CODES = new Set([
+  'SUPER_ADMIN',
+  'OPERATIONS',
+  'FINANCE_ADMIN',
+  'DISPATCHER',
+  'ADMIN',
+  'PLATFORM_ADMIN',
+]);
+
 export class RbacService {
   /**
    * Fetches all active roles for a user from PostgreSQL
@@ -164,15 +173,37 @@ export class RbacService {
    * Creates a dynamic role
    */
   async createRole(
-    params: { code: string; name: string; description?: string; isSystemRole?: boolean; actorId?: string },
+    params: {
+      code: string;
+      name: string;
+      description?: string;
+      isSystemRole?: boolean;
+      actorId?: string;
+      actorIsSuperAdmin?: boolean;
+    },
     poolOverride?: pg.Pool
   ): Promise<RoleRecord> {
     const runner = poolOverride || getPool();
+    const normalizedCode = params.code.trim().toUpperCase();
+
+    if (params.actorIsSuperAdmin === false && (params.isSystemRole || PROTECTED_ADMIN_ROLE_CODES.has(normalizedCode))) {
+      await recordAuditEvent({
+        actorId: params.actorId || 'SYSTEM',
+        actorType: 'ADMIN',
+        action: 'PRIVILEGE_ESCALATION_BLOCKED',
+        entityType: 'ROLE',
+        entityId: normalizedCode,
+        newState: { reason: 'Non-SUPER_ADMIN attempted to create privileged/system role' },
+        poolOverride: runner,
+      });
+      throw new Error('PRIVILEGE_ESCALATION_DENIED: Only SUPER_ADMIN can create system or administrative roles.');
+    }
+
     const res = await runner.query(
       `INSERT INTO roles (code, name, description, is_system_role, created_at, updated_at)
        VALUES ($1, $2, $3, $4, NOW(), NOW())
        RETURNING id, code, name, description, is_system_role, created_at, updated_at`,
-      [params.code.toUpperCase(), params.name, params.description || '', Boolean(params.isSystemRole)]
+      [normalizedCode, params.name, params.description || '', Boolean(params.isSystemRole)]
     );
     const newRole = res.rows[0];
 
@@ -196,9 +227,32 @@ export class RbacService {
     roleId: string,
     permissionId: string,
     actorId?: string,
-    poolOverride?: pg.Pool
+    poolOverride?: pg.Pool,
+    actorIsSuperAdmin?: boolean
   ): Promise<void> {
     const runner = poolOverride || getPool();
+    const roleRes = await runner.query(`SELECT id, code, is_system_role FROM roles WHERE id = $1`, [roleId]);
+    if (roleRes.rows.length === 0) {
+      throw new Error('ROLE_NOT_FOUND: Target role does not exist.');
+    }
+    const targetRole = roleRes.rows[0];
+
+    if (
+      actorIsSuperAdmin === false &&
+      (targetRole.is_system_role || PROTECTED_ADMIN_ROLE_CODES.has(String(targetRole.code).toUpperCase()))
+    ) {
+      await recordAuditEvent({
+        actorId: actorId || 'SYSTEM',
+        actorType: 'ADMIN',
+        action: 'PRIVILEGE_ESCALATION_BLOCKED',
+        entityType: 'ROLE_PERMISSION',
+        entityId: `${roleId}:${permissionId}`,
+        newState: { roleCode: targetRole.code, reason: 'Non-SUPER_ADMIN cannot modify system/admin role permissions' },
+        poolOverride: runner,
+      });
+      throw new Error('PRIVILEGE_ESCALATION_DENIED: Only SUPER_ADMIN can modify permissions on system or administrative roles.');
+    }
+
     await runner.query(
       `INSERT INTO role_permissions (role_id, permission_id)
        VALUES ($1, $2)
@@ -223,9 +277,32 @@ export class RbacService {
     roleId: string,
     permissionId: string,
     actorId?: string,
-    poolOverride?: pg.Pool
+    poolOverride?: pg.Pool,
+    actorIsSuperAdmin?: boolean
   ): Promise<void> {
     const runner = poolOverride || getPool();
+    const roleRes = await runner.query(`SELECT id, code, is_system_role FROM roles WHERE id = $1`, [roleId]);
+    if (roleRes.rows.length === 0) {
+      throw new Error('ROLE_NOT_FOUND: Target role does not exist.');
+    }
+    const targetRole = roleRes.rows[0];
+
+    if (
+      actorIsSuperAdmin === false &&
+      (targetRole.is_system_role || PROTECTED_ADMIN_ROLE_CODES.has(String(targetRole.code).toUpperCase()))
+    ) {
+      await recordAuditEvent({
+        actorId: actorId || 'SYSTEM',
+        actorType: 'ADMIN',
+        action: 'PRIVILEGE_ESCALATION_BLOCKED',
+        entityType: 'ROLE_PERMISSION',
+        entityId: `${roleId}:${permissionId}`,
+        newState: { roleCode: targetRole.code, reason: 'Non-SUPER_ADMIN cannot revoke system/admin role permissions' },
+        poolOverride: runner,
+      });
+      throw new Error('PRIVILEGE_ESCALATION_DENIED: Only SUPER_ADMIN can modify permissions on system or administrative roles.');
+    }
+
     await runner.query(
       `DELETE FROM role_permissions WHERE role_id = $1 AND permission_id = $2`,
       [roleId, permissionId]
@@ -248,9 +325,45 @@ export class RbacService {
     userId: string,
     roleId: string,
     actorId?: string,
-    poolOverride?: pg.Pool
+    poolOverride?: pg.Pool,
+    actorIsSuperAdmin?: boolean
   ): Promise<void> {
     const runner = poolOverride || getPool();
+    const roleRes = await runner.query(`SELECT id, code, is_system_role FROM roles WHERE id = $1`, [roleId]);
+    if (roleRes.rows.length === 0) {
+      throw new Error('ROLE_NOT_FOUND: Target role does not exist.');
+    }
+    const targetRole = roleRes.rows[0];
+    const targetRoleCode = String(targetRole.code).toUpperCase();
+
+    if (actorIsSuperAdmin === false) {
+      if (actorId && userId === actorId) {
+        await recordAuditEvent({
+          actorId,
+          actorType: 'ADMIN',
+          action: 'PRIVILEGE_ESCALATION_BLOCKED',
+          entityType: 'USER_ROLE',
+          entityId: `${userId}:${roleId}`,
+          newState: { roleCode: targetRoleCode, reason: 'Self role assignment denied for non-SUPER_ADMIN' },
+          poolOverride: runner,
+        });
+        throw new Error('PRIVILEGE_ESCALATION_DENIED: You cannot modify your own role assignments.');
+      }
+
+      if (PROTECTED_ADMIN_ROLE_CODES.has(targetRoleCode)) {
+        await recordAuditEvent({
+          actorId: actorId || 'SYSTEM',
+          actorType: 'ADMIN',
+          action: 'PRIVILEGE_ESCALATION_BLOCKED',
+          entityType: 'USER_ROLE',
+          entityId: `${userId}:${roleId}`,
+          newState: { roleCode: targetRoleCode, reason: 'Only SUPER_ADMIN may assign privileged admin roles' },
+          poolOverride: runner,
+        });
+        throw new Error(`PRIVILEGE_ESCALATION_DENIED: Only SUPER_ADMIN may assign role '${targetRoleCode}'.`);
+      }
+    }
+
     await runner.query(
       `INSERT INTO user_roles (user_id, role_id, assigned_at)
        VALUES ($1, $2, NOW())
@@ -264,6 +377,7 @@ export class RbacService {
       action: 'ROLE_ASSIGNED_TO_USER',
       entityType: 'USER_ROLE',
       entityId: `${userId}:${roleId}`,
+      newState: { roleCode: targetRoleCode },
       poolOverride: runner,
     });
   }
@@ -275,9 +389,29 @@ export class RbacService {
     userId: string,
     roleId: string,
     actorId?: string,
-    poolOverride?: pg.Pool
+    poolOverride?: pg.Pool,
+    actorIsSuperAdmin?: boolean
   ): Promise<void> {
     const runner = poolOverride || getPool();
+    const roleRes = await runner.query(`SELECT id, code FROM roles WHERE id = $1`, [roleId]);
+    if (roleRes.rows.length === 0) {
+      throw new Error('ROLE_NOT_FOUND: Target role does not exist.');
+    }
+    const targetRoleCode = String(roleRes.rows[0].code).toUpperCase();
+
+    if (actorIsSuperAdmin === false && PROTECTED_ADMIN_ROLE_CODES.has(targetRoleCode)) {
+      await recordAuditEvent({
+        actorId: actorId || 'SYSTEM',
+        actorType: 'ADMIN',
+        action: 'PRIVILEGE_ESCALATION_BLOCKED',
+        entityType: 'USER_ROLE',
+        entityId: `${userId}:${roleId}`,
+        newState: { roleCode: targetRoleCode, reason: 'Only SUPER_ADMIN may revoke privileged admin roles' },
+        poolOverride: runner,
+      });
+      throw new Error(`PRIVILEGE_ESCALATION_DENIED: Only SUPER_ADMIN may remove role '${targetRoleCode}'.`);
+    }
+
     await runner.query(
       `DELETE FROM user_roles WHERE user_id = $1 AND role_id = $2`,
       [userId, roleId]
@@ -289,6 +423,7 @@ export class RbacService {
       action: 'ROLE_REMOVED_FROM_USER',
       entityType: 'USER_ROLE',
       entityId: `${userId}:${roleId}`,
+      newState: { roleCode: targetRoleCode },
       poolOverride: runner,
     });
   }

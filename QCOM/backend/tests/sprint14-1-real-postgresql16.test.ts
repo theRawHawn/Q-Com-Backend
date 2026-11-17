@@ -101,8 +101,10 @@ export async function runSprint14_1RealPostgreSql16Tests(): Promise<void> {
   // ---------------------------------------------------------------------------
   console.log('\n--- Workstream 2: Concurrent Checkout & Row-Level Locking Invariants ---');
 
-  // Get demo merchant and user
-  const merchRes = await realPool.query('SELECT id FROM merchants LIMIT 1');
+  // Get active demo merchant and user
+  const merchRes = await realPool.query(
+    "SELECT id FROM merchants WHERE UPPER(status) = 'ACTIVE' AND is_online = true AND is_paused = false ORDER BY created_at ASC LIMIT 1"
+  );
   const merchantId = merchRes.rows[0].id;
   const userRes = await realPool.query('SELECT id FROM users LIMIT 1');
   const userId = userRes.rows[0].id;
@@ -504,8 +506,16 @@ export async function runSprint14_1RealPostgreSql16Tests(): Promise<void> {
   const sellerInv = await apiCall(`/api/merchants/${merchantId}/inventory`, { token: customerToken });
   assert.ok([200, 403].includes(sellerInv.status), 'Seller tenant authorization enforced');
 
-  // 4. Admin Portal Handshake
-  const adminMe = await apiCall('/api/admin/me', { headers: { 'x-admin-role': 'SUPER_ADMIN' } });
+  // 4. Admin Portal Handshake (JWT authenticated)
+  const adminLogin = await apiCall('/api/auth/admin/login', {
+    method: 'POST',
+    body: {
+      employeeCode: 'EMP-001',
+      password: process.env.SEED_ADMIN_PASSWORD || 'QcomSeedAdmin#2026',
+    },
+  });
+  assert.strictEqual(adminLogin.status, 200);
+  const adminMe = await apiCall('/api/admin/me', { token: adminLogin.data.accessToken });
   assert.strictEqual(adminMe.status, 200);
   assert.strictEqual(adminMe.data.success, true);
   console.log('✓ Admin Portal governance endpoints operational on real PostgreSQL 16.');

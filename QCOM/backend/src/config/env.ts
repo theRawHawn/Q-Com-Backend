@@ -34,7 +34,10 @@ const envSchema = z.object({
 
   // Sprint 2: Centralized Authentication & JWT Security Settings
   JWT_SECRET: z.string().default('qcom_dev_access_secret_2026_super_secure_key'),
-  JWT_ACCESS_SECRET: z.string().default('qcom_dev_access_secret_2026_super_secure_key'),
+  JWT_ACCESS_SECRET: z.preprocess(
+    (val) => val ?? process.env.JWT_SECRET,
+    z.string().default('qcom_dev_access_secret_2026_super_secure_key')
+  ),
   JWT_REFRESH_SECRET: z.string().default('qcom_dev_refresh_secret_2026_super_secure_key'),
   JWT_ISSUER: z.string().default('qcom-auth-engine'),
   JWT_AUDIENCE: z.string().default('qcom-clients'),
@@ -101,6 +104,10 @@ export function validateProductionSecurity(config: EnvConfig): void {
 
     if (!config.JWT_ACCESS_SECRET || defaultDevSecrets.includes(config.JWT_ACCESS_SECRET) || config.JWT_ACCESS_SECRET.length < 32) {
       throw new Error('[Security Exception] Production requires a high-entropy JWT_ACCESS_SECRET of at least 32 characters.');
+    }
+
+    if (process.env.JWT_SECRET && (defaultDevSecrets.includes(config.JWT_SECRET) || config.JWT_SECRET.length < 32)) {
+      throw new Error('[Security Exception] Production JWT_SECRET must be high-entropy and at least 32 characters.');
     }
 
     if (!config.JWT_REFRESH_SECRET || defaultDevSecrets.includes(config.JWT_REFRESH_SECRET) || config.JWT_REFRESH_SECRET.length < 32) {

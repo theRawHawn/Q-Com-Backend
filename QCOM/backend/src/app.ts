@@ -1,7 +1,7 @@
 import express, { Express, Request, Response } from 'express';
 import cors from 'cors';
 import { env } from './config/env.js';
-import { checkDatabaseHealth } from './database/connection.js';
+import { checkDatabaseHealth, getPool } from './database/connection.js';
 import { checkRedisHealth } from './database/redis.js';
 import {
   requestIdMiddleware,
@@ -13,6 +13,7 @@ import {
   notFoundHandler,
   errorHandler,
 } from './middleware/index.js';
+import { catalogSearchRateLimiter } from './middleware/rateLimiter.js';
 import { authRouter, adminAuthRouter } from './routes/authRoutes.js';
 import { rbacRouter } from './routes/rbacRoutes.js';
 import { resourceRouter } from './routes/resourceDemoRoutes.js';
@@ -49,11 +50,11 @@ export function createApp(): Express {
   // 3. CORS configuration
   const allowedOrigins = env.CORS_ALLOWED_ORIGINS === '*'
     ? '*'
-    : env.CORS_ALLOWED_ORIGINS.split(',').map(o => o.trim());
+    : env.CORS_ALLOWED_ORIGINS.split(',').map(o => o.trim()).filter(Boolean);
 
   app.use(cors({
     origin: allowedOrigins,
-    credentials: true,
+    credentials: allowedOrigins !== '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     allowedHeaders: [
       'Content-Type',
@@ -202,6 +203,18 @@ export function createApp(): Express {
   apiRouter.use('/', refundRouter);
   apiRouter.use('/returns', returnRouter);
   apiRouter.use('/refunds', refundRouter);
+
+  // Public storefront catalog read (matches API.md & Customer App; /api/admin/catalog/products remains strictly admin-only)
+  apiRouter.get('/catalog/products', catalogSearchRateLimiter, async (_req: Request, res: Response): Promise<void> => {
+    try {
+      const pool = getPool();
+      const pRes = await pool.query('SELECT * FROM products ORDER BY name ASC LIMIT 100');
+      res.status(200).json({ success: true, products: pRes.rows });
+    } catch {
+      res.status(500).json({ success: false, error: 'CATALOG_FETCH_FAILED', message: 'Failed to fetch catalog products.' });
+    }
+  });
+
   apiRouter.use('/admin', adminCompatibilityRouter);
   apiRouter.use('/', adminCompatibilityRouter);
   apiRouter.use('/partner', partnerCompatibilityRouter);

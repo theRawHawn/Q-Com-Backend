@@ -78,7 +78,7 @@ export class AuthService {
     // 3. Generate and hash OTP with unique per-challenge salt
     const rawOtp = generateNumericOtp(6);
     const challengeSalt = generateSecureToken(16);
-    const otpHash = hashOtp(cleanPhone, rawOtp, purpose);
+    const otpHash = hashOtp(cleanPhone, rawOtp, purpose, challengeSalt);
     const expiresAt = new Date(Date.now() + env.OTP_TTL_MINUTES * 60 * 1000);
     const resendAvailableAt = new Date(Date.now() + env.OTP_RESEND_SECONDS * 1000);
 
@@ -127,78 +127,109 @@ export class AuthService {
     const cleanPhone = phone.trim();
     const cleanOtp = otp.trim();
 
-    // 1. Check for temporary phone lockout (> 5 failed attempts within 15 min)
-    const lockoutWindow = new Date(Date.now() - 15 * 60 * 1000);
-    const failedAttemptsRes = await runner.query(
-      `SELECT SUM(attempt_count) as total_fails FROM otp_challenges 
-       WHERE phone = $1 AND is_consumed = FALSE AND created_at >= $2`,
-      [cleanPhone, lockoutWindow]
-    );
-    if (Number(failedAttemptsRes.rows[0]?.total_fails || 0) >= 10) {
-      throw new Error('This phone number has been temporarily locked out due to multiple failed attempts. Please retry later.');
-    }
+    // Execute lockout check, challenge verification, attempt increment, and consumption atomically under row lock
+    const txOutcome = await transaction(async (txClient) => {
+      // 1. Check for temporary phone lockout (>= 10 failed attempts within 15 min)
+      const lockoutWindow = new Date(Date.now() - 15 * 60 * 1000);
+      const failedAttemptsRes = await txClient.query(
+        `SELECT COALESCE(SUM(attempt_count), 0) as total_fails FROM otp_challenges 
+         WHERE phone = $1 AND is_consumed = FALSE AND created_at >= $2`,
+        [cleanPhone, lockoutWindow]
+      );
+      if (Number(failedAttemptsRes.rows[0]?.total_fails || 0) >= 10) {
+        return {
+          ok: false as const,
+          errorMessage: 'This phone number has been temporarily locked out due to multiple failed attempts. Please retry later.',
+        };
+      }
 
-    // 2. Fetch latest active unconsumed challenge with row locking
-    const challengeRes = await runner.query(
-      `SELECT id, otp_hash, salt, expires_at, attempt_count, max_attempts, is_consumed 
-       FROM otp_challenges 
-       WHERE phone = $1 AND purpose = $2 AND is_consumed = FALSE 
-       ORDER BY created_at DESC LIMIT 1
-       FOR UPDATE`,
-      [cleanPhone, purpose]
-    );
+      // 2. Fetch latest active unconsumed challenge with row locking
+      const challengeRes = await txClient.query(
+        `SELECT id, otp_hash, salt, expires_at, attempt_count, max_attempts, is_consumed 
+         FROM otp_challenges 
+         WHERE phone = $1 AND purpose = $2 AND is_consumed = FALSE 
+         ORDER BY created_at DESC LIMIT 1
+         FOR UPDATE`,
+        [cleanPhone, purpose]
+      );
 
-    if (challengeRes.rows.length === 0) {
-      throw new Error('No active OTP request found. Please request a new OTP.');
-    }
+      if (challengeRes.rows.length === 0) {
+        return {
+          ok: false as const,
+          errorMessage: 'No active OTP request found. Please request a new OTP.',
+        };
+      }
 
-    const challenge = challengeRes.rows[0];
+      const challenge = challengeRes.rows[0];
 
-    // Check expiration
-    if (new Date(challenge.expires_at).getTime() < Date.now()) {
-      throw new Error('OTP has expired. Please request a new OTP.');
-    }
+      // Check expiration
+      if (new Date(challenge.expires_at).getTime() < Date.now()) {
+        return {
+          ok: false as const,
+          errorMessage: 'OTP has expired. Please request a new OTP.',
+        };
+      }
 
-    // Check max attempts on this challenge
-    if (challenge.attempt_count >= challenge.max_attempts) {
-      throw new Error('Maximum verification attempts exceeded for this OTP. Please request a new OTP.');
-    }
+      // Check max attempts on this challenge
+      if (challenge.attempt_count >= challenge.max_attempts) {
+        return {
+          ok: false as const,
+          errorMessage: 'Maximum verification attempts exceeded for this OTP. Please request a new OTP.',
+        };
+      }
 
-    // 3. Verify OTP Hash (supporting default salt and per-challenge salt)
-    let expectedHash = hashOtp(cleanPhone, cleanOtp, purpose);
-    let isMatch = constantTimeCompare(challenge.otp_hash, expectedHash);
-    if (!isMatch && challenge.salt) {
-      expectedHash = hashOtp(cleanPhone, cleanOtp, purpose, challenge.salt);
-      isMatch = constantTimeCompare(challenge.otp_hash, expectedHash);
-    }
+      // 3. Verify OTP Hash (require per-challenge salt when salt exists; fallback only for unsalted legacy rows)
+      const expectedHash = challenge.salt
+        ? hashOtp(cleanPhone, cleanOtp, purpose, challenge.salt)
+        : hashOtp(cleanPhone, cleanOtp, purpose);
+      const isMatch = constantTimeCompare(challenge.otp_hash, expectedHash);
 
-    if (!isMatch) {
-      // Increment attempt count
-      await runner.query(
-        `UPDATE otp_challenges SET attempt_count = attempt_count + 1 WHERE id = $1`,
+      if (!isMatch) {
+        const nextAttempts = Number(challenge.attempt_count) + 1;
+        await txClient.query(
+          `UPDATE otp_challenges SET attempt_count = $1 WHERE id = $2`,
+          [nextAttempts, challenge.id]
+        );
+        return {
+          ok: false as const,
+          auditFailure: {
+            challengeId: challenge.id,
+            attemptCount: nextAttempts,
+          },
+          errorMessage: 'Invalid OTP. Please check the code and try again.',
+        };
+      }
+
+      // 4. Mark challenge as consumed atomically
+      const consumeRes = await txClient.query(
+        `UPDATE otp_challenges SET is_consumed = TRUE, consumed_at = NOW() WHERE id = $1 AND is_consumed = FALSE RETURNING id`,
         [challenge.id]
       );
-      await recordAuditEvent({
-        actorId: cleanPhone,
-        actorType: 'USER',
-        action: 'OTP_VERIFICATION_FAILED',
-        entityType: 'OTP_CHALLENGE',
-        entityId: challenge.id,
-        newState: { attemptCount: challenge.attempt_count + 1 },
-        ipAddress,
-        userAgent,
-        poolOverride: runner,
-      });
-      throw new Error('Invalid OTP. Please check the code and try again.');
-    }
+      if (consumeRes.rows.length === 0) {
+        return {
+          ok: false as const,
+          errorMessage: 'OTP has already been consumed.',
+        };
+      }
 
-    // 4. Mark challenge as consumed atomically
-    const consumeRes = await runner.query(
-      `UPDATE otp_challenges SET is_consumed = TRUE, consumed_at = NOW() WHERE id = $1 AND is_consumed = FALSE RETURNING id`,
-      [challenge.id]
-    );
-    if (consumeRes.rows.length === 0) {
-      throw new Error('OTP has already been consumed.');
+      return { ok: true as const };
+    }, poolOverride);
+
+    if (!txOutcome.ok) {
+      if (txOutcome.auditFailure) {
+        await recordAuditEvent({
+          actorId: cleanPhone,
+          actorType: 'USER',
+          action: 'OTP_VERIFICATION_FAILED',
+          entityType: 'OTP_CHALLENGE',
+          entityId: txOutcome.auditFailure.challengeId,
+          newState: { attemptCount: txOutcome.auditFailure.attemptCount },
+          ipAddress,
+          userAgent,
+          poolOverride: runner,
+        });
+      }
+      throw new Error(txOutcome.errorMessage);
     }
 
     // 5. Look up or create user record
@@ -355,7 +386,7 @@ export class AuthService {
       // 1. SELECT row FOR UPDATE to lock the refresh token record against concurrent races
       const tokenRes = await txClient.query(
         `SELECT rt.id, rt.session_id, rt.user_id, rt.family_id, rt.is_revoked, rt.rotated_at, rt.expires_at,
-                s.status as session_status, u.is_suspended, u.suspension_reason, u.phone, u.email
+                s.status as session_status, s.token_version, u.is_suspended, u.suspension_reason, u.phone, u.email
          FROM refresh_tokens rt
          JOIN auth_sessions s ON s.id = rt.session_id
          JOIN users u ON u.id = rt.user_id
@@ -450,11 +481,11 @@ export class AuthService {
       // 9. Resolve current roles
       const roles = await rbacService.getUserRoles(tokenRecord.user_id, runner);
 
-      // 10. Sign new Access JWT
+      // 10. Sign new Access JWT preserving session token_version
       const accessToken = signAccessToken({
         sub: tokenRecord.user_id,
         session_id: tokenRecord.session_id,
-        token_version: 1,
+        token_version: Number(tokenRecord.token_version || 1),
         roles,
         phone: tokenRecord.phone,
         email: tokenRecord.email,
@@ -592,90 +623,169 @@ export class AuthService {
     poolOverride?: pg.Pool
   ): Promise<AuthResult> {
     const runner = poolOverride || getPool();
-    const cleanCode = employeeCode.trim().toUpperCase();
+    const cleanCode = (employeeCode || '').trim().toUpperCase();
 
-    // Look up or seed admin user
-    let userRes = await runner.query(
+    if (!cleanCode || !/^[A-Z0-9_-]{3,32}$/.test(cleanCode)) {
+      await recordAuditEvent({
+        actorId: cleanCode || 'UNKNOWN',
+        actorType: 'ADMIN',
+        action: 'ADMIN_LOGIN_FAILED',
+        entityType: 'USER',
+        entityId: cleanCode || 'UNKNOWN',
+        newState: { reason: 'INVALID_EMPLOYEE_CODE_FORMAT' },
+        ipAddress,
+        userAgent,
+        poolOverride: runner,
+      });
+      throw new Error('Invalid employee code or credentials.');
+    }
+
+    if (!pinOrPassword || typeof pinOrPassword !== 'string' || pinOrPassword.trim().length === 0) {
+      await recordAuditEvent({
+        actorId: cleanCode,
+        actorType: 'ADMIN',
+        action: 'ADMIN_LOGIN_FAILED',
+        entityType: 'USER',
+        entityId: cleanCode,
+        newState: { reason: 'MISSING_PASSWORD' },
+        ipAddress,
+        userAgent,
+        poolOverride: runner,
+      });
+      throw new Error('Password is required for administrative authentication.');
+    }
+
+    // Exact email lookup only — never auto-provision admin users or use ILIKE wildcard matching
+    const adminEmail = `${cleanCode.toLowerCase()}@qcom.local`;
+    const userRes = await runner.query(
       `SELECT u.id, u.phone, u.name, u.email, u.is_suspended, u.suspension_reason,
               u.password_hash, u.failed_password_attempts, u.password_locked_until
        FROM users u
-       WHERE u.email = $1 OR u.name ILIKE $2`,
-      [`${cleanCode.toLowerCase()}@qcom.local`, `%${cleanCode}%`]
+       WHERE LOWER(u.email) = $1
+       LIMIT 1`,
+      [adminEmail]
     );
 
-    let user: any;
+    const dummyHash = hashPassword('DummyConstantWork#2026').formatted;
+
     if (userRes.rows.length === 0) {
-      // Create admin user record if not present with distinct phone
-      const num = cleanCode.replace(/\D/g, '') || '1';
-      const adminPhone = `+91-88888${num.padStart(5, '0')}`;
+      verifyPassword(pinOrPassword, dummyHash);
+      await recordAuditEvent({
+        actorId: cleanCode,
+        actorType: 'ADMIN',
+        action: 'ADMIN_LOGIN_FAILED',
+        entityType: 'USER',
+        entityId: cleanCode,
+        newState: { reason: 'ACCOUNT_NOT_FOUND' },
+        ipAddress,
+        userAgent,
+        poolOverride: runner,
+      });
+      throw new Error('Invalid administrative credentials.');
+    }
 
-      const createRes = await runner.query(
-        `INSERT INTO users (phone, name, email, is_phone_verified, account_type, created_at, updated_at)
-         VALUES ($1, $2, $3, TRUE, 'business', NOW(), NOW())
-         ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name
-         RETURNING id, phone, name, email, is_suspended, suspension_reason, password_hash, failed_password_attempts, password_locked_until`,
-        [adminPhone, `Admin ${cleanCode}`, `${cleanCode.toLowerCase()}@qcom.local`]
-      );
-      user = createRes.rows[0];
+    const user = userRes.rows[0];
+    const roles = await rbacService.getUserRoles(user.id, runner);
+    const hasAdminRole = roles.some((r) =>
+      ['SUPER_ADMIN', 'ADMIN', 'OPERATIONS', 'FINANCE_ADMIN', 'DISPATCHER', 'MARKETING_ADMIN'].includes(r)
+    );
 
-      // Assign SUPER_ADMIN role if emp-000/001 else OPERATIONS
-      const roleCode = cleanCode === 'EMP-000' || cleanCode === 'EMP-001' ? 'SUPER_ADMIN' : 'OPERATIONS';
-      const roleRes = await runner.query(`SELECT id FROM roles WHERE code = $1`, [roleCode]);
-      if (roleRes.rows.length > 0) {
-        await runner.query(
-          `INSERT INTO user_roles (user_id, role_id, assigned_at) VALUES ($1, $2, NOW()) ON CONFLICT (user_id, role_id) DO NOTHING`,
-          [user.id, roleRes.rows[0].id]
-        );
-      }
-    } else {
-      user = userRes.rows[0];
+    if (!hasAdminRole || !user.password_hash) {
+      verifyPassword(pinOrPassword, dummyHash);
+      await recordAuditEvent({
+        actorId: user.id,
+        actorType: 'ADMIN',
+        action: 'ADMIN_LOGIN_FAILED',
+        entityType: 'USER',
+        entityId: user.id,
+        newState: { employeeCode: cleanCode, reason: !hasAdminRole ? 'MISSING_ADMIN_ROLE' : 'PASSWORD_NOT_CONFIGURED' },
+        ipAddress,
+        userAgent,
+        poolOverride: runner,
+      });
+      throw new Error('Invalid administrative credentials.');
     }
 
     if (user.is_suspended) {
-      throw new Error(`Admin account suspended: ${user.suspension_reason}`);
+      await recordAuditEvent({
+        actorId: user.id,
+        actorType: 'ADMIN',
+        action: 'ADMIN_LOGIN_FAILED',
+        entityType: 'USER',
+        entityId: user.id,
+        newState: { employeeCode: cleanCode, reason: 'ACCOUNT_SUSPENDED' },
+        ipAddress,
+        userAgent,
+        poolOverride: runner,
+      });
+      throw new Error(`Admin account suspended: ${user.suspension_reason || 'Access denied.'}`);
     }
 
     // Check account lockout
     if (user.password_locked_until && new Date(user.password_locked_until).getTime() > Date.now()) {
       const waitMinutes = Math.ceil((new Date(user.password_locked_until).getTime() - Date.now()) / 60000);
+      await recordAuditEvent({
+        actorId: user.id,
+        actorType: 'ADMIN',
+        action: 'ADMIN_LOGIN_FAILED',
+        entityType: 'USER',
+        entityId: user.id,
+        newState: { employeeCode: cleanCode, reason: 'ACCOUNT_LOCKED' },
+        ipAddress,
+        userAgent,
+        poolOverride: runner,
+      });
       throw new Error(`Admin account temporarily locked due to repeated failed attempts. Please retry in ${waitMinutes} minutes.`);
     }
 
-    // If account has password_hash configured, verify credentials
-    if (user.password_hash) {
-      if (!pinOrPassword) {
-        throw new Error('Password or PIN is required for this administrative account.');
-      }
-      const passResult = verifyPassword(pinOrPassword, user.password_hash);
-      if (!passResult.verified) {
-        const newFails = (Number(user.failed_password_attempts) || 0) + 1;
-        const lockUntil = newFails >= 5 ? new Date(Date.now() + 15 * 60 * 1000) : null;
-        await runner.query(
-          `UPDATE users SET failed_password_attempts = $1, password_locked_until = $2 WHERE id = $3`,
-          [newFails, lockUntil, user.id]
-        );
-        throw new Error('Invalid credentials: Password or PIN verification failed.');
-      }
-
-      // Reset failed attempts on success
-      if ((Number(user.failed_password_attempts) || 0) > 0 || user.password_locked_until) {
-        await runner.query(
-          `UPDATE users SET failed_password_attempts = 0, password_locked_until = NULL WHERE id = $1`,
-          [user.id]
-        );
-      }
-
-      // Opportunistic rehashing if legacy format detected
-      if (passResult.needsRehash) {
-        const scryptHash = hashPassword(pinOrPassword);
-        await runner.query(
-          `UPDATE users SET password_hash = $1, password_updated_at = NOW() WHERE id = $2`,
-          [scryptHash.formatted, user.id]
-        );
-      }
+    // Strictly verify credential hash
+    const passResult = verifyPassword(pinOrPassword, user.password_hash);
+    if (!passResult.verified) {
+      const failUpdate = await runner.query(
+        `UPDATE users
+            SET failed_password_attempts = COALESCE(failed_password_attempts, 0) + 1,
+                password_locked_until = CASE
+                  WHEN COALESCE(failed_password_attempts, 0) + 1 >= 5 THEN NOW() + INTERVAL '15 minutes'
+                  ELSE password_locked_until
+                END
+          WHERE id = $1
+          RETURNING failed_password_attempts, password_locked_until`,
+        [user.id]
+      );
+      const newFails = Number(failUpdate.rows[0]?.failed_password_attempts || 1);
+      const lockUntil = failUpdate.rows[0]?.password_locked_until
+        ? new Date(failUpdate.rows[0].password_locked_until)
+        : null;
+      await recordAuditEvent({
+        actorId: user.id,
+        actorType: 'ADMIN',
+        action: 'ADMIN_LOGIN_FAILED',
+        entityType: 'USER',
+        entityId: user.id,
+        newState: { employeeCode: cleanCode, failedAttempts: newFails, lockedUntil: lockUntil?.toISOString() || null },
+        ipAddress,
+        userAgent,
+        poolOverride: runner,
+      });
+      throw new Error('Invalid credentials: Password or PIN verification failed.');
     }
 
-    const roles = await rbacService.getUserRoles(user.id, runner);
+    // Reset failed attempts on success
+    if ((Number(user.failed_password_attempts) || 0) > 0 || user.password_locked_until) {
+      await runner.query(
+        `UPDATE users SET failed_password_attempts = 0, password_locked_until = NULL WHERE id = $1`,
+        [user.id]
+      );
+    }
+
+    // Opportunistic rehashing if legacy format detected
+    if (passResult.needsRehash) {
+      const scryptHash = hashPassword(pinOrPassword);
+      await runner.query(
+        `UPDATE users SET password_hash = $1, password_updated_at = NOW() WHERE id = $2`,
+        [scryptHash.formatted, user.id]
+      );
+    }
 
     // Create session
     const sessionExpiresAt = new Date(Date.now() + env.ADMIN_SESSION_TTL_HOURS * 60 * 60 * 1000);
@@ -767,11 +877,16 @@ export class AuthService {
       throw new Error('Current password is incorrect.');
     }
 
-    // Invalidate all active sessions for this user across instances
+    // Invalidate all active sessions and refresh tokens for this user across instances
     await runner.query(
       `UPDATE auth_sessions SET status = 'REVOKED', revoked_at = NOW() WHERE user_id = $1 AND status = 'ACTIVE'`,
       [userId]
     );
+    await runner.query(
+      `UPDATE refresh_tokens SET is_revoked = TRUE, revoked_at = NOW() WHERE user_id = $1 AND is_revoked = FALSE`,
+      [userId]
+    );
+    realtimeGateway.handleUserLogoutAll(userId);
 
     await recordAuditEvent({
       actorId: userId,
