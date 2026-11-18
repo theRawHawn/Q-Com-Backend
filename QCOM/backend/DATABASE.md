@@ -2,7 +2,7 @@
 
 **Engine Requirement:** PostgreSQL 16+  
 **Migration Tool:** Custom Idempotent Advisory-Locked Migrator (`scripts/migrate.ts`)  
-**Migrations Applied:** 001 through 026 (Verified & Tested)  
+**Migrations Applied:** 001 through 027 (Verified & Tested)  
 
 ---
 
@@ -36,6 +36,7 @@
 | **024** | `024_add_password_hash_and_otp_salt.sql`| `salt` on `otp_challenges`; `password_hash`, `password_updated_at`, `failed_password_attempts`, `password_locked_until` on `users` |
 | **025** | `025_add_outbox_worker_leases.sql` | Durable outbox relay leases across workers |
 | **026** | `026_sprint15_2_capacity_indexes_and_concurrency.sql` | Hot-path indexes and capacity concurrency optimizations |
+| **027** | `027_sprint15_5_financial_ledger_settlement_integrity.sql` | `ledger_journal_batches` atomic claim registry, FIFO `settled_amount` & `refunded_amount` on `order_settlement_allocations`, `seq_no` triggers on `seller_ledgers`/`rider_ledgers`, `REVERSED` status on `seller_payouts`, append-only `UPDATE`/`DELETE`/`TRUNCATE` triggers (`LEDGER_IMMUTABLE`), and `PUBLIC` mutation revocations |
 
 ---
 
@@ -54,4 +55,6 @@
    Migrations use a serialized advisory lock (`SELECT pg_advisory_lock(42424242)`) to ensure multiple backend instances starting concurrently do not run race-conditioned migrations.
 5. **Security & Suspension Schema:**  
    User suspension state is stored authoritatively on `users.is_suspended` / `users.suspension_reason`, session versioning on `auth_sessions.token_version`, return requests on `order_returns`, and refund records on `refunds`.
+6. **Append-Only Ledger Immutability & Deterministic Ordering:**  
+   PostgreSQL triggers (`fn_prevent_gl_mutation` on `general_ledger_entries`/`ledger_journal_batches`, `fn_prevent_subledger_mutation` on `seller_ledgers`/`rider_ledgers`, and `fn_prevent_ledger_truncate` on all four tables) block historical `UPDATE`, `DELETE`, and `TRUNCATE` mutations with `LEDGER_IMMUTABLE`, reinforced by `REVOKE UPDATE, DELETE, TRUNCATE ... FROM PUBLIC`. Monotonic `seq_no` triggers guarantee deterministic balance snapshot reads even under identical millisecond timestamps. *(Security boundary: while triggers fire for normal SQL sessions, PostgreSQL database owners and superusers technically retain DDL/trigger-disable privileges, so production deployments must connect using a dedicated `NOSUPERUSER` non-owner application role.)*
 

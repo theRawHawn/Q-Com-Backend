@@ -67,7 +67,7 @@ If the active Redis server does not report exact `redis_version:7.0.15`, `verify
 
 ### Database Migrations & Seeds
 
-1. Run schema migrations (`001`–`026`):
+1. Run schema migrations (`001`–`027`):
    ```bash
    npm --prefix QCOM/backend run db:migrate
    ```

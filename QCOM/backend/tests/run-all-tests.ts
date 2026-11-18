@@ -55,11 +55,12 @@ import { runSprint15_2_3RealPg16Redis7InfrastructureTests } from './sprint15-2-3
 import { runSprint15_2_4InventoryAndFinancialIntegrityTests } from './sprint15-2-4-inventory-lifecycle-and-financial-integrity.test.js';
 import { runSprint15_2_5GitSyncAndFinancialIntegrityTests } from './sprint15-2-5-git-sync-and-financial-integrity-closure.test.js';
 import { runSprint15_4SecurityAndAccessControlHardeningTests } from './sprint15-4-security-and-access-control-hardening.test.js';
+import { runSprint15_5FinancialLedgerSettlementIntegrityTests } from './sprint15-5-financial-ledger-settlement-integrity.test.js';
 import { verifyRedisExactVersion } from '../scripts/verify-redis-version.js';
 
 async function runAllTests() {
   console.log('===========================================================');
-  console.log('  QCOM Unified Backend Engine — Automated Test Suite (Sprint 1–15.4)');
+  console.log('  QCOM Unified Backend Engine — Automated Test Suite (Sprint 1–15.5)');
   console.log('===========================================================');
   const start = Date.now();
   try {
@@ -195,6 +196,9 @@ async function runAllTests() {
 
     // Sprint 15.4 Production-Grade Security & Access-Control Hardening Tests
     await runSprint15_4SecurityAndAccessControlHardeningTests();
+
+    // Sprint 15.5 Financial Ledger & Settlement Integrity Tests
+    await runSprint15_5FinancialLedgerSettlementIntegrityTests();
 
     const duration = ((Date.now() - start) / 1000).toFixed(2);
     console.log('\n===========================================================');

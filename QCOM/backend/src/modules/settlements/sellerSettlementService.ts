@@ -1,11 +1,93 @@
 import crypto from 'crypto';
 import pg from 'pg';
+import BigNumber from 'bignumber.js';
 import { getPool, transaction } from '../../database/connection.js';
 import { ledgerService } from '../ledger/ledgerService.js';
 import { getPayoutProvider, PayoutProvider, PayoutDisbursementResult } from './payoutProvider.js';
-import { SellerSettlementStatement, PayoutResult, validateSellerSettlementTransition } from './settlementTypes.js';
+import { SellerSettlementStatement, PayoutResult } from './settlementTypes.js';
 import { settlementEventPublisher, SettlementDomainEvent } from './settlementEvents.js';
 import { isTransientFailure } from '../resilience/retryPolicy.js';
+import {
+  add,
+  divide,
+  max,
+  min,
+  multiply,
+  roundCurrency,
+  subtract,
+  toDecimal,
+} from '../pricing/money.js';
+
+export async function applyPayoutToAllocationsFIFO(
+  client: pg.PoolClient,
+  merchantId: string,
+  payoutAmount: number
+): Promise<void> {
+  const openRes = await client.query(`
+    SELECT id, net_seller_payable, COALESCE(settled_amount, 0) AS settled_amount, COALESCE(refunded_amount, 0) AS refunded_amount
+    FROM order_settlement_allocations
+    WHERE merchant_id = $1 AND status = 'ALLOCATED'
+    ORDER BY allocated_at ASC, id ASC
+    FOR UPDATE
+  `, [merchantId]);
+
+  let remainingBn = toDecimal(roundCurrency(payoutAmount));
+  for (const row of openRes.rows) {
+    if (remainingBn.lte('0.001')) break;
+    const netPayableBn = toDecimal(row.net_seller_payable);
+    const settledSoFarBn = toDecimal(row.settled_amount || '0');
+    const refundedSoFarBn = toDecimal(row.refunded_amount || '0');
+    const openPortionBn = BigNumber.max(0, netPayableBn.minus(settledSoFarBn).minus(refundedSoFarBn));
+    if (openPortionBn.lte('0.001')) {
+      await client.query(
+        `UPDATE order_settlement_allocations SET status = 'SETTLED' WHERE id = $1`,
+        [row.id]
+      );
+      continue;
+    }
+    const appliedBn = toDecimal(roundCurrency(min(remainingBn, openPortionBn)));
+    const newSettledBn = toDecimal(roundCurrency(add(settledSoFarBn, appliedBn)));
+    const fullySettled = newSettledBn.plus(refundedSoFarBn).gte(netPayableBn.minus('0.01'));
+    await client.query(`
+      UPDATE order_settlement_allocations
+      SET settled_amount = $1,
+          status = CASE WHEN $2 THEN 'SETTLED' ELSE status END
+      WHERE id = $3
+    `, [Number(roundCurrency(newSettledBn)), fullySettled, row.id]);
+    remainingBn = remainingBn.minus(appliedBn);
+  }
+}
+
+export async function revertAllocationsFIFOForReversal(
+  client: pg.PoolClient,
+  merchantId: string,
+  reversedAmount: number
+): Promise<void> {
+  const settledRes = await client.query(`
+    SELECT id, net_seller_payable, COALESCE(settled_amount, 0) AS settled_amount, status
+    FROM order_settlement_allocations
+    WHERE merchant_id = $1 AND (status = 'SETTLED' OR COALESCE(settled_amount, 0) > 0)
+    ORDER BY allocated_at DESC, id DESC
+    FOR UPDATE
+  `, [merchantId]);
+
+  let remainingBn = toDecimal(roundCurrency(reversedAmount));
+  for (const row of settledRes.rows) {
+    if (remainingBn.lte('0.001')) break;
+    const settledSoFarBn = toDecimal(row.settled_amount || '0');
+    const revertableBn = settledSoFarBn.gt(0) ? settledSoFarBn : toDecimal(row.net_seller_payable);
+    if (revertableBn.lte(0)) continue;
+    const revertedBn = toDecimal(roundCurrency(min(remainingBn, revertableBn)));
+    const newSettledBn = BigNumber.max(0, revertableBn.minus(revertedBn));
+    await client.query(`
+      UPDATE order_settlement_allocations
+      SET settled_amount = $1,
+          status = CASE WHEN status = 'SETTLED' THEN 'ALLOCATED' ELSE status END
+      WHERE id = $2
+    `, [Number(roundCurrency(newSettledBn)), row.id]);
+    remainingBn = remainingBn.minus(revertedBn);
+  }
+}
 
 export class AsyncKeyedMutex {
   private queues = new Map<string, Promise<void>>();
@@ -66,40 +148,44 @@ export class SellerSettlementService {
       ORDER BY a.allocated_at DESC
     `, [merchantId]);
 
-    let totalGrossGmv = 0;
-    let totalCommission = 0;
-    let totalCommissionGst = 0;
-    let totalGstTcs = 0;
-    let totalSellerTds = 0;
-    let totalPenalties = 0;
-    let totalNetPayable = 0;
+    let totalGrossGmvBn = new BigNumber(0);
+    let totalCommissionBn = new BigNumber(0);
+    let totalCommissionGstBn = new BigNumber(0);
+    let totalGstTcsBn = new BigNumber(0);
+    let totalSellerTdsBn = new BigNumber(0);
+    let totalPenaltiesBn = new BigNumber(0);
+    let totalNetPayableBn = new BigNumber(0);
 
     const orders = allocRes.rows.map((r) => {
-      const gmv = parseFloat(r.gross_gmv);
-      const comm = parseFloat(r.platform_commission);
-      const commGst = parseFloat(r.commission_gst);
-      const tcs = parseFloat(r.gst_tcs_amount);
-      const tds = parseFloat(r.seller_tds_amount);
-      const pen = parseFloat(r.store_delay_penalty);
-      const net = parseFloat(r.net_seller_payable);
+      const gmvBn = toDecimal(r.gross_gmv);
+      const commBn = toDecimal(r.platform_commission);
+      const commGstBn = toDecimal(r.commission_gst);
+      const tcsBn = toDecimal(r.gst_tcs_amount);
+      const tdsBn = toDecimal(r.seller_tds_amount);
+      const penBn = toDecimal(r.store_delay_penalty);
+      const netBn = toDecimal(r.net_seller_payable);
+      const refundedNetBn = toDecimal(r.refunded_amount || '0');
 
-      totalGrossGmv += gmv;
-      totalCommission += comm;
-      totalCommissionGst += commGst;
-      totalGstTcs += tcs;
-      totalSellerTds += tds;
-      totalPenalties += pen;
-      totalNetPayable += net;
+      if (r.status !== 'REVERSED') {
+        const activeNetBn = BigNumber.max(0, netBn.minus(refundedNetBn));
+        totalGrossGmvBn = totalGrossGmvBn.plus(gmvBn);
+        totalCommissionBn = totalCommissionBn.plus(commBn);
+        totalCommissionGstBn = totalCommissionGstBn.plus(commGstBn);
+        totalGstTcsBn = totalGstTcsBn.plus(tcsBn);
+        totalSellerTdsBn = totalSellerTdsBn.plus(tdsBn);
+        totalPenaltiesBn = totalPenaltiesBn.plus(penBn);
+        totalNetPayableBn = totalNetPayableBn.plus(activeNetBn);
+      }
 
       return {
         orderId: r.order_id,
         orderNumber: r.order_number,
         orderDate: r.order_created_at.toISOString(),
-        grossGmv: gmv,
-        commission: +(comm + commGst).toFixed(2),
-        gstTcs: tcs,
-        tds,
-        netPayable: net,
+        grossGmv: Number(roundCurrency(gmvBn)),
+        commission: Number(roundCurrency(add(commBn, commGstBn))),
+        gstTcs: Number(roundCurrency(tcsBn)),
+        tds: Number(roundCurrency(tdsBn)),
+        netPayable: Number(roundCurrency(netBn)),
       };
     });
 
@@ -110,8 +196,18 @@ export class SellerSettlementService {
       WHERE merchant_id = $1 AND status = 'PAID'
     `, [merchantId]);
 
-    const settledAmount = parseFloat(payoutRes.rows[0].total_settled);
-    const outstandingBalance = +(totalNetPayable - settledAmount).toFixed(2);
+    const settledAmountBn = toDecimal(payoutRes.rows[0].total_settled);
+
+    // Authoritative withdrawable balance from seller_ledgers (incorporates reservations, reversals, and clawbacks)
+    const ledgerBalRes = await pool.query(`
+      SELECT running_balance FROM seller_ledgers
+      WHERE merchant_id = $1
+      ORDER BY created_at DESC, seq_no DESC
+      LIMIT 1
+    `, [merchantId]);
+    const outstandingBalance = ledgerBalRes.rows.length > 0
+      ? Number(roundCurrency(BigNumber.max(0, toDecimal(ledgerBalRes.rows[0].running_balance))))
+      : Number(roundCurrency(BigNumber.max(0, totalNetPayableBn.minus(settledAmountBn))));
 
     return {
       merchantId: m.id,
@@ -127,22 +223,19 @@ export class SellerSettlementService {
         bankName: m.bank_name || undefined,
         verified: !!m.bank_verified,
       },
-      totalGrossGmv: +totalGrossGmv.toFixed(2),
-      totalCommission: +totalCommission.toFixed(2),
-      totalCommissionGst: +totalCommissionGst.toFixed(2),
-      totalGstTcs: +totalGstTcs.toFixed(2),
-      totalSellerTds: +totalSellerTds.toFixed(2),
-      totalPenalties: +totalPenalties.toFixed(2),
-      totalNetPayable: +totalNetPayable.toFixed(2),
-      settledAmount: +settledAmount.toFixed(2),
-      outstandingBalance: Math.max(0, outstandingBalance),
+      totalGrossGmv: Number(roundCurrency(totalGrossGmvBn)),
+      totalCommission: Number(roundCurrency(totalCommissionBn)),
+      totalCommissionGst: Number(roundCurrency(totalCommissionGstBn)),
+      totalGstTcs: Number(roundCurrency(totalGstTcsBn)),
+      totalSellerTds: Number(roundCurrency(totalSellerTdsBn)),
+      totalPenalties: Number(roundCurrency(totalPenaltiesBn)),
+      totalNetPayable: Number(roundCurrency(totalNetPayableBn)),
+      settledAmount: Number(roundCurrency(settledAmountBn)),
+      outstandingBalance,
       orders,
     };
   }
 
-  /**
-   * Executes authoritative seller payout with idempotency, row locking, and double-entry ledger posting
-   */
   /**
    * Executes payout disbursement to merchant bank account.
    * Decoupled into 3 distinct phases:
@@ -157,6 +250,20 @@ export class SellerSettlementService {
   }): Promise<PayoutResult> {
     const { merchantId, amount, idempotencyKey } = params;
 
+    let validatedRequestedAmount: number | undefined;
+    if (amount !== undefined) {
+      let bn;
+      try {
+        bn = toDecimal(amount);
+      } catch {
+        throw new Error('INVALID_PAYOUT_AMOUNT: Payout amount must be a valid finite number.');
+      }
+      if (bn.lte(0)) {
+        throw new Error('INVALID_PAYOUT_AMOUNT: Payout amount must be greater than zero.');
+      }
+      validatedRequestedAmount = Number(roundCurrency(bn));
+    }
+
     // -----------------------------------------------------------------
     // STEP 0: Fast Idempotency Check
     // -----------------------------------------------------------------
@@ -170,6 +277,19 @@ export class SellerSettlementService {
 
       if (existingPayoutRes.rows.length > 0) {
         const row = existingPayoutRes.rows[0];
+        if (row.merchant_id !== merchantId) {
+          throw new Error(
+            `IDEMPOTENCY_KEY_CONFLICT: Idempotency key '${idempotencyKey}' already belongs to a different merchant.`
+          );
+        }
+        if (
+          validatedRequestedAmount !== undefined &&
+          !toDecimal(row.amount).eq(toDecimal(validatedRequestedAmount))
+        ) {
+          throw new Error(
+            `IDEMPOTENCY_KEY_CONFLICT: Idempotency key '${idempotencyKey}' was previously used for amount ₹${roundCurrency(row.amount)}, cannot reuse for ₹${roundCurrency(validatedRequestedAmount)}.`
+          );
+        }
         return {
           payoutId: row.id,
           payoutReference: row.payout_reference,
@@ -206,13 +326,27 @@ export class SellerSettlementService {
         `, [idempotencyKey]);
 
         if (existingPayoutRes.rows.length > 0) {
+          const existingRow = existingPayoutRes.rows[0];
+          if (existingRow.merchant_id !== merchantId) {
+            throw new Error(
+              `IDEMPOTENCY_KEY_CONFLICT: Idempotency key '${idempotencyKey}' already belongs to a different merchant.`
+            );
+          }
+          if (
+            validatedRequestedAmount !== undefined &&
+            !toDecimal(existingRow.amount).eq(toDecimal(validatedRequestedAmount))
+          ) {
+            throw new Error(
+              `IDEMPOTENCY_KEY_CONFLICT: Idempotency key '${idempotencyKey}' was previously used for amount ₹${roundCurrency(existingRow.amount)}, cannot reuse for ₹${roundCurrency(validatedRequestedAmount)}.`
+            );
+          }
           return {
-            payoutId: existingPayoutRes.rows[0].id,
-            payoutReference: existingPayoutRes.rows[0].payout_reference,
-            payoutAmount: parseFloat(existingPayoutRes.rows[0].amount),
+            payoutId: existingRow.id,
+            payoutReference: existingRow.payout_reference,
+            payoutAmount: parseFloat(existingRow.amount),
             merchant: null,
             isDuplicate: true,
-            existingRow: existingPayoutRes.rows[0],
+            existingRow,
           };
         }
       }
@@ -235,32 +369,38 @@ export class SellerSettlementService {
         throw new Error('MISSING_BANK_DETAILS: Merchant does not have bank account details configured for payout.');
       }
 
-      // Calculate available unsettled balance
+      // Calculate available unsettled balance deterministically
       const ledgerBalRes = await client.query(`
         SELECT running_balance FROM seller_ledgers
         WHERE merchant_id = $1
-        ORDER BY created_at DESC
+        ORDER BY created_at DESC, seq_no DESC
         LIMIT 1
       `, [merchantId]);
 
-      const availableBalance = ledgerBalRes.rows.length > 0 ? parseFloat(ledgerBalRes.rows[0].running_balance) : 0.00;
+      const availableBalanceBn = ledgerBalRes.rows.length > 0
+        ? toDecimal(ledgerBalRes.rows[0].running_balance)
+        : new BigNumber(0);
+      const availableBalance = Number(roundCurrency(availableBalanceBn));
 
-      if (availableBalance <= 0) {
+      if (availableBalanceBn.lte(0)) {
         throw new Error('ZERO_PAYABLE_BALANCE: Merchant has zero unsettled payable balance.');
       }
 
-      const payoutAmount = amount !== undefined ? amount : availableBalance;
-      if (payoutAmount > availableBalance) {
+      const payoutAmountBn = validatedRequestedAmount !== undefined
+        ? toDecimal(validatedRequestedAmount)
+        : availableBalanceBn;
+      const payoutAmount = Number(roundCurrency(payoutAmountBn));
+      if (payoutAmountBn.gt(availableBalanceBn)) {
         throw new Error(`INSUFFICIENT_BALANCE: Requested payout amount ₹${payoutAmount} exceeds available balance ₹${availableBalance}`);
       }
-      if (payoutAmount <= 0) {
+      if (payoutAmountBn.lte(0)) {
         throw new Error('INVALID_PAYOUT_AMOUNT: Payout amount must be greater than zero.');
       }
 
       const payoutReference = `PAYOUT_SELLER_${Date.now()}_${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 
-      // Reserve funds in seller_ledgers immediately to block concurrent double-spend
-      const updatedBalance = +(availableBalance - payoutAmount).toFixed(2);
+      // Reserve funds in seller_ledgers immediately to block concurrent double-spend (append-only)
+      const updatedBalance = Number(roundCurrency(availableBalanceBn.minus(payoutAmountBn)));
       await client.query(`
         INSERT INTO seller_ledgers (
           merchant_id, entry_type, category, amount, running_balance, description
@@ -366,7 +506,7 @@ export class SellerSettlementService {
       `, [payoutId]);
 
       const payoutRow = lockRes.rows[0];
-      if (payoutRow.status === 'PAID') {
+      if (payoutRow.status === 'PAID' || payoutRow.status === 'FAILED' || payoutRow.status === 'REVERSED') {
         return {
           payoutId: payoutRow.id,
           payoutReference: payoutRow.payout_reference,
@@ -375,6 +515,7 @@ export class SellerSettlementService {
           status: payoutRow.status,
           utrNumber: payoutRow.utr_number || undefined,
           journalBatchId: payoutRow.journal_batch_id || undefined,
+          failureReason: payoutRow.failure_reason || undefined,
           isDuplicate: false,
         };
       }
@@ -389,20 +530,7 @@ export class SellerSettlementService {
           client,
         });
 
-        // 2. Update seller_ledgers description with confirmed UTR
-        await client.query(`
-          UPDATE seller_ledgers
-          SET utr_number = $1,
-              description = $2
-          WHERE merchant_id = $3 AND description = $4
-        `, [
-          providerRes.utrNumber,
-          `Bank payout disbursement settled (Ref: ${payoutReference}, UTR: ${providerRes.utrNumber})`,
-          merchantId,
-          `Bank payout disbursement reserved (Ref: ${payoutReference})`,
-        ]);
-
-        // 3. Mark payout as PAID
+        // 2. Mark payout as PAID (UTR tracked on seller_payouts & GL; seller_ledgers remains strictly append-only)
         await client.query(`
           UPDATE seller_payouts
           SET status = 'PAID',
@@ -416,12 +544,8 @@ export class SellerSettlementService {
           WHERE id = $4
         `, [providerRes.utrNumber, providerRes.providerPayoutId, journalBatchId, payoutId]);
 
-        // 4. Update allocated orders to SETTLED
-        await client.query(`
-          UPDATE order_settlement_allocations
-          SET status = 'SETTLED'
-          WHERE merchant_id = $1 AND status = 'ALLOCATED'
-        `, [merchantId]);
+        // 3. FIFO settle open allocations up to payoutAmount
+        await applyPayoutToAllocationsFIFO(client, merchantId, payoutAmount);
 
         stagedEvents.push(
           settlementEventPublisher.createEvent('SellerPayoutCompleted', {
@@ -466,7 +590,7 @@ export class SellerSettlementService {
           isDuplicate: false,
         };
       } else {
-        // Conclusive failure: lock merchant first (F-10.1A-04 fix), mark FAILED, and restore merchant balance
+        // Conclusive failure: lock merchant first, mark FAILED, and restore merchant balance via append-only CREDIT
         await client.query(`
           SELECT id FROM merchants WHERE id = $1 FOR UPDATE
         `, [merchantId]);
@@ -484,12 +608,14 @@ export class SellerSettlementService {
         const curBalRes = await client.query(`
           SELECT running_balance FROM seller_ledgers
           WHERE merchant_id = $1
-          ORDER BY created_at DESC
+          ORDER BY created_at DESC, seq_no DESC
           LIMIT 1
         `, [merchantId]);
 
-        const currentRunning = curBalRes.rows.length > 0 ? parseFloat(curBalRes.rows[0].running_balance) : 0;
-        const restoredRunning = +(currentRunning + payoutAmount).toFixed(2);
+        const currentRunningBn = curBalRes.rows.length > 0
+          ? toDecimal(curBalRes.rows[0].running_balance)
+          : new BigNumber(0);
+        const restoredRunning = Number(roundCurrency(currentRunningBn.plus(toDecimal(payoutAmount))));
 
         await client.query(`
           INSERT INTO seller_ledgers (
@@ -541,7 +667,7 @@ export class SellerSettlementService {
     }
 
     const payout = lockRes.rows[0];
-    if (payout.status === 'PAID' || payout.status === 'FAILED') {
+    if (payout.status === 'PAID' || payout.status === 'FAILED' || payout.status === 'REVERSED') {
       return {
         payoutId: payout.id,
         payoutReference: payout.payout_reference,
@@ -608,7 +734,7 @@ export class SellerSettlementService {
       }
 
       const curPayout = rowCheck.rows[0];
-      if (curPayout.status === 'PAID' || curPayout.status === 'FAILED') {
+      if (curPayout.status === 'PAID' || curPayout.status === 'FAILED' || curPayout.status === 'REVERSED') {
         return {
           payoutId: curPayout.id,
           payoutReference: curPayout.payout_reference,
@@ -621,8 +747,7 @@ export class SellerSettlementService {
         };
       }
 
-      // Stale-worker fencing check: If an expected lease owner was specified, verify that the lease
-      // hasn't expired and been claimed by another active worker.
+      // Stale-worker fencing check
       if (expectedLeaseOwner && curPayout.recovery_lease_id && curPayout.recovery_lease_id !== expectedLeaseOwner) {
         const leaseExpiry = curPayout.recovery_lease_expires_at ? new Date(curPayout.recovery_lease_expires_at).getTime() : 0;
         if (leaseExpiry > Date.now()) {
@@ -655,18 +780,6 @@ export class SellerSettlementService {
         });
 
         await client.query(`
-          UPDATE seller_ledgers
-          SET utr_number = $1,
-              description = $2
-          WHERE merchant_id = $3 AND description = $4
-        `, [
-          confirmedUtr,
-          `Bank payout disbursement settled (Ref: ${payoutReference}, UTR: ${confirmedUtr})`,
-          merchantId,
-          `Bank payout disbursement reserved (Ref: ${payoutReference})`,
-        ]);
-
-        await client.query(`
           UPDATE seller_payouts
           SET status = 'PAID',
               utr_number = $1,
@@ -679,11 +792,7 @@ export class SellerSettlementService {
           WHERE id = $4
         `, [confirmedUtr, providerPayoutId || null, journalBatchId, payoutId]);
 
-        await client.query(`
-          UPDATE order_settlement_allocations
-          SET status = 'SETTLED'
-          WHERE merchant_id = $1 AND status = 'ALLOCATED'
-        `, [merchantId]);
+        await applyPayoutToAllocationsFIFO(client, merchantId, payoutAmount);
 
         stagedEvents.push(
           settlementEventPublisher.createEvent('SellerPayoutCompleted', {
@@ -707,7 +816,7 @@ export class SellerSettlementService {
           isDuplicate: false,
         };
       } else {
-        // Conclusive rejection: lock merchant, mark FAILED, and restore running balance
+        // Conclusive rejection: lock merchant, mark FAILED, and restore running balance via append-only CREDIT
         await client.query(`
           SELECT id FROM merchants WHERE id = $1 FOR UPDATE
         `, [merchantId]);
@@ -725,12 +834,14 @@ export class SellerSettlementService {
         const curBalRes = await client.query(`
           SELECT running_balance FROM seller_ledgers
           WHERE merchant_id = $1
-          ORDER BY created_at DESC
+          ORDER BY created_at DESC, seq_no DESC
           LIMIT 1
         `, [merchantId]);
 
-        const currentRunning = curBalRes.rows.length > 0 ? parseFloat(curBalRes.rows[0].running_balance) : 0;
-        const restoredRunning = +(currentRunning + payoutAmount).toFixed(2);
+        const currentRunningBn = curBalRes.rows.length > 0
+          ? toDecimal(curBalRes.rows[0].running_balance)
+          : new BigNumber(0);
+        const restoredRunning = Number(roundCurrency(currentRunningBn.plus(toDecimal(payoutAmount))));
 
         await client.query(`
           INSERT INTO seller_ledgers (
@@ -762,18 +873,29 @@ export class SellerSettlementService {
 
     return finalResult;
   }
+
   public async processSellerClawback(params: {
     orderId: string;
     merchantId: string;
     refundAmount: number;
+    returnId?: string;
     clientOverride?: pg.PoolClient;
   }): Promise<{ isPostPayout: boolean; debitAmount: number; newBalance: number }> {
+    const refundAmtBn = toDecimal(params.refundAmount);
+    if (refundAmtBn.lte(0)) {
+      throw new Error('INVALID_CLAWBACK_AMOUNT: Refund amount for seller clawback must be greater than zero.');
+    }
+    const refundAmount = Number(roundCurrency(refundAmtBn));
+
     const execute = async (client: pg.PoolClient) => {
-      // 1. Check if allocation exists
+      // 1. Lock merchant first, then allocation FOR UPDATE (consistent lock ordering with webhooks/payouts to prevent deadlocks)
+      await client.query(`SELECT id FROM merchants WHERE id = $1 FOR UPDATE`, [params.merchantId]);
+
       const allocRes = await client.query(`
         SELECT * FROM order_settlement_allocations
         WHERE order_id = $1
         LIMIT 1
+        FOR UPDATE
       `, [params.orderId]);
 
       if (allocRes.rows.length === 0) {
@@ -782,58 +904,158 @@ export class SellerSettlementService {
       }
 
       const alloc = allocRes.rows[0];
-      const isPostPayout = alloc.status === 'SETTLED';
-      const debitAmount = Math.min(parseFloat(alloc.net_seller_payable), params.refundAmount);
 
-      // 2. Fetch current running balance
       const ledgerBalRes = await client.query(`
         SELECT running_balance FROM seller_ledgers
         WHERE merchant_id = $1
-        ORDER BY created_at DESC
+        ORDER BY created_at DESC, seq_no DESC
         LIMIT 1
       `, [params.merchantId]);
+      const currentBalanceBn = ledgerBalRes.rows.length > 0
+        ? toDecimal(ledgerBalRes.rows[0].running_balance)
+        : new BigNumber(0);
+      const currentBalance = Number(roundCurrency(currentBalanceBn));
 
-      const currentBalance = ledgerBalRes.rows.length > 0 ? parseFloat(ledgerBalRes.rows[0].running_balance) : 0.00;
-      const newBalance = +(currentBalance - debitAmount).toFixed(2);
-      const entryType = isPostPayout ? 'CLAWBACK_DEBIT' : 'RETURN_DEBIT';
+      const rawSettledBn = toDecimal(alloc.settled_amount || '0');
+      const netSellerPayableBn = toDecimal(alloc.net_seller_payable || '0');
+      const settledSoFarBn = alloc.status === 'SETTLED' && rawSettledBn.isZero()
+        ? netSellerPayableBn
+        : rawSettledBn;
+      const alreadyRefundedNetBn = toDecimal(alloc.refunded_amount || '0');
+      const remainingReversibleNetBn = BigNumber.max(0, netSellerPayableBn.minus(alreadyRefundedNetBn));
 
-      // 3. Insert into seller_ledgers
-      await client.query(`
-        INSERT INTO seller_ledgers (
-          merchant_id, order_id, entry_type, category, amount, running_balance, description
-        )
-        VALUES ($1, $2, $3, 'DEBIT', $4, $5, $6)
-      `, [
-        params.merchantId,
-        params.orderId,
-        entryType,
-        debitAmount,
-        newBalance,
-        isPostPayout
-          ? `Clawback debit on post-payout return for order ${params.orderId}`
-          : `Return debit on pre-payout return for order ${params.orderId}`,
-      ]);
+      // Guard against duplicate/excess clawbacks on already REVERSED allocations
+      if (alloc.status === 'REVERSED' || remainingReversibleNetBn.lte(0)) {
+        const hadPostPayout = alloc.status === 'SETTLED' || settledSoFarBn.gt(0);
+        return { isPostPayout: hadPostPayout, debitAmount: 0, newBalance: currentBalance };
+      }
 
-      // 4. Record General Ledger Entry
+      const refundAmountBn = toDecimal(refundAmount);
+      const grossGmvBn = toDecimal(alloc.gross_gmv || '0');
+      const allocCommBn = toDecimal(alloc.platform_commission || '0');
+      const allocCommGstBn = toDecimal(alloc.commission_gst || '0');
+      const allocTcsBn = toDecimal(alloc.gst_tcs_amount || '0');
+      const allocTdsBn = toDecimal(alloc.seller_tds_amount || '0');
+      const allocDelayPenaltyBn = toDecimal(alloc.store_delay_penalty || '0');
+
+      const totalOrigFeesBn = add(allocCommBn, allocCommGstBn, allocTcsBn, allocTdsBn, allocDelayPenaltyBn);
+      const refundedProportionBn = netSellerPayableBn.gt(0)
+        ? divide(alreadyRefundedNetBn, netSellerPayableBn)
+        : new BigNumber(0);
+      const remainingGrossEstBn = subtract(grossGmvBn, multiply(refundedProportionBn, grossGmvBn)).minus('0.01');
+      const isFullRemaining = grossGmvBn.gt(0)
+        ? refundAmountBn.gte(remainingGrossEstBn)
+        : refundAmountBn.gte(remainingReversibleNetBn);
+
+      const ratioBn = grossGmvBn.gt(0) ? BigNumber.min(1, divide(refundAmountBn, grossGmvBn)) : new BigNumber(1);
+      let revCommBn = toDecimal(roundCurrency(multiply(allocCommBn, ratioBn)));
+      let revCommGstBn = toDecimal(roundCurrency(multiply(allocCommGstBn, ratioBn)));
+      let revTcsBn = toDecimal(roundCurrency(multiply(allocTcsBn, ratioBn)));
+      let revTdsBn = toDecimal(roundCurrency(multiply(allocTdsBn, ratioBn)));
+      let revDelayPenaltyBn = toDecimal(roundCurrency(multiply(allocDelayPenaltyBn, ratioBn)));
+      let revFeeTotalBn = add(revCommBn, revCommGstBn, revTcsBn, revTdsBn, revDelayPenaltyBn);
+
+      // Ensure revFeeTotal never exceeds refundAmount
+      if (revFeeTotalBn.gt(refundAmountBn) && revFeeTotalBn.gt(0)) {
+        const capScaleBn = divide(refundAmountBn, revFeeTotalBn);
+        revCommBn = toDecimal(roundCurrency(multiply(revCommBn, capScaleBn)));
+        revCommGstBn = toDecimal(roundCurrency(multiply(revCommGstBn, capScaleBn)));
+        revTcsBn = toDecimal(roundCurrency(multiply(revTcsBn, capScaleBn)));
+        revTdsBn = toDecimal(roundCurrency(multiply(revTdsBn, capScaleBn)));
+        revDelayPenaltyBn = toDecimal(roundCurrency(multiply(revDelayPenaltyBn, capScaleBn)));
+        revFeeTotalBn = add(revCommBn, revCommGstBn, revTcsBn, revTdsBn, revDelayPenaltyBn);
+      }
+
+      let debitAmountBn: BigNumber;
+      if (isFullRemaining && totalOrigFeesBn.plus(remainingReversibleNetBn).lte(refundAmountBn.plus('0.05'))) {
+        debitAmountBn = remainingReversibleNetBn;
+      } else {
+        debitAmountBn = min(
+          remainingReversibleNetBn,
+          BigNumber.max(0, toDecimal(roundCurrency(refundAmountBn.minus(revFeeTotalBn))))
+        );
+      }
+      const debitAmount = Number(roundCurrency(debitAmountBn));
+
+      // Align proportional fee if rounding pushed debitAmount + revFeeTotal != refundAmount
+      const remainderForFeesBn = BigNumber.max(0, refundAmountBn.minus(debitAmountBn));
+      const feeGapBn = remainderForFeesBn.minus(revFeeTotalBn);
+      if (!feeGapBn.isZero() && feeGapBn.abs().lte('0.05') && revCommBn.plus(feeGapBn).gte(0)) {
+        revCommBn = toDecimal(roundCurrency(revCommBn.plus(feeGapBn)));
+      }
+
+      // Split partially settled order accurately between unsettled Payable (2020) and settled Clawback Receivable (1040)
+      const unsettledRemainingBn = BigNumber.max(
+        0,
+        netSellerPayableBn.minus(alreadyRefundedNetBn).minus(settledSoFarBn)
+      );
+      const payableReductionBn = toDecimal(roundCurrency(min(debitAmountBn, unsettledRemainingBn)));
+      const clawbackReceivableBn = toDecimal(roundCurrency(BigNumber.max(0, debitAmountBn.minus(payableReductionBn))));
+      const payableReduction = Number(roundCurrency(payableReductionBn));
+      const clawbackReceivable = Number(roundCurrency(clawbackReceivableBn));
+      const isPostPayout = clawbackReceivableBn.gt(0);
+
+      let runningAfterBn = currentBalanceBn;
+      if (payableReductionBn.gt(0)) {
+        runningAfterBn = runningAfterBn.minus(payableReductionBn);
+        await client.query(`
+          INSERT INTO seller_ledgers (
+            merchant_id, order_id, entry_type, category, amount, running_balance, description
+          )
+          VALUES ($1, $2, 'RETURN_DEBIT', 'DEBIT', $3, $4, $5)
+        `, [
+          params.merchantId,
+          params.orderId,
+          payableReduction,
+          Number(roundCurrency(runningAfterBn)),
+          `Return debit on pre-payout return portion for order ${params.orderId}`,
+        ]);
+      }
+
+      if (clawbackReceivableBn.gt(0)) {
+        runningAfterBn = runningAfterBn.minus(clawbackReceivableBn);
+        await client.query(`
+          INSERT INTO seller_ledgers (
+            merchant_id, order_id, entry_type, category, amount, running_balance, description
+          )
+          VALUES ($1, $2, 'CLAWBACK_DEBIT', 'DEBIT', $3, $4, $5)
+        `, [
+          params.merchantId,
+          params.orderId,
+          clawbackReceivable,
+          Number(roundCurrency(runningAfterBn)),
+          `Clawback debit on post-payout return portion for order ${params.orderId}`,
+        ]);
+      }
+
+      const newBalance = Number(roundCurrency(runningAfterBn));
+
+      // Record balanced General Ledger Entry (Reversal of fees + delay penalty + 2020 and/or 1040 vs Cr 1010)
       await ledgerService.recordReturnRefund({
         orderId: params.orderId,
         merchantId: params.merchantId,
-        refundAmount: params.refundAmount,
-        netGoodsAmount: debitAmount,
-        commissionAmount: parseFloat(alloc.platform_commission || 0),
-        commissionGst: parseFloat(alloc.commission_gst || 0),
-        gstTcsAmount: parseFloat(alloc.gst_tcs_amount || 0),
-        sellerTdsAmount: parseFloat(alloc.seller_tds_amount || 0),
+        refundAmount,
+        payableReductionAmount: payableReduction,
+        clawbackReceivableAmount: clawbackReceivable,
+        commissionAmount: Number(roundCurrency(revCommBn)),
+        commissionGst: Number(roundCurrency(revCommGstBn)),
+        gstTcsAmount: Number(roundCurrency(revTcsBn)),
+        sellerTdsAmount: Number(roundCurrency(revTdsBn)),
+        storeDelayPenalty: Number(roundCurrency(revDelayPenaltyBn)),
         isPostPayout,
+        returnId: params.returnId,
         client,
       });
 
-      // 5. Update allocation status
+      const updatedRefundedNetBn = toDecimal(roundCurrency(alreadyRefundedNetBn.plus(debitAmountBn)));
+      const markFullyReversed = isFullRemaining || updatedRefundedNetBn.gte(netSellerPayableBn.minus('0.01'));
+
       await client.query(`
         UPDATE order_settlement_allocations
-        SET status = 'REVERSED'
-        WHERE order_id = $1
-      `, [params.orderId]);
+        SET refunded_amount = $1,
+            status = CASE WHEN $2 THEN 'REVERSED' ELSE status END
+        WHERE order_id = $3
+      `, [Number(roundCurrency(updatedRefundedNetBn)), markFullyReversed, params.orderId]);
 
       return { isPostPayout, debitAmount, newBalance };
     };

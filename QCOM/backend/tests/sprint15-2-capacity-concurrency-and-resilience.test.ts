@@ -323,7 +323,7 @@ export async function runSprint15_2CapacityConcurrencyAndResilienceTests(): Prom
   console.log('  ✓ Test 5.1 Passed: Atomic single-winner delivery task acceptance. Exactly 1 rider claimed the task (HTTP 200), concurrent claimant blocked (HTTP 409).');
 
   // Test 5.2: Admin rider re-assignment guard prevents overwriting non-eligible trip
-  const riderRes = await realPool.query(`SELECT id FROM riders LIMIT 1`);
+  const riderRes = await realPool.query(`SELECT id FROM riders WHERE status <> 'SUSPENDED' LIMIT 1`);
   const validRiderId = riderRes.rows[0].id;
   const assignBlocked = await apiCall(`/api/admin/orders/${tripOrderId}/assign-rider`, {
     method: 'POST',

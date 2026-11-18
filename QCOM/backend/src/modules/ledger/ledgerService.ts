@@ -1,6 +1,8 @@
 import pg from 'pg';
 import crypto from 'crypto';
-import { getPool } from '../../database/connection.js';
+import BigNumber from 'bignumber.js';
+import { getPool, transaction } from '../../database/connection.js';
+import { toDecimal, roundCurrency, add, subtract } from '../pricing/money.js';
 
 export interface LedgerPaymentEntry {
   orderId: string;
@@ -35,64 +37,317 @@ export interface FulfillmentAllocationLedgerParams {
   client?: pg.PoolClient;
 }
 
+interface NormalizedBatchLine {
+  account: string;
+  side: 'DEBIT' | 'CREDIT';
+  amountStr: string;
+  amount: number;
+  orderId: string | null;
+  merchantId: string | null;
+  riderId: string | null;
+  narration: string;
+}
+
+function assertPositiveMoney(value: number | string, fieldName: string): number {
+  const bn = toDecimal(value);
+  if (bn.lte(0)) {
+    throw new Error(`INVALID_FINANCIAL_AMOUNT: ${fieldName} must be greater than zero (got ${value}).`);
+  }
+  return Number(roundCurrency(bn));
+}
+
+function assertNonNegativeMoney(value: number | string, fieldName: string): number {
+  const bn = toDecimal(value);
+  if (bn.lt(0)) {
+    throw new Error(`INVALID_FINANCIAL_AMOUNT: ${fieldName} cannot be negative (got ${value}).`);
+  }
+  return Number(roundCurrency(bn));
+}
+
+function computeCanonicalPayloadHash(
+  transactionType: string,
+  lines: { account: string; side: string; amountStr: string }[]
+): string {
+  const canonical = lines
+    .map((l) => `${l.account}:${l.side}:${l.amountStr}`)
+    .sort()
+    .join(';');
+  return crypto
+    .createHash('sha256')
+    .update(`${transactionType}|${canonical}`)
+    .digest('hex');
+}
+
 export class LedgerService {
+  /**
+   * Aggregates same-(account, side) legs inside a single journal batch,
+   * enforces exact Debit == Credit balance, atomically claims transaction_reference
+   * in ledger_journal_batches, and rejects payload mismatches on replay.
+   */
+  public async postJournalBatch(params: {
+    txRef: string;
+    transactionType: string;
+    lines: {
+      account: string;
+      side: 'DEBIT' | 'CREDIT';
+      amount: number | string | BigNumber;
+      narration: string;
+      orderId?: string | null;
+      merchantId?: string | null;
+      riderId?: string | null;
+    }[];
+    client?: pg.PoolClient;
+  }): Promise<string> {
+    const { txRef, transactionType, client } = params;
+
+    // Aggregate legitimate multiple lines targeting the same (account, side) in one batch
+    // so uq_gl_ref_account_side is preserved cleanly while retaining exact sums.
+    const grouped = new Map<
+      string,
+      {
+        account: string;
+        side: 'DEBIT' | 'CREDIT';
+        amountBn: BigNumber;
+        orderId: string | null;
+        merchantId: string | null;
+        riderId: string | null;
+        narrations: string[];
+      }
+    >();
+
+    for (const rawLine of params.lines) {
+      const bn = toDecimal(rawLine.amount);
+      if (bn.lte(0)) continue;
+      const key = `${rawLine.account}|${rawLine.side}`;
+      const existing = grouped.get(key);
+      if (existing) {
+        existing.amountBn = existing.amountBn.plus(bn);
+        existing.orderId = existing.orderId || rawLine.orderId || null;
+        existing.merchantId = existing.merchantId || rawLine.merchantId || null;
+        existing.riderId = existing.riderId || rawLine.riderId || null;
+        if (rawLine.narration && !existing.narrations.includes(rawLine.narration)) {
+          existing.narrations.push(rawLine.narration);
+        }
+      } else {
+        grouped.set(key, {
+          account: rawLine.account,
+          side: rawLine.side,
+          amountBn: bn,
+          orderId: rawLine.orderId || null,
+          merchantId: rawLine.merchantId || null,
+          riderId: rawLine.riderId || null,
+          narrations: rawLine.narration ? [rawLine.narration] : [],
+        });
+      }
+    }
+
+    const normalized: NormalizedBatchLine[] = [];
+    let debitSumBn = new BigNumber(0);
+    let creditSumBn = new BigNumber(0);
+
+    for (const item of grouped.values()) {
+      const amountStr = roundCurrency(item.amountBn);
+      const amountNum = Number(amountStr);
+      if (amountNum <= 0) continue;
+      if (item.side === 'DEBIT') {
+        debitSumBn = debitSumBn.plus(toDecimal(amountStr));
+      } else {
+        creditSumBn = creditSumBn.plus(toDecimal(amountStr));
+      }
+      normalized.push({
+        account: item.account,
+        side: item.side,
+        amountStr,
+        amount: amountNum,
+        orderId: item.orderId,
+        merchantId: item.merchantId,
+        riderId: item.riderId,
+        narration: item.narrations.join(' | '),
+      });
+    }
+
+    if (normalized.length === 0) {
+      throw new Error(`LEDGER_UNBALANCED: Journal batch '${txRef}' has zero positive entries.`);
+    }
+
+    const totalDebitsStr = roundCurrency(debitSumBn);
+    const totalCreditsStr = roundCurrency(creditSumBn);
+    if (!toDecimal(totalDebitsStr).eq(toDecimal(totalCreditsStr))) {
+      throw new Error(
+        `LEDGER_UNBALANCED: Journal batch '${txRef}' debits (${totalDebitsStr}) do not equal credits (${totalCreditsStr}).`
+      );
+    }
+
+    const payloadHash = computeCanonicalPayloadHash(transactionType, normalized);
+
+    const executeInTx = async (txClient: pg.PoolClient): Promise<string> => {
+      // Check existing batch registry first (or unbackfilled legacy general_ledger_entries in pg-mem)
+      const existingBatchRes = await txClient.query(
+        `SELECT journal_batch_id, transaction_type, payload_hash
+         FROM ledger_journal_batches
+         WHERE transaction_reference = $1
+         LIMIT 1`,
+        [txRef]
+      );
+
+      if (existingBatchRes.rows.length > 0) {
+        return await this.verifyExistingBatch(txClient, txRef, transactionType, payloadHash, existingBatchRes.rows[0]);
+      }
+
+      // Legacy fallback: check if general_ledger_entries already contains unbackfilled entries for txRef
+      const legacyEntriesRes = await txClient.query(
+        `SELECT journal_batch_id, transaction_type, account_code, entry_side, amount
+         FROM general_ledger_entries
+         WHERE transaction_reference = $1`,
+        [txRef]
+      );
+      if (legacyEntriesRes.rows.length > 0) {
+        const legacyHash = computeCanonicalPayloadHash(
+          String(legacyEntriesRes.rows[0].transaction_type),
+          legacyEntriesRes.rows.map((r: any) => ({
+            account: String(r.account_code),
+            side: String(r.entry_side),
+            amountStr: roundCurrency(r.amount),
+          }))
+        );
+        if (legacyEntriesRes.rows[0].transaction_type !== transactionType || legacyHash !== payloadHash) {
+          throw new Error(
+            `LEDGER_TX_REF_CONFLICT: Transaction reference '${txRef}' already exists with a different payload.`
+          );
+        }
+        return legacyEntriesRes.rows[0].journal_batch_id;
+      }
+
+      // Atomic batch claim: ON CONFLICT DO NOTHING ensures concurrent writers never partially interleave legs
+      const proposedBatchId = crypto.randomUUID();
+      const claimRes = await txClient.query(
+        `INSERT INTO ledger_journal_batches (
+           transaction_reference, journal_batch_id, transaction_type,
+           payload_hash, total_debits, total_credits
+         )
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (transaction_reference) DO NOTHING
+         RETURNING journal_batch_id`,
+        [txRef, proposedBatchId, transactionType, payloadHash, totalDebitsStr, totalCreditsStr]
+      );
+
+      if (claimRes.rows.length === 0) {
+        const racerRes = await txClient.query(
+          `SELECT journal_batch_id, transaction_type, payload_hash
+           FROM ledger_journal_batches
+           WHERE transaction_reference = $1
+           LIMIT 1`,
+          [txRef]
+        );
+        if (racerRes.rows.length === 0) {
+          throw new Error(`LEDGER_TX_REF_CONFLICT: Failed to resolve concurrent journal batch '${txRef}'.`);
+        }
+        return await this.verifyExistingBatch(txClient, txRef, transactionType, payloadHash, racerRes.rows[0]);
+      }
+
+      // Winner inserts ALL batch entries atomically WITHOUT ON CONFLICT DO NOTHING
+      for (const line of normalized) {
+        await txClient.query(
+          `INSERT INTO general_ledger_entries (
+             journal_batch_id, transaction_reference, transaction_type,
+             account_code, entry_side, amount, currency,
+             order_id, merchant_id, rider_id, narration
+           )
+           VALUES ($1, $2, $3, $4, $5, $6, 'INR', $7, $8, $9, $10)`,
+          [
+            proposedBatchId,
+            txRef,
+            transactionType,
+            line.account,
+            line.side,
+            line.amountStr,
+            line.orderId,
+            line.merchantId,
+            line.riderId,
+            line.narration,
+          ]
+        );
+      }
+
+      return proposedBatchId;
+    };
+
+    if (client) {
+      return executeInTx(client);
+    }
+    return transaction(executeInTx);
+  }
+
+  private async verifyExistingBatch(
+    txClient: pg.PoolClient,
+    txRef: string,
+    transactionType: string,
+    expectedHash: string,
+    existingBatch: { journal_batch_id: string; transaction_type: string; payload_hash: string }
+  ): Promise<string> {
+    if (existingBatch.payload_hash === 'LEGACY_BACKFILL') {
+      const legacyRows = await txClient.query(
+        `SELECT transaction_type, account_code, entry_side, amount
+         FROM general_ledger_entries
+         WHERE transaction_reference = $1`,
+        [txRef]
+      );
+      const legacyHash = computeCanonicalPayloadHash(
+        String(existingBatch.transaction_type),
+        legacyRows.rows.map((r: any) => ({
+          account: String(r.account_code),
+          side: String(r.entry_side),
+          amountStr: roundCurrency(r.amount),
+        }))
+      );
+      if (existingBatch.transaction_type !== transactionType || legacyHash !== expectedHash) {
+        throw new Error(
+          `LEDGER_TX_REF_CONFLICT: Transaction reference '${txRef}' already committed with different financial payload.`
+        );
+      }
+      return existingBatch.journal_batch_id;
+    }
+
+    if (existingBatch.transaction_type !== transactionType || existingBatch.payload_hash !== expectedHash) {
+      throw new Error(
+        `LEDGER_TX_REF_CONFLICT: Transaction reference '${txRef}' already committed with different financial payload.`
+      );
+    }
+
+    return existingBatch.journal_batch_id;
+  }
+
   /**
    * Batch A: Customer Online Payment Capture
    * Dr 1010 Cash at Gateway (Escrow), Cr 2010 Customer Funds Held in Escrow
    */
   public async recordOrderPayment(entry: LedgerPaymentEntry): Promise<string> {
-    const runner = entry.client || getPool();
     const txRef = `TX_PAY_${entry.orderId}`;
+    const grossAmount = assertPositiveMoney(entry.grossAmount, 'grossAmount');
 
-    // Idempotency guard: Return existing batch if already posted
-    const existing = await runner.query(`
-      SELECT journal_batch_id FROM general_ledger_entries
-      WHERE transaction_reference = $1
-      LIMIT 1
-    `, [txRef]);
-    if (existing.rows.length > 0) {
-      return existing.rows[0].journal_batch_id;
-    }
-
-    const journalBatchId = crypto.randomUUID();
-
-    // 1. Debit: Cash at Payment Gateway (Escrow) - Account 1010
-    await runner.query(`
-      INSERT INTO general_ledger_entries (
-        journal_batch_id, transaction_reference, transaction_type,
-        account_code, entry_side, amount, currency,
-        order_id, merchant_id, narration
-      )
-      VALUES ($1, $2, 'CUSTOMER_PAYMENT', '1010', 'DEBIT', $3, 'INR', $4, $5, $6)
-      ON CONFLICT (transaction_reference, account_code, entry_side) DO NOTHING
-    `, [
-      journalBatchId,
+    return this.postJournalBatch({
       txRef,
-      entry.grossAmount,
-      entry.orderId,
-      entry.merchantId,
-      `Customer payment escrow for order ${entry.orderId}`,
-    ]);
-
-    // 2. Credit: Customer Funds Held in Escrow - Account 2010
-    await runner.query(`
-      INSERT INTO general_ledger_entries (
-        journal_batch_id, transaction_reference, transaction_type,
-        account_code, entry_side, amount, currency,
-        order_id, merchant_id, narration
-      )
-      VALUES ($1, $2, 'CUSTOMER_PAYMENT', '2010', 'CREDIT', $3, 'INR', $4, $5, $6)
-      ON CONFLICT (transaction_reference, account_code, entry_side) DO NOTHING
-    `, [
-      journalBatchId,
-      txRef,
-      entry.grossAmount,
-      entry.orderId,
-      entry.merchantId,
-      `Escrow liability for order ${entry.orderId}`,
-    ]);
-
-    return journalBatchId;
+      transactionType: 'CUSTOMER_PAYMENT',
+      client: entry.client,
+      lines: [
+        {
+          account: '1010',
+          side: 'DEBIT',
+          amount: grossAmount,
+          orderId: entry.orderId,
+          merchantId: entry.merchantId,
+          narration: `Customer payment escrow for order ${entry.orderId}`,
+        },
+        {
+          account: '2010',
+          side: 'CREDIT',
+          amount: grossAmount,
+          orderId: entry.orderId,
+          merchantId: entry.merchantId,
+          narration: `Escrow liability for order ${entry.orderId}`,
+        },
+      ],
+    });
   }
 
   /**
@@ -106,41 +361,34 @@ export class LedgerService {
     amount: number;
     client?: pg.PoolClient;
   }): Promise<string> {
-    const runner = params.client || getPool();
     const txRef = `TX_COD_COLLECT_${params.orderId}`;
+    const amount = assertPositiveMoney(params.amount, 'codAmount');
 
-    const existing = await runner.query(`
-      SELECT journal_batch_id FROM general_ledger_entries
-      WHERE transaction_reference = $1
-      LIMIT 1
-    `, [txRef]);
-    if (existing.rows.length > 0) {
-      return existing.rows[0].journal_batch_id;
-    }
-
-    const journalBatchId = crypto.randomUUID();
-
-    await runner.query(`
-      INSERT INTO general_ledger_entries (
-        journal_batch_id, transaction_reference, transaction_type,
-        account_code, entry_side, amount, currency,
-        order_id, merchant_id, rider_id, narration
-      )
-      VALUES 
-      ($1, $2, 'COD_COLLECTION', '1030', 'DEBIT', $3, 'INR', $4, $5, $6, $7),
-      ($1, $2, 'COD_COLLECTION', '2010', 'CREDIT', $3, 'INR', $4, $5, $6, $8)
-    `, [
-      journalBatchId,
+    return this.postJournalBatch({
       txRef,
-      params.amount,
-      params.orderId,
-      params.merchantId,
-      params.riderId,
-      `COD physical collection by rider for order ${params.orderId}`,
-      `Customer liability satisfied via COD for order ${params.orderId}`,
-    ]);
-
-    return journalBatchId;
+      transactionType: 'COD_COLLECTION',
+      client: params.client,
+      lines: [
+        {
+          account: '1030',
+          side: 'DEBIT',
+          amount,
+          orderId: params.orderId,
+          merchantId: params.merchantId,
+          riderId: params.riderId,
+          narration: `COD physical collection by rider for order ${params.orderId}`,
+        },
+        {
+          account: '2010',
+          side: 'CREDIT',
+          amount,
+          orderId: params.orderId,
+          merchantId: params.merchantId,
+          riderId: params.riderId,
+          narration: `Customer liability satisfied via COD for order ${params.orderId}`,
+        },
+      ],
+    });
   }
 
   /**
@@ -151,28 +399,32 @@ export class LedgerService {
    * Total Debits == Total Credits == Order Total + Gross Rider Fare
    */
   public async recordOrderFulfillmentAllocation(params: FulfillmentAllocationLedgerParams): Promise<string> {
-    const runner = params.client || getPool();
     const txRef = `TX_FULFILL_${params.orderId}`;
 
-    const existing = await runner.query(`
-      SELECT journal_batch_id FROM general_ledger_entries
-      WHERE transaction_reference = $1
-      LIMIT 1
-    `, [txRef]);
-    if (existing.rows.length > 0) {
-      return existing.rows[0].journal_batch_id;
-    }
+    const orderTotal = assertPositiveMoney(params.orderTotal, 'orderTotal');
+    const grossRiderFare = assertNonNegativeMoney(params.grossRiderFare, 'grossRiderFare');
+    const netSellerPayable = assertNonNegativeMoney(params.netSellerPayable, 'netSellerPayable');
+    const netRiderPayable = assertNonNegativeMoney(params.netRiderPayable, 'netRiderPayable');
+    const riderTdsAmount = assertNonNegativeMoney(params.riderTdsAmount, 'riderTdsAmount');
+    const platformCommission = assertNonNegativeMoney(params.platformCommission, 'platformCommission');
+    const commissionGst = assertNonNegativeMoney(params.commissionGst, 'commissionGst');
+    const customerDeliveryFee = assertNonNegativeMoney(params.customerDeliveryFee, 'customerDeliveryFee');
+    const deliveryFeeGst = assertNonNegativeMoney(params.deliveryFeeGst, 'deliveryFeeGst');
+    const customerHandlingFee = assertNonNegativeMoney(params.customerHandlingFee, 'customerHandlingFee');
+    const handlingFeeGst = assertNonNegativeMoney(params.handlingFeeGst, 'handlingFeeGst');
+    const storeDelayPenalty = assertNonNegativeMoney(params.storeDelayPenalty, 'storeDelayPenalty');
+    const gstTcsAmount = assertNonNegativeMoney(params.gstTcsAmount, 'gstTcsAmount');
+    const sellerTdsAmount = assertNonNegativeMoney(params.sellerTdsAmount, 'sellerTdsAmount');
 
-    const journalBatchId = crypto.randomUUID();
-
-    const totalFeeGst = +(params.commissionGst + params.deliveryFeeGst + params.handlingFeeGst).toFixed(2);
-    const totalPlatformCharges = +(params.customerHandlingFee + params.storeDelayPenalty).toFixed(2);
+    const totalFeeGst = Number(roundCurrency(add(commissionGst, deliveryFeeGst, handlingFeeGst)));
+    const totalPlatformCharges = Number(roundCurrency(add(customerHandlingFee, storeDelayPenalty)));
 
     const entries: {
       account: string;
       side: 'DEBIT' | 'CREDIT';
       amount: number;
       narration: string;
+      orderId?: string;
       merchantId?: string;
       riderId?: string;
     }[] = [];
@@ -181,75 +433,82 @@ export class LedgerService {
     entries.push({
       account: '2010',
       side: 'DEBIT',
-      amount: params.orderTotal,
+      amount: orderTotal,
       narration: `Release customer escrow liability upon order fulfillment for ${params.orderId}`,
+      orderId: params.orderId,
       merchantId: params.merchantId,
       riderId: params.riderId,
     });
 
     // 2. Debit Rider Logistics Expense
-    if (params.grossRiderFare > 0) {
+    if (grossRiderFare > 0) {
       entries.push({
         account: '5010',
         side: 'DEBIT',
-        amount: params.grossRiderFare,
+        amount: grossRiderFare,
         narration: `Logistics expense recognized for delivery of order ${params.orderId}`,
+        orderId: params.orderId,
         merchantId: params.merchantId,
         riderId: params.riderId,
       });
     }
 
     // 3. Credit Merchant Accounts Payable
-    if (params.netSellerPayable > 0) {
+    if (netSellerPayable > 0) {
       entries.push({
         account: '2020',
         side: 'CREDIT',
-        amount: params.netSellerPayable,
+        amount: netSellerPayable,
         narration: `Net payable allocated to merchant for order ${params.orderId}`,
+        orderId: params.orderId,
         merchantId: params.merchantId,
       });
     }
 
     // 4. Credit Delivery Partner Wallet Payable
-    if (params.netRiderPayable > 0) {
+    if (netRiderPayable > 0) {
       entries.push({
         account: '2030',
         side: 'CREDIT',
-        amount: params.netRiderPayable,
+        amount: netRiderPayable,
         narration: `Net fare and tips payable to delivery partner for order ${params.orderId}`,
+        orderId: params.orderId,
         riderId: params.riderId,
       });
     }
 
     // 5. Credit Logistics Withholding Payable (Sec 393 / 194-C)
-    if (params.riderTdsAmount > 0) {
+    if (riderTdsAmount > 0) {
       entries.push({
         account: '2060',
         side: 'CREDIT',
-        amount: params.riderTdsAmount,
+        amount: riderTdsAmount,
         narration: `TDS withheld on rider logistics fare under Section 393 for order ${params.orderId}`,
+        orderId: params.orderId,
         riderId: params.riderId,
       });
     }
 
     // 6. Credit Marketplace Commission Revenue (SAC 9983)
-    if (params.platformCommission > 0) {
+    if (platformCommission > 0) {
       entries.push({
         account: '4010',
         side: 'CREDIT',
-        amount: params.platformCommission,
+        amount: platformCommission,
         narration: `Marketplace commission earned under SAC 9983 on order ${params.orderId}`,
+        orderId: params.orderId,
         merchantId: params.merchantId,
       });
     }
 
     // 7. Credit Customer Delivery Fee Revenue (SAC 9968)
-    if (params.customerDeliveryFee > 0) {
+    if (customerDeliveryFee > 0) {
       entries.push({
         account: '4020',
         side: 'CREDIT',
-        amount: params.customerDeliveryFee,
+        amount: customerDeliveryFee,
         narration: `Customer logistics fee revenue recognized under SAC 9968 for order ${params.orderId}`,
+        orderId: params.orderId,
       });
     }
 
@@ -260,6 +519,7 @@ export class LedgerService {
         side: 'CREDIT',
         amount: totalPlatformCharges,
         narration: `Platform handling fee and merchant delay compensation for order ${params.orderId}`,
+        orderId: params.orderId,
         merchantId: params.merchantId,
       });
     }
@@ -271,75 +531,74 @@ export class LedgerService {
         side: 'CREDIT',
         amount: totalFeeGst,
         narration: `Output GST liability on platform fees (commission, delivery, handling) for order ${params.orderId}`,
+        orderId: params.orderId,
       });
     }
 
     // 10. Credit GST-TCS Section 52 Payable
-    if (params.gstTcsAmount > 0) {
+    if (gstTcsAmount > 0) {
       entries.push({
         account: '2040',
         side: 'CREDIT',
-        amount: params.gstTcsAmount,
+        amount: gstTcsAmount,
         narration: `Section 52 GST-TCS collected for order ${params.orderId}`,
+        orderId: params.orderId,
         merchantId: params.merchantId,
       });
     }
 
     // 11. Credit Income-Tax Withholding Payable (Sec 393 / 194-O)
-    if (params.sellerTdsAmount > 0) {
+    if (sellerTdsAmount > 0) {
       entries.push({
         account: '2050',
         side: 'CREDIT',
-        amount: params.sellerTdsAmount,
+        amount: sellerTdsAmount,
         narration: `Section 393 e-commerce TDS withheld from merchant for order ${params.orderId}`,
+        orderId: params.orderId,
         merchantId: params.merchantId,
       });
     }
 
-    // Enforce exact mathematical Debit == Credit equality
-    const totalDebits = +entries
+    // Enforce exact mathematical Debit == Credit equality with BigNumber
+    let totalDebitsBn = entries
       .filter((e) => e.side === 'DEBIT')
-      .reduce((sum, e) => sum + e.amount, 0)
-      .toFixed(2);
-    const totalCredits = +entries
+      .reduce((sum, e) => sum.plus(toDecimal(e.amount)), new BigNumber(0));
+    let totalCreditsBn = entries
       .filter((e) => e.side === 'CREDIT')
-      .reduce((sum, e) => sum + e.amount, 0)
-      .toFixed(2);
+      .reduce((sum, e) => sum.plus(toDecimal(e.amount)), new BigNumber(0));
 
-    const diff = +(totalDebits - totalCredits).toFixed(2);
-    if (Math.abs(diff) > 0.05) {
-      throw new Error(`LEDGER_UNBALANCED: Fulfillment journal batch is unbalanced. Debits: ${totalDebits}, Credits: ${totalCredits}, Diff: ${diff}`);
-    } else if (diff !== 0) {
-      // Absorb fractional rounding difference (< ₹0.05) into convenience/handling revenue (4030) or merchant payable
-      const adjEntry = entries.find((e) => e.account === '4030') || entries.find((e) => e.account === '2020');
+    const diffBn = totalDebitsBn.minus(totalCreditsBn);
+    if (diffBn.abs().gt(0.05)) {
+      throw new Error(
+        `LEDGER_UNBALANCED: Fulfillment journal batch is unbalanced. Debits: ${roundCurrency(totalDebitsBn)}, Credits: ${roundCurrency(totalCreditsBn)}, Diff: ${roundCurrency(diffBn)}`
+      );
+    } else if (!diffBn.isZero()) {
+      // Absorb fractional rounding difference (<= ₹0.05) into convenience/handling revenue (4030) or merchant payable
+      const adjEntry =
+        entries.find((e) => e.account === '4030' && toDecimal(e.amount).plus(diffBn).gt(0)) ||
+        entries.find((e) => e.account === '2020' && toDecimal(e.amount).plus(diffBn).gt(0));
       if (adjEntry) {
-        adjEntry.amount = +(adjEntry.amount + diff).toFixed(2);
+        adjEntry.amount = Number(roundCurrency(toDecimal(adjEntry.amount).plus(diffBn)));
+      }
+      totalDebitsBn = entries
+        .filter((e) => e.side === 'DEBIT')
+        .reduce((sum, e) => sum.plus(toDecimal(e.amount)), new BigNumber(0));
+      totalCreditsBn = entries
+        .filter((e) => e.side === 'CREDIT')
+        .reduce((sum, e) => sum.plus(toDecimal(e.amount)), new BigNumber(0));
+      if (!totalDebitsBn.eq(totalCreditsBn)) {
+        throw new Error(
+          `LEDGER_UNBALANCED: Fulfillment rounding adjustment failed to balance batch (${roundCurrency(totalDebitsBn)} != ${roundCurrency(totalCreditsBn)}).`
+        );
       }
     }
 
-    // Insert all entries in batch
-    for (const e of entries) {
-      await runner.query(`
-        INSERT INTO general_ledger_entries (
-          journal_batch_id, transaction_reference, transaction_type,
-          account_code, entry_side, amount, currency,
-          order_id, merchant_id, rider_id, narration
-        )
-        VALUES ($1, $2, 'ORDER_FULFILLMENT', $3, $4, $5, 'INR', $6, $7, $8, $9)
-      `, [
-        journalBatchId,
-        txRef,
-        e.account,
-        e.side,
-        e.amount,
-        params.orderId,
-        e.merchantId || null,
-        e.riderId || null,
-        e.narration,
-      ]);
-    }
-
-    return journalBatchId;
+    return this.postJournalBatch({
+      txRef,
+      transactionType: 'ORDER_FULFILLMENT',
+      lines: entries,
+      client: params.client,
+    });
   }
 
   /**
@@ -353,40 +612,30 @@ export class LedgerService {
     utrNumber?: string;
     client?: pg.PoolClient;
   }): Promise<string> {
-    const runner = params.client || getPool();
     const txRef = `TX_MERCH_PAYOUT_${params.payoutReference}`;
+    const amount = assertPositiveMoney(params.amount, 'payoutAmount');
 
-    const existing = await runner.query(`
-      SELECT journal_batch_id FROM general_ledger_entries
-      WHERE transaction_reference = $1
-      LIMIT 1
-    `, [txRef]);
-    if (existing.rows.length > 0) {
-      return existing.rows[0].journal_batch_id;
-    }
-
-    const journalBatchId = crypto.randomUUID();
-
-    await runner.query(`
-      INSERT INTO general_ledger_entries (
-        journal_batch_id, transaction_reference, transaction_type,
-        account_code, entry_side, amount, currency,
-        merchant_id, narration
-      )
-      VALUES 
-      ($1, $2, 'MERCHANT_SETTLEMENT', '2020', 'DEBIT', $3, 'INR', $4, $5),
-      ($1, $2, 'MERCHANT_SETTLEMENT', '1020', 'CREDIT', $3, 'INR', $4, $6)
-      ON CONFLICT (transaction_reference, account_code, entry_side) DO NOTHING
-    `, [
-      journalBatchId,
+    return this.postJournalBatch({
       txRef,
-      params.amount,
-      params.merchantId,
-      `Disbursement of merchant payable via bank transfer (Ref: ${params.payoutReference}, UTR: ${params.utrNumber || 'PENDING'})`,
-      `Bank operating account debit for merchant settlement ${params.payoutReference}`,
-    ]);
-
-    return journalBatchId;
+      transactionType: 'MERCHANT_SETTLEMENT',
+      client: params.client,
+      lines: [
+        {
+          account: '2020',
+          side: 'DEBIT',
+          amount,
+          merchantId: params.merchantId,
+          narration: `Disbursement of merchant payable via bank transfer (Ref: ${params.payoutReference}, UTR: ${params.utrNumber || 'PENDING'})`,
+        },
+        {
+          account: '1020',
+          side: 'CREDIT',
+          amount,
+          merchantId: params.merchantId,
+          narration: `Bank operating account debit for merchant settlement ${params.payoutReference}`,
+        },
+      ],
+    });
   }
 
   /**
@@ -400,40 +649,30 @@ export class LedgerService {
     utrNumber?: string;
     client?: pg.PoolClient;
   }): Promise<string> {
-    const runner = params.client || getPool();
     const txRef = `TX_RIDER_PAYOUT_${params.payoutReference}`;
+    const amount = assertPositiveMoney(params.amount, 'riderPayoutAmount');
 
-    const existing = await runner.query(`
-      SELECT journal_batch_id FROM general_ledger_entries
-      WHERE transaction_reference = $1
-      LIMIT 1
-    `, [txRef]);
-    if (existing.rows.length > 0) {
-      return existing.rows[0].journal_batch_id;
-    }
-
-    const journalBatchId = crypto.randomUUID();
-
-    await runner.query(`
-      INSERT INTO general_ledger_entries (
-        journal_batch_id, transaction_reference, transaction_type,
-        account_code, entry_side, amount, currency,
-        rider_id, narration
-      )
-      VALUES 
-      ($1, $2, 'RIDER_PAYOUT', '2030', 'DEBIT', $3, 'INR', $4, $5),
-      ($1, $2, 'RIDER_PAYOUT', '1020', 'CREDIT', $3, 'INR', $4, $6)
-      ON CONFLICT (transaction_reference, account_code, entry_side) DO NOTHING
-    `, [
-      journalBatchId,
+    return this.postJournalBatch({
       txRef,
-      params.amount,
-      params.riderId,
-      `Disbursement of rider wallet earnings via UPI/IMPS (Ref: ${params.payoutReference}, UTR: ${params.utrNumber || 'PENDING'})`,
-      `Bank operating account disbursement for rider payout ${params.payoutReference}`,
-    ]);
-
-    return journalBatchId;
+      transactionType: 'RIDER_PAYOUT',
+      client: params.client,
+      lines: [
+        {
+          account: '2030',
+          side: 'DEBIT',
+          amount,
+          riderId: params.riderId,
+          narration: `Disbursement of rider wallet earnings via UPI/IMPS (Ref: ${params.payoutReference}, UTR: ${params.utrNumber || 'PENDING'})`,
+        },
+        {
+          account: '1020',
+          side: 'CREDIT',
+          amount,
+          riderId: params.riderId,
+          narration: `Bank operating account disbursement for rider payout ${params.payoutReference}`,
+        },
+      ],
+    });
   }
 
   /**
@@ -446,33 +685,34 @@ export class LedgerService {
     reference: string;
     client?: pg.PoolClient;
   }): Promise<string> {
-    const runner = params.client || getPool();
-    const journalBatchId = crypto.randomUUID();
     const txRef = `TX_COD_REMIT_${params.reference}`;
+    const amount = assertPositiveMoney(params.amount, 'remittanceAmount');
 
-    await runner.query(`
-      INSERT INTO general_ledger_entries (
-        journal_batch_id, transaction_reference, transaction_type,
-        account_code, entry_side, amount, currency,
-        rider_id, narration
-      )
-      VALUES 
-      ($1, $2, 'COD_COLLECTION', '1020', 'DEBIT', $3, 'INR', $4, $5),
-      ($1, $2, 'COD_COLLECTION', '1030', 'CREDIT', $3, 'INR', $4, $6)
-    `, [
-      journalBatchId,
+    return this.postJournalBatch({
       txRef,
-      params.amount,
-      params.riderId,
-      `Bank operating account receipt for COD remittance (Ref: ${params.reference})`,
-      `Clearance of rider floating cash liability (Rider: ${params.riderId})`,
-    ]);
-
-    return journalBatchId;
+      transactionType: 'COD_COLLECTION',
+      client: params.client,
+      lines: [
+        {
+          account: '1020',
+          side: 'DEBIT',
+          amount,
+          riderId: params.riderId,
+          narration: `Bank operating account receipt for COD remittance (Ref: ${params.reference})`,
+        },
+        {
+          account: '1030',
+          side: 'CREDIT',
+          amount,
+          riderId: params.riderId,
+          narration: `Clearance of rider floating cash liability (Rider: ${params.riderId})`,
+        },
+      ],
+    });
   }
 
   /**
-   * Batch K / M: Payout Failure Reversal
+   * Batch K / M: Payout Failure Reversal (after bank confirmation was previously recorded)
    * Dr 1020 Bank Operating Account, Cr 2020 Merchant Payable / Cr 2030 Rider Wallet
    */
   public async recordPayoutFailureReversal(params: {
@@ -482,35 +722,75 @@ export class LedgerService {
     reference: string;
     client?: pg.PoolClient;
   }): Promise<string> {
-    const runner = params.client || getPool();
-    const journalBatchId = crypto.randomUUID();
     const txRef = `TX_PAYOUT_REV_${params.reference}`;
-
+    const amount = assertPositiveMoney(params.amount, 'reversalAmount');
     const targetAccount = params.type === 'MERCHANT' ? '2020' : '2030';
     const merchantId = params.type === 'MERCHANT' ? params.actorId : null;
     const riderId = params.type === 'RIDER' ? params.actorId : null;
 
-    await runner.query(`
-      INSERT INTO general_ledger_entries (
-        journal_batch_id, transaction_reference, transaction_type,
-        account_code, entry_side, amount, currency,
-        merchant_id, rider_id, narration
-      )
-      VALUES 
-      ($1, $2, 'ADJUSTMENT', '1020', 'DEBIT', $3, 'INR', $4, $5, $6),
-      ($1, $2, 'ADJUSTMENT', $7, 'CREDIT', $3, 'INR', $4, $5, $8)
-    `, [
-      journalBatchId,
+    return this.postJournalBatch({
       txRef,
-      params.amount,
-      merchantId,
-      riderId,
-      `Reversal of failed payout funds back to bank operating account (Ref: ${params.reference})`,
-      targetAccount,
-      `Restoration of payable balance due to failed transfer (Ref: ${params.reference})`,
-    ]);
+      transactionType: 'ADJUSTMENT',
+      client: params.client,
+      lines: [
+        {
+          account: '1020',
+          side: 'DEBIT',
+          amount,
+          merchantId,
+          riderId,
+          narration: `Reversal of failed payout funds back to bank operating account (Ref: ${params.reference})`,
+        },
+        {
+          account: targetAccount,
+          side: 'CREDIT',
+          amount,
+          merchantId,
+          riderId,
+          narration: `Restoration of payable balance due to failed transfer (Ref: ${params.reference})`,
+        },
+      ],
+    });
+  }
 
-    return journalBatchId;
+  /**
+   * Batch S: Post-Clawback Future Earnings Offset
+   * Settles open Merchant Receivable (1040) against newly earned Merchant Payable (2020)
+   * Dr 2020 Merchant Accounts Payable, Cr 1040 Merchant Receivables / Clawbacks
+   */
+  public async recordClawbackOffset(params: {
+    merchantId: string;
+    amount: number;
+    orderId?: string;
+    reference: string;
+    client?: pg.PoolClient;
+  }): Promise<string> {
+    const txRef = `TX_CLAWBACK_OFFSET_${params.reference}`;
+    const amount = assertPositiveMoney(params.amount, 'clawbackOffsetAmount');
+
+    return this.postJournalBatch({
+      txRef,
+      transactionType: 'ADJUSTMENT',
+      client: params.client,
+      lines: [
+        {
+          account: '2020',
+          side: 'DEBIT',
+          amount,
+          orderId: params.orderId || null,
+          merchantId: params.merchantId,
+          narration: `Apply seller earnings payable against outstanding clawback receivable (Ref: ${params.reference})`,
+        },
+        {
+          account: '1040',
+          side: 'CREDIT',
+          amount,
+          orderId: params.orderId || null,
+          merchantId: params.merchantId,
+          narration: `Clearance of merchant clawback receivable 1040 via earnings offset (Ref: ${params.reference})`,
+        },
+      ],
+    });
   }
 
   /**
@@ -524,47 +804,38 @@ export class LedgerService {
     amount: number;
     client?: pg.PoolClient;
   }): Promise<string> {
-    const runner = params.client || getPool();
     const refundKey = params.refundNumber || params.refundId || 'FULL';
     const txRef = `TX_CANCEL_REFUND_${params.orderId}_${refundKey}`;
+    const amount = assertPositiveMoney(params.amount, 'refundAmount');
 
-    const existing = await runner.query(`
-      SELECT journal_batch_id, amount FROM general_ledger_entries
-      WHERE transaction_reference = $1
-      LIMIT 1
-    `, [txRef]);
-    if (existing.rows.length > 0) {
-      return existing.rows[0].journal_batch_id;
-    }
-
-    const journalBatchId = crypto.randomUUID();
-
-    await runner.query(`
-      INSERT INTO general_ledger_entries (
-        journal_batch_id, transaction_reference, transaction_type,
-        account_code, entry_side, amount, currency,
-        order_id, narration
-      )
-      VALUES 
-      ($1, $2, 'REFUND', '2010', 'DEBIT', $3, 'INR', $4, $5),
-      ($1, $2, 'REFUND', '1010', 'CREDIT', $3, 'INR', $4, $6)
-      ON CONFLICT (transaction_reference, account_code, entry_side) DO NOTHING
-    `, [
-      journalBatchId,
+    return this.postJournalBatch({
       txRef,
-      params.amount,
-      params.orderId,
-      `Cancellation refund: release customer escrow liability for order ${params.orderId} (Ref: ${refundKey})`,
-      `Cancellation refund: gateway escrow cash returned for order ${params.orderId} (Ref: ${refundKey})`,
-    ]);
-
-    return journalBatchId;
+      transactionType: 'REFUND',
+      client: params.client,
+      lines: [
+        {
+          account: '2010',
+          side: 'DEBIT',
+          amount,
+          orderId: params.orderId,
+          narration: `Cancellation refund: release customer escrow liability for order ${params.orderId} (Ref: ${refundKey})`,
+        },
+        {
+          account: '1010',
+          side: 'CREDIT',
+          amount,
+          orderId: params.orderId,
+          narration: `Cancellation refund: gateway escrow cash returned for order ${params.orderId} (Ref: ${refundKey})`,
+        },
+      ],
+    });
   }
 
   /**
    * Batch R: Post-Fulfillment Return & Refund General Ledger Entry
-   * Pre-Payout: Dr 2020 Merchant Payable (or Dr 2020 + Dr 4010 + Dr 2070 + Dr 2040 + Dr 2050), Cr 1010 Cash at Gateway
-   * Post-Payout: Dr 1040 Merchant Receivable (or Dr 1040 + Dr 4010 + Dr 2070 + Dr 2040 + Dr 2050), Cr 1010 Cash at Gateway
+   * Pre-Payout: Dr 2020 Merchant Payable (+ fees), Cr 1010 Cash at Gateway
+   * Partially Settled: Dr 2020 Merchant Payable (unsettled portion) + Dr 1040 Merchant Receivable (settled portion) (+ fees), Cr 1010 Cash at Gateway
+   * Post-Payout: Dr 1040 Merchant Receivable (+ fees), Cr 1010 Cash at Gateway
    * Guarantees sum(Debits) == sum(Credits) == refundAmount
    */
   public async recordReturnRefund(params: {
@@ -573,56 +844,81 @@ export class LedgerService {
     refundAmount: number;
     isPostPayout?: boolean;
     netGoodsAmount?: number;
+    payableReductionAmount?: number;
+    clawbackReceivableAmount?: number;
     commissionAmount?: number;
     commissionGst?: number;
     gstTcsAmount?: number;
     sellerTdsAmount?: number;
+    storeDelayPenalty?: number;
     returnId?: string;
+    refundId?: string;
+    refundNumber?: string;
     client?: pg.PoolClient;
   }): Promise<string> {
-    const runner = params.client || getPool();
-    const txRef = `TX_RETURN_REFUND_${params.returnId || params.orderId}`;
+    const key = params.returnId || params.refundId || params.refundNumber || params.orderId;
+    const txRef = `TX_RETURN_REFUND_${key}`;
 
-    const existing = await runner.query(`
-      SELECT journal_batch_id FROM general_ledger_entries
-      WHERE transaction_reference = $1
-      LIMIT 1
-    `, [txRef]);
-    if (existing.rows.length > 0) {
-      return existing.rows[0].journal_batch_id;
-    }
-
-    const journalBatchId = crypto.randomUUID();
-    const refundTotal = +(params.refundAmount).toFixed(2);
+    const refundTotal = assertPositiveMoney(params.refundAmount, 'refundAmount');
     const targetAccount = params.isPostPayout ? '1040' : '2020';
 
-    const comm = +(params.commissionAmount || 0).toFixed(2);
-    const commGst = +(params.commissionGst || 0).toFixed(2);
-    const tcs = +(params.gstTcsAmount || 0).toFixed(2);
-    const tds = +(params.sellerTdsAmount || 0).toFixed(2);
-    const feeTotal = +(comm + commGst + tcs + tds).toFixed(2);
-    const netGoods = params.netGoodsAmount !== undefined
-      ? +params.netGoodsAmount.toFixed(2)
-      : +(refundTotal - feeTotal).toFixed(2);
+    const comm = assertNonNegativeMoney(params.commissionAmount || 0, 'commissionAmount');
+    const commGst = assertNonNegativeMoney(params.commissionGst || 0, 'commissionGst');
+    const tcs = assertNonNegativeMoney(params.gstTcsAmount || 0, 'gstTcsAmount');
+    const tds = assertNonNegativeMoney(params.sellerTdsAmount || 0, 'sellerTdsAmount');
+    const delayPen = assertNonNegativeMoney(params.storeDelayPenalty || 0, 'storeDelayPenalty');
+    const feeTotalBn = add(comm, commGst, tcs, tds, delayPen);
+
+    const hasSplit = params.payableReductionAmount !== undefined || params.clawbackReceivableAmount !== undefined;
+    let payableReduction = hasSplit
+      ? assertNonNegativeMoney(params.payableReductionAmount || 0, 'payableReductionAmount')
+      : 0;
+    let clawbackReceivable = hasSplit
+      ? assertNonNegativeMoney(params.clawbackReceivableAmount || 0, 'clawbackReceivableAmount')
+      : 0;
+
+    if (!hasSplit) {
+      const netGoods =
+        params.netGoodsAmount !== undefined
+          ? assertNonNegativeMoney(params.netGoodsAmount, 'netGoodsAmount')
+          : Number(roundCurrency(BigNumber.max(0, subtract(refundTotal, feeTotalBn))));
+      if (params.isPostPayout) {
+        clawbackReceivable = netGoods;
+      } else {
+        payableReduction = netGoods;
+      }
+    }
 
     const entries: {
       account: string;
       side: 'DEBIT' | 'CREDIT';
       amount: number;
       narration: string;
+      orderId?: string;
       merchantId?: string;
     }[] = [];
 
-    // 1. Debit Merchant Payable (2020) or Merchant Receivable / Clawback (1040)
-    entries.push({
-      account: targetAccount,
-      side: 'DEBIT',
-      amount: netGoods,
-      narration: params.isPostPayout
-        ? `Post-payout return clawback debit against merchant ${params.merchantId} for order ${params.orderId}`
-        : `Pre-payout return debit reducing merchant payable for order ${params.orderId}`,
-      merchantId: params.merchantId,
-    });
+    // 1. Debit Merchant Payable (2020) and/or Merchant Receivable / Clawback (1040)
+    if (payableReduction > 0) {
+      entries.push({
+        account: '2020',
+        side: 'DEBIT',
+        amount: payableReduction,
+        narration: `Pre-payout return debit reducing merchant payable for order ${params.orderId}`,
+        orderId: params.orderId,
+        merchantId: params.merchantId,
+      });
+    }
+    if (clawbackReceivable > 0) {
+      entries.push({
+        account: '1040',
+        side: 'DEBIT',
+        amount: clawbackReceivable,
+        narration: `Post-payout return clawback debit against merchant ${params.merchantId} for order ${params.orderId}`,
+        orderId: params.orderId,
+        merchantId: params.merchantId,
+      });
+    }
 
     // 2. Proportional Fee Reversals if applicable
     if (comm > 0) {
@@ -631,6 +927,7 @@ export class LedgerService {
         side: 'DEBIT',
         amount: comm,
         narration: `Reversal of commission on returned goods for order ${params.orderId}`,
+        orderId: params.orderId,
         merchantId: params.merchantId,
       });
     }
@@ -640,6 +937,7 @@ export class LedgerService {
         side: 'DEBIT',
         amount: commGst,
         narration: `Reversal of output GST on platform commission for order ${params.orderId}`,
+        orderId: params.orderId,
       });
     }
     if (tcs > 0) {
@@ -648,6 +946,7 @@ export class LedgerService {
         side: 'DEBIT',
         amount: tcs,
         narration: `Adjustment of Section 52 GST-TCS on return for order ${params.orderId}`,
+        orderId: params.orderId,
       });
     }
     if (tds > 0) {
@@ -656,6 +955,17 @@ export class LedgerService {
         side: 'DEBIT',
         amount: tds,
         narration: `Adjustment of Section 393/194-O TDS on return for order ${params.orderId}`,
+        orderId: params.orderId,
+      });
+    }
+    if (delayPen > 0) {
+      entries.push({
+        account: '4030',
+        side: 'DEBIT',
+        amount: delayPen,
+        narration: `Proportional reversal of store delay penalty on returned order ${params.orderId}`,
+        orderId: params.orderId,
+        merchantId: params.merchantId,
       });
     }
 
@@ -665,29 +975,44 @@ export class LedgerService {
       side: 'CREDIT',
       amount: refundTotal,
       narration: `Gateway refund disbursed to customer for order ${params.orderId}`,
+      orderId: params.orderId,
     });
 
-    for (const e of entries) {
-      await runner.query(`
-        INSERT INTO general_ledger_entries (
-          journal_batch_id, transaction_reference, transaction_type,
-          account_code, entry_side, amount, currency,
-          order_id, merchant_id, narration
-        )
-        VALUES ($1, $2, 'REFUND', $3, $4, $5, 'INR', $6, $7, $8)
-      `, [
-        journalBatchId,
-        txRef,
-        e.account,
-        e.side,
-        e.amount,
-        params.orderId,
-        e.merchantId || null,
-        e.narration,
-      ]);
+    let totalDebitsBn = entries
+      .filter((e) => e.side === 'DEBIT')
+      .reduce((s, e) => s.plus(toDecimal(e.amount)), new BigNumber(0));
+    const totalCreditsBn = entries
+      .filter((e) => e.side === 'CREDIT')
+      .reduce((s, e) => s.plus(toDecimal(e.amount)), new BigNumber(0));
+    const diffBn = totalCreditsBn.minus(totalDebitsBn);
+
+    if (diffBn.abs().gt(0.05)) {
+      throw new Error(
+        `LEDGER_UNBALANCED: Return refund batch unbalanced (Debits: ${roundCurrency(totalDebitsBn)}, Credits: ${roundCurrency(totalCreditsBn)}, Diff: ${roundCurrency(diffBn)}).`
+      );
+    } else if (!diffBn.isZero()) {
+      const adjTarget =
+        entries.find((e) => e.account === targetAccount && toDecimal(e.amount).plus(diffBn).gt(0)) ||
+        entries.find((e) => e.side === 'DEBIT' && toDecimal(e.amount).plus(diffBn).gt(0));
+      if (adjTarget) {
+        adjTarget.amount = Number(roundCurrency(toDecimal(adjTarget.amount).plus(diffBn)));
+        totalDebitsBn = entries
+          .filter((e) => e.side === 'DEBIT')
+          .reduce((s, e) => s.plus(toDecimal(e.amount)), new BigNumber(0));
+      }
+      if (!totalCreditsBn.eq(totalDebitsBn)) {
+        throw new Error(
+          `LEDGER_UNBALANCED: Return refund rounding adjustment failed (${roundCurrency(totalDebitsBn)} != ${roundCurrency(totalCreditsBn)}).`
+        );
+      }
     }
 
-    return journalBatchId;
+    return this.postJournalBatch({
+      txRef,
+      transactionType: 'REFUND',
+      lines: entries,
+      client: params.client,
+    });
   }
 
   /**
@@ -725,31 +1050,31 @@ export class LedgerService {
       ORDER BY a.account_code ASC
     `);
 
-    let totalDebits = 0;
-    let totalCredits = 0;
+    let totalDebitsBn = new BigNumber(0);
+    let totalCreditsBn = new BigNumber(0);
 
     const accounts = res.rows.map((r) => {
-      const d = parseFloat(r.debit_total);
-      const c = parseFloat(r.credit_total);
-      totalDebits += d;
-      totalCredits += c;
-      const net = r.normal_balance === 'DEBIT' ? +(d - c).toFixed(2) : +(c - d).toFixed(2);
+      const dBn = toDecimal(roundCurrency(r.debit_total));
+      const cBn = toDecimal(roundCurrency(r.credit_total));
+      totalDebitsBn = totalDebitsBn.plus(dBn);
+      totalCreditsBn = totalCreditsBn.plus(cBn);
+      const netBn = r.normal_balance === 'DEBIT' ? dBn.minus(cBn) : cBn.minus(dBn);
 
       return {
         accountCode: r.account_code,
         accountName: r.account_name,
         category: r.category,
         normalBalance: r.normal_balance,
-        debitTotal: +d.toFixed(2),
-        creditTotal: +c.toFixed(2),
-        netBalance: net,
+        debitTotal: Number(roundCurrency(dBn)),
+        creditTotal: Number(roundCurrency(cBn)),
+        netBalance: Number(roundCurrency(netBn)),
       };
     });
 
-    totalDebits = +totalDebits.toFixed(2);
-    totalCredits = +totalCredits.toFixed(2);
-    const difference = +(totalDebits - totalCredits).toFixed(2);
-    const isBalanced = Math.abs(difference) === 0;
+    const totalDebits = Number(roundCurrency(totalDebitsBn));
+    const totalCredits = Number(roundCurrency(totalCreditsBn));
+    const difference = Number(roundCurrency(totalDebitsBn.minus(totalCreditsBn)));
+    const isBalanced = totalDebitsBn.eq(totalCreditsBn);
 
     return {
       totalDebits,

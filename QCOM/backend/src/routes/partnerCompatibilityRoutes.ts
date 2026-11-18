@@ -332,7 +332,7 @@ tasksCompatibilityRouter.post('/:taskId/pickup-confirm', authenticate, riderTele
  */
 tasksCompatibilityRouter.post('/:taskId/verify-otp', authenticate, riderTelemetryRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const { taskId } = req.params;
-  const { otp, cashCollected } = req.body;
+  const { otp } = req.body;
   const pool = getPool();
 
   if (!otp || typeof otp !== 'string') {
@@ -351,7 +351,8 @@ tasksCompatibilityRouter.post('/:taskId/verify-otp', authenticate, riderTelemetr
 
     // Look up delivery trip and parent order
     const tripRes = await pool.query(`
-      SELECT dt.id, dt.order_id, dt.rider_id, dt.status as trip_status, o.delivery_otp, dt.total_rider_payout,
+      SELECT dt.id, dt.order_id, dt.rider_id, dt.status as trip_status, o.delivery_otp,
+             o.payment_method, o.total_amount, dt.total_rider_payout,
              dt.base_fare, dt.distance_fare, dt.surge_fare, dt.rider_tip_payable,
              dt.rider_withholding_amount
       FROM delivery_trips dt
@@ -415,14 +416,18 @@ tasksCompatibilityRouter.post('/:taskId/verify-otp', authenticate, riderTelemetr
       return;
     }
 
+    const pmLower = String(trip.payment_method || '').trim().toLowerCase();
+    const isCodOrder = pmLower === 'pay on delivery' || pmLower === 'cod' || pmLower === 'cash on delivery';
+    const authoritativeCodAmount = isCodOrder ? +parseFloat(trip.total_amount || '0').toFixed(2) : 0;
+
     // Complete delivery atomically in PostgreSQL (prevents concurrent delivery OTP replay)
     const deliverRes = await pool.query(`
       UPDATE delivery_trips 
       SET status = 'DELIVERED', delivered_at = NOW(), otp_verified = TRUE,
-          cod_collected_amount = COALESCE($1, cod_collected_amount)
+          cod_collected_amount = $1
       WHERE id = $2 AND status NOT IN ('DELIVERED', 'COMPLETED')
       RETURNING id
-    `, [Number(cashCollected) || 0, trip.id]);
+    `, [authoritativeCodAmount, trip.id]);
 
     if (deliverRes.rowCount === 0) {
       res.status(409).json({
@@ -445,7 +450,7 @@ tasksCompatibilityRouter.post('/:taskId/verify-otp', authenticate, riderTelemetr
       action: 'DELIVERY_OTP_VERIFIED',
       entityType: 'DELIVERY_TRIP',
       entityId: trip.id,
-      newState: { orderId: trip.order_id },
+      newState: { orderId: trip.order_id, authoritativeCodAmount },
       ipAddress: req.ip,
     });
 
@@ -454,7 +459,21 @@ tasksCompatibilityRouter.post('/:taskId/verify-otp', authenticate, riderTelemetr
     const surgePay = parseFloat(trip.surge_fare || 0);
     const tips = parseFloat(trip.rider_tip_payable || 0);
     const tds = parseFloat(trip.rider_withholding_amount || 0.5);
-    const totalPayout = basePay + distPay + surgePay + tips - tds;
+    const totalPayout = +(basePay + distPay + surgePay + tips - tds).toFixed(2);
+
+    let authoritativeWalletBalance = totalPayout;
+    let completedDeliveriesToday = 1;
+    if (trip.rider_id) {
+      const rBalRes = await pool.query(`SELECT wallet_balance FROM riders WHERE id = $1 LIMIT 1`, [trip.rider_id]);
+      if (rBalRes.rows.length > 0) {
+        authoritativeWalletBalance = +parseFloat(rBalRes.rows[0].wallet_balance || '0').toFixed(2);
+      }
+      const dCountRes = await pool.query(
+        `SELECT COUNT(*) AS cnt FROM delivery_trips WHERE rider_id = $1 AND status = 'DELIVERED'`,
+        [trip.rider_id]
+      );
+      completedDeliveriesToday = Math.max(1, parseInt(dCountRes.rows[0]?.cnt || '1', 10));
+    }
 
     res.status(200).json({
       success: true,
@@ -469,8 +488,8 @@ tasksCompatibilityRouter.post('/:taskId/verify-otp', authenticate, riderTelemetr
       },
       walletSummary: {
         todayTotalEarnings: totalPayout,
-        withdrawableBalance: totalPayout,
-        completedDeliveriesToday: 1,
+        withdrawableBalance: authoritativeWalletBalance,
+        completedDeliveriesToday,
       },
     });
   } catch (err: any) {

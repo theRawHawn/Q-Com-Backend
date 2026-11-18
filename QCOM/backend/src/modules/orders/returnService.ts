@@ -498,11 +498,16 @@ export class ReturnService {
         });
         refundRecord = refRes.refund;
 
+        if (refundRecord.status === 'FAILED') {
+          throw new Error(`RETURN_REFUND_FAILED: Payment gateway rejected refund for returned items (${refundRecord.refundNumber}).`);
+        }
+
         // 3. Process Seller Clawback or Return Debit in seller_ledgers & General Ledger
         clawbackResult = await sellerSettlementService.processSellerClawback({
           orderId: ret.order_id,
           merchantId: ret.merchant_id,
           refundAmount: totalRefundAmount,
+          returnId: ret.id,
           clientOverride: client,
         });
 

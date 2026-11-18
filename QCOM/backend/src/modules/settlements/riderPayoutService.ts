@@ -1,11 +1,13 @@
 import crypto from 'crypto';
 import pg from 'pg';
+import BigNumber from 'bignumber.js';
 import { getPool, transaction } from '../../database/connection.js';
 import { ledgerService } from '../ledger/ledgerService.js';
 import { getPayoutProvider, PayoutProvider, PayoutDisbursementResult } from './payoutProvider.js';
 import { RiderEarningsStatement, PayoutResult } from './settlementTypes.js';
 import { settlementEventPublisher, SettlementDomainEvent } from './settlementEvents.js';
 import { isTransientFailure } from '../resilience/retryPolicy.js';
+import { add, toDecimal, roundCurrency } from '../pricing/money.js';
 
 export class AsyncKeyedMutex {
   private queues = new Map<string, Promise<void>>();
@@ -68,36 +70,37 @@ export class RiderPayoutService {
       ORDER BY t.delivered_at DESC
     `, [riderId]);
 
-    let totalGrossEarnings = 0;
-    let totalTips = 0;
-    let totalTdsWithheld = 0;
-    let totalNetEarnings = 0;
+    let totalGrossEarningsBn = new BigNumber(0);
+    let totalTipsBn = new BigNumber(0);
+    let totalTdsWithheldBn = new BigNumber(0);
+    let totalNetEarningsBn = new BigNumber(0);
 
     const trips = tripsRes.rows.map((t) => {
-      const base = parseFloat(t.base_fare || '35.00');
-      const dist = parseFloat(t.distance_fare || '0.00');
-      const surge = parseFloat(t.surge_fare || '0.00');
-      const wait = parseFloat(t.wait_time_compensation || '0.00');
-      const tip = parseFloat(t.tip_amount || '0.00');
-      const tds = parseFloat(t.rider_withholding_amount || '0.00');
-      const net = +(base + dist + surge + wait + tip - tds).toFixed(2);
+      const baseBn = toDecimal(t.base_fare || '35.00');
+      const distBn = toDecimal(t.distance_fare || '0.00');
+      const surgeBn = toDecimal(t.surge_fare || '0.00');
+      const waitBn = toDecimal(t.wait_time_compensation || '0.00');
+      const tipBn = toDecimal(t.tip_amount || '0.00');
+      const tdsBn = toDecimal(t.rider_withholding_amount || '0.00');
+      const tripGrossBn = add(baseBn, distBn, surgeBn, waitBn);
+      const netBn = tripGrossBn.plus(tipBn).minus(tdsBn);
 
-      totalGrossEarnings += +(base + dist + surge + wait).toFixed(2);
-      totalTips += tip;
-      totalTdsWithheld += tds;
-      totalNetEarnings += net;
+      totalGrossEarningsBn = totalGrossEarningsBn.plus(tripGrossBn);
+      totalTipsBn = totalTipsBn.plus(tipBn);
+      totalTdsWithheldBn = totalTdsWithheldBn.plus(tdsBn);
+      totalNetEarningsBn = totalNetEarningsBn.plus(netBn);
 
       return {
         tripId: t.id,
         orderId: t.order_id,
         deliveredAt: t.delivered_at ? t.delivered_at.toISOString() : new Date().toISOString(),
-        baseFare: base,
-        distanceFare: dist,
-        surgeFare: surge,
-        waitCompensation: wait,
-        customerTip: tip,
-        tdsWithheld: tds,
-        netPayout: net,
+        baseFare: Number(roundCurrency(baseBn)),
+        distanceFare: Number(roundCurrency(distBn)),
+        surgeFare: Number(roundCurrency(surgeBn)),
+        waitCompensation: Number(roundCurrency(waitBn)),
+        customerTip: Number(roundCurrency(tipBn)),
+        tdsWithheld: Number(roundCurrency(tdsBn)),
+        netPayout: Number(roundCurrency(netBn)),
       };
     });
 
@@ -107,10 +110,10 @@ export class RiderPayoutService {
       WHERE rider_id = $1 AND status = 'PAID'
     `, [riderId]);
 
-    const totalPaidOut = parseFloat(payoutRes.rows[0].total_paid_out);
-    const floatingCash = parseFloat(r.floating_cash_balance || '0.00');
-    const floatingLimit = parseFloat(r.floating_cash_limit || '2500.00');
-    const isDispatchBlocked = floatingCash >= floatingLimit || r.status === 'SUSPENDED';
+    const totalPaidOut = Number(roundCurrency(toDecimal(payoutRes.rows[0].total_paid_out)));
+    const floatingCashBn = toDecimal(r.floating_cash_balance || '0.00');
+    const floatingLimitBn = toDecimal(r.floating_cash_limit || '2500.00');
+    const isDispatchBlocked = floatingCashBn.gte(floatingLimitBn) || r.status === 'SUSPENDED';
 
     return {
       riderId: r.id,
@@ -118,20 +121,20 @@ export class RiderPayoutService {
       panNumber: r.pan_number || undefined,
       panStatus: r.pan_status || undefined,
       kycStatus: r.kyc_status,
-      walletBalance: parseFloat(r.wallet_balance || '0.00'),
-      floatingCashBalance: floatingCash,
-      floatingCashLimit: floatingLimit,
+      walletBalance: Number(roundCurrency(toDecimal(r.wallet_balance || '0.00'))),
+      floatingCashBalance: Number(roundCurrency(floatingCashBn)),
+      floatingCashLimit: Number(roundCurrency(floatingLimitBn)),
       isDispatchBlocked,
       upiVpa: r.upi_vpa || undefined,
       bankDetails: {
         accountNumber: r.bank_account_number || undefined,
         ifsc: r.bank_ifsc || undefined,
       },
-      totalGrossEarnings: +totalGrossEarnings.toFixed(2),
-      totalTips: +totalTips.toFixed(2),
-      totalTdsWithheld: +totalTdsWithheld.toFixed(2),
-      totalNetEarnings: +totalNetEarnings.toFixed(2),
-      totalPaidOut: +totalPaidOut.toFixed(2),
+      totalGrossEarnings: Number(roundCurrency(totalGrossEarningsBn)),
+      totalTips: Number(roundCurrency(totalTipsBn)),
+      totalTdsWithheld: Number(roundCurrency(totalTdsWithheldBn)),
+      totalNetEarnings: Number(roundCurrency(totalNetEarningsBn)),
+      totalPaidOut,
       trips,
     };
   }
@@ -154,6 +157,20 @@ export class RiderPayoutService {
   }): Promise<PayoutResult> {
     const { riderId, amount, method = 'UPI', idempotencyKey } = params;
 
+    let validatedAmount: number | undefined;
+    if (amount !== undefined) {
+      let bn;
+      try {
+        bn = toDecimal(amount);
+      } catch {
+        throw new Error('INVALID_PAYOUT_AMOUNT: Payout amount must be a valid finite number.');
+      }
+      if (bn.lte(0)) {
+        throw new Error('INVALID_PAYOUT_AMOUNT: Payout amount must be greater than zero.');
+      }
+      validatedAmount = Number(roundCurrency(bn));
+    }
+
     // -----------------------------------------------------------------
     // STEP 0: Fast Idempotency Check
     // -----------------------------------------------------------------
@@ -167,6 +184,24 @@ export class RiderPayoutService {
 
       if (existingPayoutRes.rows.length > 0) {
         const row = existingPayoutRes.rows[0];
+        if (row.rider_id !== riderId) {
+          throw new Error(
+            `IDEMPOTENCY_KEY_CONFLICT: Idempotency key '${idempotencyKey}' already belongs to a different rider.`
+          );
+        }
+        if (
+          validatedAmount !== undefined &&
+          !toDecimal(row.amount).eq(toDecimal(validatedAmount))
+        ) {
+          throw new Error(
+            `IDEMPOTENCY_KEY_CONFLICT: Idempotency key '${idempotencyKey}' was previously used for amount ₹${roundCurrency(row.amount)}, cannot reuse for ₹${roundCurrency(validatedAmount)}.`
+          );
+        }
+        if (params.method !== undefined && row.payout_method !== params.method) {
+          throw new Error(
+            `IDEMPOTENCY_KEY_CONFLICT: Idempotency key '${idempotencyKey}' was previously used with method '${row.payout_method}', cannot reuse with '${params.method}'.`
+          );
+        }
         return {
           payoutId: row.id,
           payoutReference: row.payout_reference,
@@ -203,13 +238,32 @@ export class RiderPayoutService {
         `, [idempotencyKey]);
 
         if (existingPayoutRes.rows.length > 0) {
+          const existingRow = existingPayoutRes.rows[0];
+          if (existingRow.rider_id !== riderId) {
+            throw new Error(
+              `IDEMPOTENCY_KEY_CONFLICT: Idempotency key '${idempotencyKey}' already belongs to a different rider.`
+            );
+          }
+          if (
+            validatedAmount !== undefined &&
+            !toDecimal(existingRow.amount).eq(toDecimal(validatedAmount))
+          ) {
+            throw new Error(
+              `IDEMPOTENCY_KEY_CONFLICT: Idempotency key '${idempotencyKey}' was previously used for amount ₹${roundCurrency(existingRow.amount)}, cannot reuse for ₹${roundCurrency(validatedAmount)}.`
+            );
+          }
+          if (params.method !== undefined && existingRow.payout_method !== params.method) {
+            throw new Error(
+              `IDEMPOTENCY_KEY_CONFLICT: Idempotency key '${idempotencyKey}' was previously used with method '${existingRow.payout_method}', cannot reuse with '${params.method}'.`
+            );
+          }
           return {
-            payoutId: existingPayoutRes.rows[0].id,
-            payoutReference: existingPayoutRes.rows[0].payout_reference,
-            payoutAmount: parseFloat(existingPayoutRes.rows[0].amount),
+            payoutId: existingRow.id,
+            payoutReference: existingRow.payout_reference,
+            payoutAmount: parseFloat(existingRow.amount),
             rider: null,
             isDuplicate: true,
-            existingRow: existingPayoutRes.rows[0],
+            existingRow,
           };
         }
       }
@@ -231,16 +285,18 @@ export class RiderPayoutService {
         throw new Error(`PAYOUT_HELD: Payouts for rider '${riderId}' are held: ${rider.payout_hold_reason || 'Compliance review'}`);
       }
 
-      const currentWallet = parseFloat(rider.wallet_balance || '0.00');
-      if (currentWallet <= 0) {
+      const currentWalletBn = toDecimal(rider.wallet_balance || '0.00');
+      const currentWallet = Number(roundCurrency(currentWalletBn));
+      if (currentWalletBn.lte(0)) {
         throw new Error('ZERO_WALLET_BALANCE: Rider wallet balance is zero.');
       }
 
-      const payoutAmount = amount !== undefined ? amount : currentWallet;
-      if (payoutAmount > currentWallet) {
+      const payoutAmountBn = validatedAmount !== undefined ? toDecimal(validatedAmount) : currentWalletBn;
+      const payoutAmount = Number(roundCurrency(payoutAmountBn));
+      if (payoutAmountBn.gt(currentWalletBn)) {
         throw new Error(`INSUFFICIENT_WALLET_BALANCE: Requested payout amount ₹${payoutAmount} exceeds wallet balance ₹${currentWallet}`);
       }
-      if (payoutAmount <= 0) {
+      if (payoutAmountBn.lte(0)) {
         throw new Error('INVALID_PAYOUT_AMOUNT: Payout amount must be greater than zero.');
       }
 
@@ -255,7 +311,7 @@ export class RiderPayoutService {
       const payoutReference = `PAYOUT_RIDER_${Date.now()}_${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 
       // Deduct from wallet balance in DB immediately to prevent concurrent double-spend
-      const updatedWallet = +(currentWallet - payoutAmount).toFixed(2);
+      const updatedWallet = Number(roundCurrency(currentWalletBn.minus(payoutAmountBn)));
       await client.query(`
         UPDATE riders
         SET wallet_balance = $1,
@@ -370,7 +426,7 @@ export class RiderPayoutService {
       `, [payoutId]);
 
       const payoutRow = lockRes.rows[0];
-      if (payoutRow.status === 'PAID') {
+      if (payoutRow.status === 'PAID' || payoutRow.status === 'FAILED' || payoutRow.status === 'REVERSED') {
         return {
           payoutId: payoutRow.id,
           payoutReference: payoutRow.payout_reference,
@@ -379,6 +435,7 @@ export class RiderPayoutService {
           status: payoutRow.status,
           utrNumber: payoutRow.utr_number || undefined,
           journalBatchId: payoutRow.journal_batch_id || undefined,
+          failureReason: payoutRow.failure_reason || undefined,
           isDuplicate: false,
         };
       }
@@ -393,20 +450,7 @@ export class RiderPayoutService {
           client,
         });
 
-        // 2. Update rider_ledgers with confirmed UTR
-        await client.query(`
-          UPDATE rider_ledgers
-          SET utr_number = $1,
-              description = $2
-          WHERE rider_id = $3 AND description = $4
-        `, [
-          providerRes.utrNumber,
-          `Disbursement to ${method === 'UPI' ? rider.upi_vpa : rider.bank_account_number} (Ref: ${payoutReference}, UTR: ${providerRes.utrNumber})`,
-          riderId,
-          `Disbursement to ${method === 'UPI' ? rider.upi_vpa : rider.bank_account_number} reserved (Ref: ${payoutReference})`,
-        ]);
-
-        // 3. Mark rider_payouts as PAID
+        // 2. Mark rider_payouts as PAID (UTR tracked on rider_payouts & GL; rider_ledgers remains append-only)
         await client.query(`
           UPDATE rider_payouts
           SET status = 'PAID',
@@ -541,7 +585,7 @@ export class RiderPayoutService {
     }
 
     const payout = lockRes.rows[0];
-    if (payout.status === 'PAID' || payout.status === 'FAILED') {
+    if (payout.status === 'PAID' || payout.status === 'FAILED' || payout.status === 'REVERSED') {
       return {
         payoutId: payout.id,
         payoutReference: payout.payout_reference,
@@ -606,7 +650,7 @@ export class RiderPayoutService {
       }
 
       const curPayout = rowCheck.rows[0];
-      if (curPayout.status === 'PAID' || curPayout.status === 'FAILED') {
+      if (curPayout.status === 'PAID' || curPayout.status === 'FAILED' || curPayout.status === 'REVERSED') {
         return {
           payoutId: curPayout.id,
           payoutReference: curPayout.payout_reference,
@@ -652,18 +696,6 @@ export class RiderPayoutService {
           utrNumber: confirmedUtr,
           client,
         });
-
-        await client.query(`
-          UPDATE rider_ledgers
-          SET utr_number = $1,
-              description = $2
-          WHERE rider_id = $3 AND description = $4
-        `, [
-          confirmedUtr,
-          `Disbursement to rider (Ref: ${payoutReference}, UTR: ${confirmedUtr})`,
-          riderId,
-          `Disbursement to ${method === 'UPI' ? curPayout.destination_vpa : curPayout.destination_account} reserved (Ref: ${payoutReference})`,
-        ]);
 
         await client.query(`
           UPDATE rider_payouts
@@ -769,6 +801,18 @@ export class RiderPayoutService {
     reference?: string;
   }): Promise<{ success: boolean; remittedAmount: number; remainingCash: number; unblocked: boolean }> {
     const { riderId, amount, method = 'UPI', reference } = params;
+
+    let bn;
+    try {
+      bn = toDecimal(amount);
+    } catch {
+      throw new Error('INVALID_REMITTANCE_AMOUNT: Remittance amount must be a valid finite number.');
+    }
+    if (bn.lte(0)) {
+      throw new Error(`INVALID_REMITTANCE_AMOUNT: Remittance amount must be greater than zero.`);
+    }
+    const remittedAmount = Number(roundCurrency(bn));
+
     const stagedEvents: SettlementDomainEvent[] = [];
 
     const result = await transaction(async (client) => {
@@ -784,14 +828,43 @@ export class RiderPayoutService {
       }
 
       const rider = riderRes.rows[0];
-      const floatingCash = parseFloat(rider.floating_cash_balance || '0.00');
+      const floatingCashBn = toDecimal(rider.floating_cash_balance || '0.00');
+      const floatingCash = Number(roundCurrency(floatingCashBn));
 
-      if (amount <= 0 || amount > floatingCash) {
-        throw new Error(`INVALID_REMITTANCE_AMOUNT: Remittance amount ₹${amount} exceeds current floating cash ₹${floatingCash}.`);
+      // Idempotent retry check when explicit reference is supplied
+      if (reference) {
+        const existingRemitRes = await client.query(
+          `SELECT rider_id, amount FROM general_ledger_entries WHERE transaction_reference = $1 LIMIT 1`,
+          [`TX_COD_REMIT_${reference}`]
+        );
+        if (existingRemitRes.rows.length > 0) {
+          const existingRow = existingRemitRes.rows[0];
+          if (existingRow.rider_id !== riderId) {
+            throw new Error(
+              `COD_REFERENCE_CONFLICT: COD remittance reference '${reference}' already belongs to a different rider.`
+            );
+          }
+          if (!toDecimal(existingRow.amount).eq(toDecimal(remittedAmount))) {
+            throw new Error(
+              `COD_REFERENCE_AMOUNT_MISMATCH: COD remittance reference '${reference}' was previously recorded for ₹${roundCurrency(existingRow.amount)}, cannot reuse for ₹${roundCurrency(remittedAmount)}.`
+            );
+          }
+          return {
+            success: true,
+            remittedAmount,
+            remainingCash: floatingCash,
+            unblocked: rider.status !== 'SUSPENDED',
+          };
+        }
       }
 
-      const remittedAmount = +amount.toFixed(2);
-      const remainingCash = +(floatingCash - remittedAmount).toFixed(2);
+      const remittedAmountBn = toDecimal(remittedAmount);
+      if (remittedAmountBn.gt(floatingCashBn)) {
+        throw new Error(`INVALID_REMITTANCE_AMOUNT: Remittance amount ₹${remittedAmount} exceeds current floating cash ₹${floatingCash}.`);
+      }
+
+      const remainingCashBn = floatingCashBn.minus(remittedAmountBn);
+      const remainingCash = Number(roundCurrency(remainingCashBn));
       const remitRef = reference || `REMIT_COD_${Date.now()}_${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
 
       // 2. Post double-entry general ledger batch (Dr 1020 Bank Account, Cr 1030 Floating Cash)
@@ -803,7 +876,7 @@ export class RiderPayoutService {
       });
 
       // 3. Post Subledger entry in rider_ledgers
-      const currentWallet = parseFloat(rider.wallet_balance || '0.00');
+      const currentWallet = Number(roundCurrency(toDecimal(rider.wallet_balance || '0.00')));
       await client.query(`
         INSERT INTO rider_ledgers (
           rider_id, entry_type, category, amount, running_balance, description
@@ -817,8 +890,8 @@ export class RiderPayoutService {
       ]);
 
       // 4. Update rider floating cash and unblock if below ceiling
-      const floatingLimit = parseFloat(rider.floating_cash_limit || '2500.00');
-      const unblocked = remainingCash < floatingLimit && rider.status === 'SUSPENDED';
+      const floatingLimitBn = toDecimal(rider.floating_cash_limit || '2500.00');
+      const unblocked = remainingCashBn.lt(floatingLimitBn) && rider.status === 'SUSPENDED';
 
       await client.query(`
         UPDATE riders

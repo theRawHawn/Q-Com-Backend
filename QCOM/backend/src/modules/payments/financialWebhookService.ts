@@ -8,6 +8,8 @@ import { ledgerService } from '../ledger/ledgerService.js';
 import { outboxService } from '../outbox/outboxService.js';
 import { settlementEventPublisher } from '../settlements/settlementEvents.js';
 import { bloomFilterService } from '../resilience/bloomFilterService.js';
+import { applyPayoutToAllocationsFIFO, revertAllocationsFIFOForReversal } from '../settlements/sellerSettlementService.js';
+import { add, roundCurrency } from '../pricing/money.js';
 
 export interface WebhookResult {
   success: boolean;
@@ -251,7 +253,7 @@ export class FinancialWebhookService {
           WHERE id = $2
         `, [newPaymentStatus, refund.order_id]);
 
-        // Post General Ledger cancellation entry if pre-fulfillment cancellation
+        // Post General Ledger cancellation/escrow release entry if pre-fulfillment and no GL refund exists yet
         if (refund.reason_code?.startsWith('ORDER_CANCELLED_') || refund.reason_code === 'CANCELLATION') {
           await ledgerService.recordPreFulfillmentCancellationRefund({
             orderId: refund.order_id,
@@ -260,6 +262,24 @@ export class FinancialWebhookService {
             amount: parseFloat(refund.amount),
             client,
           });
+        } else {
+          const allocCheck = await client.query(
+            `SELECT 1 FROM order_settlement_allocations WHERE order_id = $1 LIMIT 1`,
+            [refund.order_id]
+          );
+          const glCheck = await client.query(
+            `SELECT 1 FROM general_ledger_entries WHERE order_id = $1 AND transaction_type = 'REFUND' LIMIT 1`,
+            [refund.order_id]
+          );
+          if (allocCheck.rows.length === 0 && glCheck.rows.length === 0) {
+            await ledgerService.recordPreFulfillmentCancellationRefund({
+              orderId: refund.order_id,
+              refundId: refund.id,
+              refundNumber: refund.refund_number,
+              amount: parseFloat(refund.amount),
+              client,
+            });
+          }
         }
 
         // Stage domain event
@@ -506,7 +526,7 @@ export class FinancialWebhookService {
       };
     }
 
-    if (sellerPayout.status === 'FAILED' && eventType !== 'payout.processed') {
+    if (sellerPayout.status === 'FAILED' || sellerPayout.status === 'REVERSED') {
       await client.query(`
         UPDATE webhook_events SET status = 'PROCESSED', processed_at = NOW() WHERE event_id = $1
       `, [eventId]);
@@ -514,11 +534,12 @@ export class FinancialWebhookService {
       return {
         success: true,
         duplicate: true,
+        ignored: eventType === 'payout.processed',
         eventId,
         eventType,
         aggregateId: sellerPayout.id,
         status: sellerPayout.status,
-        message: `Seller payout '${sellerPayout.id}' is already in terminal status '${sellerPayout.status}'.`,
+        message: `Seller payout '${sellerPayout.id}' is already in terminal status '${sellerPayout.status}'. Out-of-order event '${eventType}' ignored.`,
       };
     }
 
@@ -538,20 +559,7 @@ export class FinancialWebhookService {
         client,
       });
 
-      // Update seller_ledgers
-      await client.query(`
-        UPDATE seller_ledgers
-        SET utr_number = $1,
-            description = $2
-        WHERE merchant_id = $3 AND description = $4
-      `, [
-        confirmedUtr,
-        `Bank payout disbursement settled (Ref: ${payoutReference}, UTR: ${confirmedUtr})`,
-        merchantId,
-        `Bank payout disbursement reserved (Ref: ${payoutReference})`,
-      ]);
-
-      // Update seller_payouts
+      // Update seller_payouts (seller_ledgers remains strictly append-only; UTR recorded in seller_payouts & GL)
       await client.query(`
         UPDATE seller_payouts
         SET status = 'PAID',
@@ -565,12 +573,8 @@ export class FinancialWebhookService {
         WHERE id = $4
       `, [confirmedUtr, providerPayoutId || null, journalBatchId, sellerPayout.id]);
 
-      // Mark order allocations SETTLED
-      await client.query(`
-        UPDATE order_settlement_allocations
-        SET status = 'SETTLED'
-        WHERE merchant_id = $1 AND status = 'ALLOCATED'
-      `, [merchantId]);
+      // Settle open allocations strictly FIFO up to payoutAmount
+      await applyPayoutToAllocationsFIFO(client, merchantId, payoutAmount);
 
       stagedEvents.push(
         settlementEventPublisher.createEvent('SellerPayoutCompleted', {
@@ -597,29 +601,43 @@ export class FinancialWebhookService {
         message: `Seller payout '${sellerPayout.id}' transitioned to PAID via webhook.`,
       };
     } else if (eventType === 'payout.reversed' || eventType === 'payout.rejected' || eventType === 'payout.failed') {
+      const terminalStatus = eventType === 'payout.reversed' ? 'REVERSED' : 'FAILED';
+
       // Lock merchant row to prevent balance corruption under horizontal scaling
       await client.query(`SELECT id FROM merchants WHERE id = $1 FOR UPDATE`, [merchantId]);
 
+      const wasPaid = sellerPayout.status === 'PAID';
+      if (wasPaid) {
+        await ledgerService.recordPayoutFailureReversal({
+          type: 'MERCHANT',
+          actorId: merchantId,
+          amount: payoutAmount,
+          reference: payoutReference,
+          client,
+        });
+        await revertAllocationsFIFOForReversal(client, merchantId, payoutAmount);
+      }
+
       await client.query(`
         UPDATE seller_payouts
-        SET status = 'FAILED',
-            failure_reason = $1,
+        SET status = $1,
+            failure_reason = $2,
             recovery_lease_id = NULL,
             recovery_lease_expires_at = NULL,
             updated_at = NOW()
-        WHERE id = $2
-      `, [failureReason || 'Disbursement rejected or reversed by banking rail.', sellerPayout.id]);
+        WHERE id = $3
+      `, [terminalStatus, failureReason || 'Disbursement rejected or reversed by banking rail.', sellerPayout.id]);
 
       // Restore running balance with CREDIT ADJUSTMENT in seller_ledgers
       const curBalRes = await client.query(`
         SELECT running_balance FROM seller_ledgers
         WHERE merchant_id = $1
-        ORDER BY created_at DESC
+        ORDER BY created_at DESC, seq_no DESC
         LIMIT 1
       `, [merchantId]);
 
-      const currentRunning = curBalRes.rows.length > 0 ? parseFloat(curBalRes.rows[0].running_balance) : 0;
-      const restoredRunning = +(currentRunning + payoutAmount).toFixed(2);
+      const currentRunning = curBalRes.rows.length > 0 ? curBalRes.rows[0].running_balance : '0.00';
+      const restoredRunning = Number(roundCurrency(add(currentRunning, payoutAmount)));
 
       await client.query(`
         INSERT INTO seller_ledgers (
@@ -630,7 +648,7 @@ export class FinancialWebhookService {
         merchantId,
         payoutAmount,
         restoredRunning,
-        `Restoration of payable balance due to failed bank disbursement (Ref: ${payoutReference}, Reason: ${failureReason || 'Bank Rejection'})`,
+        `Restoration of payable balance due to ${terminalStatus.toLowerCase()} bank disbursement (Ref: ${payoutReference}, Reason: ${failureReason || 'Bank Rejection'})`,
       ]);
 
       await client.query(`
@@ -642,8 +660,8 @@ export class FinancialWebhookService {
         eventId,
         eventType,
         aggregateId: sellerPayout.id,
-        status: 'FAILED',
-        message: `Seller payout '${sellerPayout.id}' marked FAILED and balance restored via webhook.`,
+        status: terminalStatus,
+        message: `Seller payout '${sellerPayout.id}' marked ${terminalStatus} and balance restored via webhook.`,
       };
     } else {
       // Intermediate state (queued, initiated, pending)
@@ -694,7 +712,7 @@ export class FinancialWebhookService {
       };
     }
 
-    if (riderPayout.status === 'FAILED' && eventType !== 'payout.processed') {
+    if (riderPayout.status === 'FAILED' || riderPayout.status === 'REVERSED') {
       await client.query(`
         UPDATE webhook_events SET status = 'PROCESSED', processed_at = NOW() WHERE event_id = $1
       `, [eventId]);
@@ -702,11 +720,12 @@ export class FinancialWebhookService {
       return {
         success: true,
         duplicate: true,
+        ignored: eventType === 'payout.processed',
         eventId,
         eventType,
         aggregateId: riderPayout.id,
         status: riderPayout.status,
-        message: `Rider payout '${riderPayout.id}' is already in terminal status '${riderPayout.status}'.`,
+        message: `Rider payout '${riderPayout.id}' is already in terminal status '${riderPayout.status}'. Out-of-order event '${eventType}' ignored.`,
       };
     }
 
@@ -767,17 +786,43 @@ export class FinancialWebhookService {
       };
     } else if (eventType === 'payout.reversed' || eventType === 'payout.rejected' || eventType === 'payout.failed') {
       const terminalStatus = eventType === 'payout.reversed' ? 'REVERSED' : 'FAILED';
+      const wasPaid = riderPayout.status === 'PAID';
 
       // Lock rider row
-      await client.query(`SELECT id FROM riders WHERE id = $1 FOR UPDATE`, [riderId]);
+      const riderLockRes = await client.query(`SELECT id, wallet_balance FROM riders WHERE id = $1 FOR UPDATE`, [riderId]);
+      const prevWallet = riderLockRes.rows.length > 0 ? riderLockRes.rows[0].wallet_balance || '0' : '0';
+      const restoredWallet = Number(roundCurrency(add(prevWallet, payoutAmount)));
+
+      if (wasPaid) {
+        await ledgerService.recordPayoutFailureReversal({
+          type: 'RIDER',
+          actorId: riderId,
+          amount: payoutAmount,
+          reference: payoutReference,
+          client,
+        });
+      }
 
       // Restore wallet balance on riders
       await client.query(`
         UPDATE riders
-        SET wallet_balance = wallet_balance + $1,
+        SET wallet_balance = $1,
             updated_at = NOW()
         WHERE id = $2
-      `, [payoutAmount, riderId]);
+      `, [restoredWallet, riderId]);
+
+      // Post append-only ADJUSTMENT CREDIT in rider_ledgers
+      await client.query(`
+        INSERT INTO rider_ledgers (
+          rider_id, entry_type, category, amount, running_balance, description
+        )
+        VALUES ($1, 'ADJUSTMENT', 'CREDIT', $2, $3, $4)
+      `, [
+        riderId,
+        payoutAmount,
+        restoredWallet,
+        `Restoration of rider wallet balance due to ${terminalStatus.toLowerCase()} disbursement (Ref: ${payoutReference})`,
+      ]);
 
       // Update rider_payouts
       await client.query(`

@@ -19,11 +19,11 @@
 | **Payments** | Provider-Agnostic Abstraction | **IMPLEMENTED** | `PaymentProvider` interface, `MockPaymentProvider` sandbox |
 | **Payments** | Webhook Deduplication | **IMPLEMENTED** | `financialWebhookService.ts`, unique `event_id` constraints |
 | **Payments** | Distributed Recovery Worker | **IMPLEMENTED** | `financialRecoveryWorker.ts`, lease fencing |
-| **Settlement** | Double-Entry General Ledger | **IMPLEMENTED** | `ledgerService.ts`, balanced `journal_entries` |
-| **Settlement** | Statutory Withholding (TDS/TCS)| **IMPLEMENTED**| Section 194-O (1%) & Section 52 GST-TCS (0.5%) |
-| **Settlement** | Idempotent Payout Execution | **IMPLEMENTED** | Payout idempotency constraints, batch release routes |
+| **Settlement** | Double-Entry General Ledger | **IMPLEMENTED** | `ledgerService.ts`, balanced `journal_entries`, Migration 027 `LEDGER_IMMUTABLE` triggers |
+| **Settlement** | Statutory Withholding (TDS/TCS)| **IMPLEMENTED**| Section 194-O / Sec 393 & Section 52 GST-TCS |
+| **Settlement** | Idempotent Payout, FIFO & Reversal | **IMPLEMENTED** | `sellerSettlementService.ts`, `riderPayoutService.ts`, FIFO `settled_amount`/`refunded_amount`, post-`PAID` reversal webhooks & `1040->2020` clawback offset |
 | **Dispatch** | Trip Broadcasting & Claiming | **IMPLEMENTED** | Atomic `UPDATE ... WHERE status = 'BROADCASTING'` |
-| **Delivery** | Doorstep OTP Handshake | **IMPLEMENTED** | Verification via `orders.delivery_otp` |
+| **Delivery** | Doorstep OTP Handshake | **IMPLEMENTED** | Constant-time verification via `orders.delivery_otp`, server-derived COD collection (`partnerCompatibilityRoutes.ts`) |
 | **Realtime** | WebSocket Event Streaming | **IMPLEMENTED** | `/ws/v1`, channel authorization (`order:<id>`) |
 | **Realtime** | Ephemeral GPS Telemetry | **IMPLEMENTED** | 1-second ping memory/Redis broadcast (0 PG writes) |
 | **Observability** | Health & Readiness Probes | **IMPLEMENTED** | `/health/live`, `/health/ready` |

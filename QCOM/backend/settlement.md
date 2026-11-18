@@ -77,7 +77,7 @@ $$\begin{aligned}
 > Within every journal transaction and batch, the sum of all Debits MUST equal the sum of all Credits:
 > $$\sum \text{Debits} \equiv \sum \text{Credits}$$
 > **IMMUTABILITY RULE:**  
-> No user, including Super Admin, is permitted to update or delete historical ledger records. Any correction or adjustment MUST occur through a new, auditable reversal or adjustment journal entry.
+> Application services and Super Admin API users are not permitted to update or delete historical ledger records (`LEDGER_IMMUTABLE` triggers plus `REVOKE UPDATE, DELETE, TRUNCATE ... FROM PUBLIC`). Any correction or adjustment MUST occur through a new, auditable reversal or adjustment journal entry. Production database connections should run under a non-owner `NOSUPERUSER` role because PostgreSQL superusers/table owners can bypass or disable triggers via DDL.
 
 ### 3.2 Standard Chart of Accounts (COA)
 | Account Code | Account Name | Category | Normal Balance |
@@ -85,6 +85,7 @@ $$\begin{aligned}
 | `1010` | Cash at Payment Gateway / Escrow | Current Asset | Debit |
 | `1020` | Bank Operating Account | Current Asset | Debit |
 | `1030` | Floating Cash in Hands of Riders (COD) | Current Asset | Debit |
+| `1040` | Seller Clawback Receivable | Current Asset | Debit |
 | `2010` | Customer Funds Held in Escrow | Current Liability | Credit |
 | `2020` | Merchant Accounts Payable (Seller Ledger) | Current Liability | Credit |
 | `2030` | Delivery Partner Wallet Payable (Rider Ledger) | Current Liability | Credit |
@@ -112,3 +113,11 @@ Debit:  2050 Income-Tax Withholding Reversal      ₹0.82
 Credit: 1010 Cash at Gateway / Escrow                      ₹972.82
 (Reversal Batch Balance: Debits ₹972.82 == Credits ₹972.82)
 ```
+
+### 3.4 Sprint 15.5 Lifecycle, Allocation & Append-Only Guarantees
+- **Append-Only Subledgers, Batches & General Ledger:** `ledger_journal_batches`, `general_ledger_entries`, `seller_ledgers`, and `rider_ledgers` forbid `UPDATE`, `DELETE`, and `TRUNCATE` via PostgreSQL triggers (`LEDGER_IMMUTABLE`) paired with `REVOKE UPDATE, DELETE, TRUNCATE ... FROM PUBLIC` (enforced for all non-superuser/non-owner roles; triggers do not substitute for restricting superuser/owner credentials). `ledger_journal_batches` enforces atomic `transaction_reference` claiming with canonical `payload_hash` verification, and monotonic `seq_no` triggers guarantee deterministic running balances.
+- **FIFO Partial Allocation Settlement & Reversal:** `order_settlement_allocations` retains `status = 'ALLOCATED'` while tracking cumulative `settled_amount` and `refunded_amount`, transitioning to `'SETTLED'` when `settled_amount + refunded_amount >= net_seller_payable - 0.01`, or `'REVERSED'` only upon full reversal.
+- **Partial & Post-Payout Clawback Offset (`2020` / `1040 -> 2020`):** Return clawbacks debit `2020` (`RETURN_DEBIT`) up to the remaining unsettled portion of an allocation and debit `1040` (`Seller Clawback Receivable`, `CLAWBACK_DEBIT`) for the settled portion alongside proportional fee/delay-penalty reversals (`4010`, `2070`, `2040`, `2050`, `4030`), automatically offsetting subsequent eligible seller allocations (`Dr 2020 / Cr 1040`).
+- **Post-`PAID` Bank Reversal & Replay Guard:** Webhook failure/reversal transitions `PAID -> REVERSED` (terminal), restores seller/rider balances via compensating ledger credits and FIFO allocation reversion, and ignores duplicate or out-of-order webhooks against terminal payouts.
+- **Idempotent COD Remittance:** `remitCodCash` validates positive currency inputs, locks `riders FOR UPDATE`, enforces same-rider and same-amount ownership on duplicate `reference` retries, and unblocks COD-suspended riders when `floating_cash_balance` drops below threshold.
+

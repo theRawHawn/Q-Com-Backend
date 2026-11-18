@@ -273,17 +273,18 @@ export class CancellationService {
       WHERE order_id = $1 AND status IN ('CREATED', 'PENDING', 'AUTHORIZED')
     `, [orderId]);
 
-    // 4. Update order status in PostgreSQL
+    // 4. Update order status in PostgreSQL (only mark REFUNDED if refund actually COMPLETED)
     const finalReason = `[${cancelledBy}] ${reason}`;
+    const markRefunded = refundRecord?.status === 'COMPLETED';
     const updRes = await client.query(`
       UPDATE orders
       SET status = 'cancelled',
           cancellation_reason = $2,
-          payment_status = CASE WHEN payment_status = 'PAID' THEN 'REFUNDED' ELSE payment_status END,
+          payment_status = CASE WHEN $3 = TRUE AND payment_status = 'PAID' THEN 'REFUNDED' ELSE payment_status END,
           updated_at = NOW()
       WHERE id = $1
       RETURNING *
-    `, [orderId, finalReason]);
+    `, [orderId, finalReason, markRefunded]);
 
     const updatedOrder = updRes.rows[0];
 

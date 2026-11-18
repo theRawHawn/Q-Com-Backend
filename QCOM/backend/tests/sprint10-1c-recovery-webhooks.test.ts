@@ -433,9 +433,9 @@ export async function runSprint10CRecoveryAndWebhookTests(): Promise<void> {
     signature: signPayload(rawRevBody),
   });
 
-  assert.strictEqual(whRes12.status, 'FAILED');
+  assert.strictEqual(whRes12.status, 'REVERSED');
   const spCheck12 = await pool.query(`SELECT status, failure_reason FROM seller_payouts WHERE id = $1`, [payoutId11]);
-  assert.strictEqual(spCheck12.rows[0].status, 'FAILED');
+  assert.strictEqual(spCheck12.rows[0].status, 'REVERSED');
 
   const ledgerRes12 = await pool.query(`
     SELECT amount, category, entry_type FROM seller_ledgers

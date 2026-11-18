@@ -7,6 +7,7 @@ import { ledgerService } from '../ledger/ledgerService.js';
 import { bloomFilterService } from '../resilience/bloomFilterService.js';
 import { CircuitBreaker } from '../resilience/circuitBreaker.js';
 import { executeWithRetry, isTransientFailure } from '../resilience/retryPolicy.js';
+import { toDecimal, roundCurrency, subtract, add } from '../pricing/money.js';
 
 export interface CreateRefundParams {
   orderId: string;
@@ -80,6 +81,27 @@ export class RefundService {
     return this.provider;
   }
 
+  private assertIdempotencyCompatibility(
+    existingRow: any,
+    orderId: string,
+    explicitAmount: number | undefined,
+    idempotencyKey: string
+  ): void {
+    if (existingRow.order_id !== orderId) {
+      throw new Error(
+        `IDEMPOTENCY_KEY_CONFLICT: Idempotency key '${idempotencyKey}' was already used for another order.`
+      );
+    }
+    if (explicitAmount !== undefined) {
+      const existingAmt = Number(roundCurrency(existingRow.amount));
+      if (existingAmt !== explicitAmount) {
+        throw new Error(
+          `IDEMPOTENCY_KEY_CONFLICT: Idempotency key '${idempotencyKey}' was already used for ₹${existingAmt.toFixed(2)}, cannot reuse for ₹${explicitAmount.toFixed(2)}.`
+        );
+      }
+    }
+  }
+
   /**
    * Initiates a refund for an order with idempotency and ceiling guarantees.
    * Completely decoupled into 3 phases:
@@ -88,6 +110,19 @@ export class RefundService {
    *   STEP C (Reconcile): Short transaction to update refund record, order status, and stage outbox events.
    */
   public async createRefund(params: CreateRefundParams): Promise<{ refund: RefundRecord; isDuplicate: boolean }> {
+    let explicitAmount: number | undefined;
+    if (params.amount !== undefined) {
+      let bn;
+      try {
+        bn = toDecimal(params.amount);
+      } catch {
+        throw new Error('INVALID_REFUND_AMOUNT: Refund amount must be a valid finite number.');
+      }
+      if (bn.lte(0)) {
+        throw new Error('INVALID_REFUND_AMOUNT: Refund amount must be greater than zero.');
+      }
+      explicitAmount = Number(roundCurrency(bn));
+    }
     // -----------------------------------------------------------------
     // STEP 0: Fast Idempotency Check
     // -----------------------------------------------------------------
@@ -100,6 +135,12 @@ export class RefundService {
       `, [params.idempotencyKey]);
 
       if (existingRefund.rows.length > 0) {
+        this.assertIdempotencyCompatibility(
+          existingRefund.rows[0],
+          params.orderId,
+          explicitAmount,
+          params.idempotencyKey
+        );
         return {
           refund: this.mapRow(existingRefund.rows[0]),
           isDuplicate: true,
@@ -130,6 +171,12 @@ export class RefundService {
         `, [params.idempotencyKey]);
 
         if (existingLocked.rows.length > 0) {
+          this.assertIdempotencyCompatibility(
+            existingLocked.rows[0],
+            params.orderId,
+            explicitAmount,
+            params.idempotencyKey
+          );
           return {
             refundRow: existingLocked.rows[0],
             paymentId: existingLocked.rows[0].payment_id,
@@ -154,30 +201,35 @@ export class RefundService {
       }
 
       const order = orderRes.rows[0];
-      const orderTotal = parseFloat(order.total_amount);
+      if (order.payment_status === 'FAILED' || order.payment_status === 'REFUNDED') {
+        throw new Error(`ORDER_NOT_REFUNDABLE: Order payment status '${order.payment_status}' cannot be refunded.`);
+      }
+      const orderTotalBn = toDecimal(order.total_amount);
 
-      // Check sum of prior refunds that are completed or in-flight (PROCESSING / PENDING)
+      // Check sum of prior refunds that are completed or in-flight (REQUESTED / PENDING / PROCESSING)
       const priorRefundsRes = await client.query(`
         SELECT COALESCE(SUM(amount), 0) AS total_refunded
         FROM refunds
-        WHERE order_id = $1 AND status IN ('PENDING', 'PROCESSING', 'COMPLETED')
+        WHERE order_id = $1 AND status IN ('REQUESTED', 'PENDING', 'PROCESSING', 'COMPLETED')
       `, [params.orderId]);
 
-      const priorRefunded = parseFloat(priorRefundsRes.rows[0].total_refunded);
-      const remainingRefundable = +(orderTotal - priorRefunded).toFixed(2);
+      const priorRefundedBn = toDecimal(priorRefundsRes.rows[0].total_refunded);
+      const remainingRefundableBn = subtract(orderTotalBn, priorRefundedBn);
+      const remainingRefundable = Number(roundCurrency(remainingRefundableBn));
 
-      const requestedAmount = params.amount !== undefined ? +params.amount.toFixed(2) : remainingRefundable;
-      if (requestedAmount <= 0) {
+      const requestedAmount = explicitAmount !== undefined ? explicitAmount : remainingRefundable;
+      const requestedAmountBn = toDecimal(requestedAmount);
+      if (requestedAmountBn.lte(0)) {
         throw new Error('INVALID_REFUND_AMOUNT: Refund amount must be greater than zero.');
       }
 
-      if (requestedAmount > remainingRefundable) {
+      if (requestedAmountBn.gt(toDecimal(remainingRefundable))) {
         throw new Error(
-          `REFUND_CEILING_EXCEEDED: Requested refund amount ₹${requestedAmount} exceeds remaining refundable balance ₹${remainingRefundable} (Order Total: ₹${orderTotal}, Prior Refunded: ₹${priorRefunded}).`
+          `REFUND_CEILING_EXCEEDED: Requested refund amount ₹${requestedAmount} exceeds remaining refundable balance ₹${remainingRefundable} (Order Total: ₹${roundCurrency(orderTotalBn)}, Prior Refunded: ₹${roundCurrency(priorRefundedBn)}).`
         );
       }
 
-      const isFull = (priorRefunded + requestedAmount) >= (orderTotal - 0.01);
+      const isFull = add(priorRefundedBn, requestedAmountBn).gte(orderTotalBn.minus('0.01'));
       const refundType = params.refundType || (isFull ? 'FULL' : 'PARTIAL');
 
       // Find payment intent / transaction ID
@@ -441,7 +493,7 @@ export class RefundService {
    */
   public async reconcileRefund(refundId: string, expectedLeaseOwner?: string): Promise<RefundRecord> {
     const pool = getPool();
-    const refRes = await pool.query(`SELECT * FROM refunds WHERE id = $1 FOR UPDATE`, [refundId]);
+    const refRes = await pool.query(`SELECT * FROM refunds WHERE id = $1`, [refundId]);
     if (refRes.rows.length === 0) {
       throw new Error(`REFUND_NOT_FOUND: Refund '${refundId}' does not exist.`);
     }

@@ -1,9 +1,11 @@
 import pg from 'pg';
+import BigNumber from 'bignumber.js';
 import { getPool, transaction } from '../../database/connection.js';
 import { ledgerService } from '../ledger/ledgerService.js';
 import { taxEngine } from '../pricing/taxEngine.js';
 import { OrderSettlementAllocation } from './settlementTypes.js';
 import { settlementEventPublisher, SettlementDomainEvent } from './settlementEvents.js';
+import { toDecimal, roundCurrency, add, subtract, multiply, divide } from '../pricing/money.js';
 
 export class SettlementAllocationService {
   /**
@@ -69,6 +71,20 @@ export class SettlementAllocationService {
         };
       }
 
+      const isCodOrder = ['pay on delivery', 'cod', 'cash on delivery'].includes(
+        String(order.payment_method || '').trim().toLowerCase()
+      );
+      if (String(order.status || '').toLowerCase() !== 'delivered') {
+        throw new Error(
+          `ORDER_NOT_DELIVERED: Order '${orderId}' must be in 'delivered' status before settlement allocation (current: '${order.status}').`
+        );
+      }
+      if (!isCodOrder && order.payment_status !== 'PAID') {
+        throw new Error(
+          `ORDER_NOT_PAID: Online order '${orderId}' must be in 'PAID' payment status before settlement allocation (current: '${order.payment_status}').`
+        );
+      }
+
       // 3. Row-level lock on delivery_trip (if assigned)
       const tripRes = await client.query(`
         SELECT * FROM delivery_trips
@@ -80,11 +96,12 @@ export class SettlementAllocationService {
       const trip = tripRes.rows[0];
       const riderId = trip?.rider_id;
 
-      // 4. Fetch merchant contract and tax configuration
+      // 4. Lock merchant contract and tax configuration FOR UPDATE to serialize subledger reads/writes
       const merchRes = await client.query(`
         SELECT * FROM merchants
         WHERE id = $1
         LIMIT 1
+        FOR UPDATE
       `, [order.merchant_id]);
 
       if (merchRes.rows.length === 0) {
@@ -92,74 +109,92 @@ export class SettlementAllocationService {
       }
 
       const merchant = merchRes.rows[0];
-      const commissionRate = parseFloat(merchant.commission_rate_percent || '15.00');
+      const commissionRateBn = toDecimal(merchant.commission_rate_percent || '15.00');
 
-      // 5. Derive authoritative financial values from frozen pricing snapshot
+      // 5. Derive authoritative financial values from frozen pricing snapshot using BigNumber
       const snapshot = typeof order.pricing_snapshot === 'string'
         ? JSON.parse(order.pricing_snapshot)
         : order.pricing_snapshot || {};
 
-      const sellerGoodsTaxable = parseFloat(snapshot.sellerGoodsBreakdown?.taxableAmount || order.taxable_amount || '0.00');
-      const sellerGoodsGst = parseFloat(
-        snapshot.sellerGoodsBreakdown?.totalGst ||
-        snapshot.sellerGst ||
-        (
-          parseFloat(order.cgst_amount || '0') +
-          parseFloat(order.sgst_amount || '0') +
-          parseFloat(order.igst_amount || '0') -
-          parseFloat(snapshot.qcomFeesBreakdown?.totalGst || '0')
-        ).toFixed(2)
+      const sellerGoodsTaxableBn = toDecimal(snapshot.sellerGoodsBreakdown?.taxableAmount ?? order.taxable_amount ?? '0.00');
+      const fallbackGoodsGstBn = subtract(
+        add(order.cgst_amount || '0', order.sgst_amount || '0', order.igst_amount || '0'),
+        snapshot.qcomFeesBreakdown?.totalGst || '0'
       );
-      const grossGmv = parseFloat(snapshot.sellerGoodsBreakdown?.totalSellerPayable || +(sellerGoodsTaxable + sellerGoodsGst).toFixed(2));
+      const sellerGoodsGstBn = toDecimal(
+        snapshot.sellerGoodsBreakdown?.totalGst ?? snapshot.sellerGst ?? roundCurrency(fallbackGoodsGstBn)
+      );
+      const sellerGoodsTaxable = Number(roundCurrency(sellerGoodsTaxableBn));
+      const sellerGoodsGst = Number(roundCurrency(sellerGoodsGstBn));
+      const grossGmvBn = toDecimal(
+        snapshot.sellerGoodsBreakdown?.totalSellerPayable ?? roundCurrency(add(sellerGoodsTaxableBn, sellerGoodsGstBn))
+      );
+      const grossGmv = Number(roundCurrency(grossGmvBn));
 
       // Sourced from effective-dated rules
-      const platformCommission = +(sellerGoodsTaxable * (commissionRate / 100)).toFixed(2);
+      const platformCommissionStr = roundCurrency(multiply(sellerGoodsTaxableBn, divide(commissionRateBn, 100)));
+      const platformCommission = Number(platformCommissionStr);
 
       // Resolve statutory commission GST rule (SAC 9983 @ 18%)
       const commTaxRule = await taxEngine.resolveServiceTaxRule('COMMISSION_GST', order.created_at, client);
-      const commGstRate = parseFloat(commTaxRule.gst_rate_percent || '18.00');
-      const commissionGst = +(platformCommission * (commGstRate / 100)).toFixed(2);
+      const commGstRateBn = toDecimal(commTaxRule.gst_rate_percent || '18.00');
+      const commissionGstStr = roundCurrency(multiply(platformCommissionStr, divide(commGstRateBn, 100)));
+      const commissionGst = Number(commissionGstStr);
 
       // Resolve Section 52 GST-TCS (0.50% on Net Taxable Supplies)
       const gstTcs = await taxEngine.resolveGstTcs({
-        netTaxableSupplies: sellerGoodsTaxable.toString(),
+        netTaxableSupplies: roundCurrency(sellerGoodsTaxableBn),
         isInterState: false,
         transactionDate: order.created_at,
         poolOverride: client,
       });
-      const gstTcsAmount = parseFloat(gstTcs.totalTcsAmount || '0.00');
+      const gstTcsAmount = Number(roundCurrency(gstTcs.totalTcsAmount || '0.00'));
 
       // Resolve Section 393 / 194-O Income-Tax Withholding
       const withholding = await taxEngine.resolveWithholding({
-        grossTaxableAmount: grossGmv.toString(),
+        grossTaxableAmount: roundCurrency(grossGmvBn),
         merchantConstitution: merchant.constitution_type || 'INDIVIDUAL',
         merchantPanStatus: merchant.pan_status || 'VALID_PAN',
         transactionDate: order.created_at,
         poolOverride: client,
       });
-      const sellerTdsAmount = parseFloat(withholding.withholdingAmount || '0.00');
+      const sellerTdsAmount = Number(roundCurrency(withholding.withholdingAmount || '0.00'));
 
       // Store preparation delay penalty (if store prep exceeded 5 mins SLA)
       let storeDelayPenalty = 0.00;
       if (merchant.base_prep_mins && merchant.base_prep_mins > 5) {
-        storeDelayPenalty = +((merchant.base_prep_mins - 5) * 1.20).toFixed(2);
+        storeDelayPenalty = Number(roundCurrency(multiply(merchant.base_prep_mins - 5, '1.20')));
       }
 
       // Net Seller Payable calculation
-      const netSellerPayable = +(
-        grossGmv -
-        platformCommission -
-        commissionGst -
-        gstTcsAmount -
-        sellerTdsAmount -
-        storeDelayPenalty
-      ).toFixed(2);
+      const netSellerPayable = Number(
+        roundCurrency(
+          subtract(
+            grossGmv,
+            platformCommission,
+            commissionGst,
+            gstTcsAmount,
+            sellerTdsAmount,
+            storeDelayPenalty
+          )
+        )
+      );
 
       // Customer fees
-      const customerDeliveryFee = parseFloat(snapshot.qcomFeesBreakdown?.deliveryTaxable || order.delivery_fee || '0.00');
-      const deliveryFeeGst = parseFloat(snapshot.qcomFeesBreakdown?.deliveryGst || (customerDeliveryFee > 0 ? +(customerDeliveryFee * 0.18).toFixed(2) : '0.00'));
-      const customerHandlingFee = parseFloat(snapshot.qcomFeesBreakdown?.handlingTaxable || order.handling_fee || '0.00');
-      const handlingFeeGst = parseFloat(snapshot.qcomFeesBreakdown?.handlingGst || (customerHandlingFee > 0 ? +(customerHandlingFee * 0.18).toFixed(2) : '0.00'));
+      const customerDeliveryFee = Number(roundCurrency(snapshot.qcomFeesBreakdown?.deliveryTaxable ?? order.delivery_fee ?? '0.00'));
+      const deliveryFeeGst = Number(
+        roundCurrency(
+          snapshot.qcomFeesBreakdown?.deliveryGst ??
+            (toDecimal(customerDeliveryFee).gt(0) ? roundCurrency(multiply(customerDeliveryFee, '0.18')) : '0.00')
+        )
+      );
+      const customerHandlingFee = Number(roundCurrency(snapshot.qcomFeesBreakdown?.handlingTaxable ?? order.handling_fee ?? '0.00'));
+      const handlingFeeGst = Number(
+        roundCurrency(
+          snapshot.qcomFeesBreakdown?.handlingGst ??
+            (toDecimal(customerHandlingFee).gt(0) ? roundCurrency(multiply(customerHandlingFee, '0.18')) : '0.00')
+        )
+      );
 
       // Rider economics
       let grossRiderFare = 0.00;
@@ -168,15 +203,16 @@ export class SettlementAllocationService {
       let netRiderPayable = 0.00;
 
       if (trip) {
-        grossRiderFare = +(
-          parseFloat(trip.base_fare || '35.00') +
-          parseFloat(trip.distance_fare || '0.00') +
-          parseFloat(trip.surge_fare || '0.00') +
-          parseFloat(trip.wait_time_compensation || '0.00')
-        ).toFixed(2);
+        const grossRiderFareBn = add(
+          trip.base_fare || '35.00',
+          trip.distance_fare || '0.00',
+          trip.surge_fare || '0.00',
+          trip.wait_time_compensation || '0.00'
+        );
+        grossRiderFare = Number(roundCurrency(grossRiderFareBn));
 
         // 100% tip pass-through with zero platform haircut
-        customerTip = parseFloat(trip.tip_amount || '0.00');
+        customerTip = Number(roundCurrency(trip.tip_amount || '0.00'));
 
         // Rider logistics withholding (1% for PAN, 20% for Non-PAN)
         const riderRes = riderId
@@ -184,23 +220,27 @@ export class SettlementAllocationService {
           : { rows: [] };
         const rider = riderRes.rows[0];
         const isRiderPanValid = rider?.pan_status === 'VALID_PAN';
-        const riderTdsRate = isRiderPanValid ? 0.01 : 0.20;
-        riderTdsAmount = +(grossRiderFare * riderTdsRate).toFixed(2);
+        const riderTdsRate = isRiderPanValid ? '0.01' : '0.20';
+        riderTdsAmount = Number(roundCurrency(multiply(grossRiderFare, riderTdsRate)));
 
-        netRiderPayable = +(grossRiderFare + customerTip - riderTdsAmount).toFixed(2);
+        netRiderPayable = Number(roundCurrency(subtract(add(grossRiderFare, customerTip), riderTdsAmount)));
       }
 
-      const platformSubsidy = +(Math.max(0, grossRiderFare - customerDeliveryFee)).toFixed(2);
+      const platformSubsidy = Number(roundCurrency(BigNumber.max(0, subtract(grossRiderFare, customerDeliveryFee))));
 
       // Total customer escrow liability released upon fulfillment
-      const orderTotal = +(
-        grossGmv +
-        customerDeliveryFee +
-        deliveryFeeGst +
-        customerHandlingFee +
-        handlingFeeGst +
-        customerTip
-      ).toFixed(2);
+      const orderTotal = Number(
+        roundCurrency(
+          add(
+            grossGmv,
+            customerDeliveryFee,
+            deliveryFeeGst,
+            customerHandlingFee,
+            handlingFeeGst,
+            customerTip
+          )
+        )
+      );
 
       // 6. Post atomic double-entry general ledger batch
       const journalBatchId = await ledgerService.recordOrderFulfillmentAllocation({
@@ -224,15 +264,29 @@ export class SettlementAllocationService {
         client,
       });
 
-      // 7. Post Subledger entries for Merchant (seller_ledgers)
+      // 7. Post Subledger entries for Merchant (seller_ledgers) under merchant FOR UPDATE lock
       const prevMerchantBalRes = await client.query(`
         SELECT running_balance FROM seller_ledgers
         WHERE merchant_id = $1
-        ORDER BY created_at DESC
+        ORDER BY created_at DESC, seq_no DESC
         LIMIT 1
       `, [order.merchant_id]);
-      const currentMerchBal = prevMerchantBalRes.rows.length > 0 ? parseFloat(prevMerchantBalRes.rows[0].running_balance) : 0.00;
-      const updatedMerchBal = +(currentMerchBal + netSellerPayable).toFixed(2);
+      const currentMerchBalBn = prevMerchantBalRes.rows.length > 0 ? toDecimal(prevMerchantBalRes.rows[0].running_balance) : new BigNumber(0);
+      const updatedMerchBal = Number(roundCurrency(currentMerchBalBn.plus(toDecimal(netSellerPayable))));
+
+      // Reconcile GL Account 1040 clawback receivable against Account 2020 payable if merchant had negative balance
+      if (currentMerchBalBn.lt(0) && toDecimal(netSellerPayable).gt(0)) {
+        const offsetAmount = Number(roundCurrency(BigNumber.min(currentMerchBalBn.abs(), toDecimal(netSellerPayable))));
+        if (offsetAmount > 0) {
+          await ledgerService.recordClawbackOffset({
+            merchantId: order.merchant_id,
+            orderId,
+            amount: offsetAmount,
+            reference: orderId,
+            client,
+          });
+        }
+      }
 
       await client.query(`
         INSERT INTO seller_ledgers (
@@ -252,11 +306,11 @@ export class SettlementAllocationService {
         const prevRiderBalRes = await client.query(`
           SELECT running_balance FROM rider_ledgers
           WHERE rider_id = $1
-          ORDER BY created_at DESC
+          ORDER BY created_at DESC, seq_no DESC
           LIMIT 1
         `, [riderId]);
-        const currentRiderBal = prevRiderBalRes.rows.length > 0 ? parseFloat(prevRiderBalRes.rows[0].running_balance) : 0.00;
-        const updatedRiderBal = +(currentRiderBal + netRiderPayable).toFixed(2);
+        const currentRiderBalBn = prevRiderBalRes.rows.length > 0 ? toDecimal(prevRiderBalRes.rows[0].running_balance) : new BigNumber(0);
+        const updatedRiderBal = Number(roundCurrency(currentRiderBalBn.plus(toDecimal(netRiderPayable))));
 
         await client.query(`
           INSERT INTO rider_ledgers (
@@ -272,16 +326,17 @@ export class SettlementAllocationService {
         ]);
 
         // Update rider's wallet balance
+        const grossPlusTip = Number(roundCurrency(add(grossRiderFare, customerTip)));
         await client.query(`
           UPDATE riders
           SET wallet_balance = wallet_balance + $2,
               fy_gross_payout_inr = fy_gross_payout_inr + $3,
               updated_at = NOW()
           WHERE id = $1
-        `, [riderId, netRiderPayable, grossRiderFare + customerTip]);
+        `, [riderId, netRiderPayable, grossPlusTip]);
 
         // Handle Cash on Delivery floating cash liability
-        if (order.payment_method === 'Pay on Delivery') {
+        if (isCodOrder) {
           const codAmount = orderTotal;
           await client.query(`
             UPDATE riders
