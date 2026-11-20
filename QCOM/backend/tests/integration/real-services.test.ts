@@ -613,18 +613,22 @@ async function runSprint15_7PostgresChecks(freshPool: import('pg').Pool): Promis
       });
     }
 
+    const nowTs = new Date();
     await freshPool.query(
       `INSERT INTO delivery_trips (
          id, order_id, trip_type, rider_id, status,
          base_fare, distance_fare, surge_fare, total_rider_payout,
          accepted_at, picked_up_at
        )
-       VALUES (
-         $1, $2, 'FORWARD', $3, $4, 50, 15, 0, 65,
-         CASE WHEN $3 IS NOT NULL THEN NOW() ELSE NULL END,
-         CASE WHEN $4 = 'PICKED_UP' THEN NOW() ELSE NULL END
-       )`,
-      [tripId, orderId, opts.riderId, opts.tripStatus]
+       VALUES ($1, $2, 'FORWARD', $3, $4, 50, 15, 0, 65, $5, $6)`,
+      [
+        tripId,
+        orderId,
+        opts.riderId,
+        opts.tripStatus,
+        opts.riderId ? nowTs : null,
+        opts.tripStatus === 'PICKED_UP' ? nowTs : null,
+      ]
     );
 
     return { orderId, tripId, orderItemId, otp, total };
