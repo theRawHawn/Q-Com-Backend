@@ -386,8 +386,7 @@ export class OrderService {
       `SELECT o.*, dt.rider_id
        FROM orders o
        LEFT JOIN delivery_trips dt ON dt.order_id = o.id
-       WHERE o.id = $1
-       LIMIT 1`,
+       WHERE o.id = $1`,
       [orderId]
     );
     if (res.rows.length === 0) {
@@ -401,7 +400,7 @@ export class OrderService {
     if (!isGlobalAdmin) {
       const isCustomerOwner = r.user_id === userId;
       const isMerchantOwner = merchantIds.length > 0 && merchantIds.includes(r.merchant_id);
-      const isAssignedRider = Boolean(riderId && r.rider_id === riderId);
+      const isAssignedRider = Boolean(riderId && res.rows.some((row) => row.rider_id === riderId));
       if (!isCustomerOwner && !isMerchantOwner && !isAssignedRider) {
         return null;
       }

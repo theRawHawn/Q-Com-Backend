@@ -56,8 +56,8 @@ export function requireOrderOwnership(orderIdParam: string = 'id') {
     // 3. Seller merchant tenant check (Merchant staff cannot access another merchant's order)
     const isMerchantAuthorized = req.auth.merchantIds && req.auth.merchantIds.includes(order.merchant_id);
 
-    // 4. Delivery rider assignment check (Rider cannot inspect trips of other riders)
-    const isAssignedRider = req.auth.riderId && order.rider_id === req.auth.riderId;
+    // 4. Delivery rider assignment check across all order trips (forward or reverse pickup)
+    const isAssignedRider = req.auth.riderId && orderRes.rows.some((row) => row.rider_id === req.auth!.riderId);
 
     if (!isCustomerOwner && !isMerchantAuthorized && !isAssignedRider) {
       await recordAuditEvent({

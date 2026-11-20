@@ -281,7 +281,7 @@ async function runPostgresChecks(): Promise<void> {
     }
 
     const { Pool } = pg.default;
-    const freshPool = new Pool({ connectionString: withDatabase(adminUrl, freshName), max: 6 });
+    const freshPool = new Pool({ connectionString: withDatabase(adminUrl, freshName), max: 12 });
     const upgradePool = new Pool({ connectionString: withDatabase(adminUrl, upgradeName), max: 4 });
     const { runMigrations, getMigrationFiles } = await import('../../src/database/migrator.js');
     const { setPool } = await import('../../src/database/connection.js');
@@ -318,6 +318,25 @@ async function runPostgresChecks(): Promise<void> {
       const upgradeApplied = await runMigrations({ poolOverride: upgradePool });
       assert.ok(upgradeApplied.some((name) => name.startsWith('025_')), 'Upgrade must apply migration 025.');
       assert.ok(upgradeApplied.some((name) => name.startsWith('026_')), 'Upgrade must apply migration 026.');
+      assert.ok(upgradeApplied.some((name) => name.startsWith('027_')), 'Upgrade must apply migration 027.');
+      assert.ok(upgradeApplied.some((name) => name.startsWith('028_')), 'Upgrade must apply migration 028.');
+      const upgradedTripIndexes = await upgradePool.query<{ indexname: string }>(
+        `SELECT indexname FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND indexname IN (
+             'uq_delivery_trips_forward_order',
+             'uq_delivery_trips_reverse_return',
+             'uq_delivery_trips_active_reverse_order',
+             'idx_riders_dispatch_candidates'
+           )`
+      );
+      assert.equal(upgradedTripIndexes.rowCount, 4, 'Migration 028 partial unique and GPS indexes must exist on upgraded DB.');
+      const legacyOrderUnique = await upgradePool.query(
+        `SELECT conname FROM pg_constraint
+         WHERE conrelid = 'delivery_trips'::regclass AND contype = 'u'
+           AND pg_get_constraintdef(oid) = 'UNIQUE (order_id)'`
+      );
+      assert.equal(legacyOrderUnique.rowCount, 0, 'Unconditional delivery_trips(order_id) UNIQUE constraint must be dropped by migration 028.');
       const preserved = await upgradePool.query(
         `SELECT status, lease_token, lease_expires_at FROM outbox_events WHERE id = $1`,
         [legacyEvent.rows[0].id]
@@ -449,7 +468,9 @@ async function runPostgresChecks(): Promise<void> {
         'The original over-lease handler must not overwrite the restarted worker result.');
       assert.equal(handlerRuns, 2, 'An over-lease handler may be delivered twice; consumers must be idempotent.');
 
-      console.log('PostgreSQL 16 fresh/upgrade migrations, pending-event delivery, separate-connection claims, fencing, expiry/restart, handler overrun, and rollback checks passed.');
+      await runSprint15_7PostgresChecks(freshPool);
+
+      console.log('PostgreSQL 16 fresh/upgrade migrations, Sprint 15.7 integrity/concurrency/pg_locks checks, outbox claims, fencing, and rollback checks passed.');
     } finally {
       setPool(null);
       await Promise.all([freshPool.end(), upgradePool.end()]);
@@ -467,6 +488,427 @@ async function runPostgresChecks(): Promise<void> {
     }
     await adminPool.end();
   }
+}
+
+async function runSprint15_7PostgresChecks(freshPool: import('pg').Pool): Promise<void> {
+  const crypto = await import('node:crypto');
+  const { runSeeds } = await import('../../seeds/seedData.js');
+  const { deliveryCompletionService } = await import('../../src/modules/delivery/deliveryCompletionService.js');
+  const { settlementAllocationService } = await import('../../src/modules/settlements/settlementAllocationService.js');
+  const { dispatchService } = await import('../../src/modules/dispatch/dispatchService.js');
+  const { candidateGenerator } = await import('../../src/modules/dispatch/candidateGenerator.js');
+  const { cancellationService } = await import('../../src/modules/orders/cancellationService.js');
+  const { refundService } = await import('../../src/modules/payments/refundService.js');
+  const { returnService } = await import('../../src/modules/orders/returnService.js');
+  const { ledgerService } = await import('../../src/modules/ledger/ledgerService.js');
+
+  await runSeeds(freshPool);
+
+  const merchRow = (
+    await freshPool.query(`SELECT id, latitude, longitude FROM merchants WHERE merchant_code = 'MERCH-BLR-01' LIMIT 1`)
+  ).rows[0];
+  const merchantId = merchRow.id as string;
+  const storeLat = Number(merchRow.latitude);
+  const storeLng = Number(merchRow.longitude);
+
+  const prodRow = (
+    await freshPool.query(
+      `SELECT p.id, p.name, si.selling_price
+       FROM products p JOIN store_inventory si ON si.product_id = p.id
+       WHERE si.merchant_id = $1 LIMIT 1`,
+      [merchantId]
+    )
+  ).rows[0];
+  const productId = prodRow.id as string;
+  const productName = prodRow.name as string;
+  const unitPrice = Number(prodRow.selling_price);
+
+  const userRow = (await freshPool.query(`SELECT id FROM users ORDER BY created_at ASC LIMIT 1`)).rows[0];
+  const userId = userRow.id as string;
+  const riderRows = (
+    await freshPool.query(`SELECT id FROM riders ORDER BY created_at ASC LIMIT 2`)
+  ).rows;
+  const rider1Id = riderRows[0].id as string;
+  const rider2Id = riderRows[1].id as string;
+
+  await freshPool.query(
+    `UPDATE store_inventory SET stock_count = 500 WHERE merchant_id = $1 AND product_id = $2`,
+    [merchantId, productId]
+  );
+
+  async function seedOrderAndForwardTrip(opts: {
+    paymentMethod: 'Pay on Delivery' | 'Instant UPI';
+    paymentStatus: string;
+    status: string;
+    tripStatus: string;
+    riderId: string | null;
+    totalAmount: number;
+    postPaymentGl?: boolean;
+  }) {
+    const orderId = crypto.randomUUID();
+    const tripId = crypto.randomUUID();
+    const orderItemId = crypto.randomUUID();
+    const otp = '642819';
+    const total = +opts.totalAmount.toFixed(2);
+    const snapshot = {
+      sellerGoodsBreakdown: {
+        taxableAmount: +(total / 1.18).toFixed(2),
+        totalGst: +(total - total / 1.18).toFixed(2),
+        totalSellerPayable: total,
+      },
+      qcomFeesBreakdown: {
+        deliveryTaxable: 0,
+        deliveryGst: 0,
+        handlingTaxable: 0,
+        handlingGst: 0,
+        totalGst: 0,
+      },
+    };
+
+    await freshPool.query(
+      `INSERT INTO orders (
+         id, order_number, user_id, merchant_id, status,
+         items_subtotal, delivery_fee, handling_fee, urgency_fee, discount_amount,
+         taxable_amount, cgst_amount, sgst_amount, igst_amount, total_amount,
+         payment_method, payment_status, delivery_otp, handover_token,
+         jobsite_address, pricing_snapshot, placed_at, estimated_delivery_at
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, 0, 0, 0, 0, $7, 0, 0, 0, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW() + INTERVAL '30 minutes')`,
+      [
+        orderId,
+        `ORD-IT-${Date.now().toString().slice(-4)}-${crypto.randomBytes(2).toString('hex')}`,
+        userId,
+        merchantId,
+        opts.status,
+        total,
+        +(total / 1.18).toFixed(2),
+        total,
+        opts.paymentMethod,
+        opts.paymentStatus,
+        otp,
+        `HND-${crypto.randomBytes(3).toString('hex').toUpperCase()}`,
+        JSON.stringify({ address: 'PG IT Site', latitude: storeLat + 0.02, longitude: storeLng + 0.02 }),
+        JSON.stringify(snapshot),
+      ]
+    );
+
+    await freshPool.query(
+      `INSERT INTO order_items (
+         id, order_id, product_id, product_name, quantity, unit_price, hsn_code, gst_rate_percent, taxable_amount, cgst_amount, sgst_amount, total_price
+       )
+       VALUES ($1, $2, $3, $4, 1, $5, '6810', 18.00, $6, 0, 0, $5)`,
+      [orderItemId, orderId, productId, productName, total, +(total / 1.18).toFixed(2)]
+    );
+
+    if (opts.postPaymentGl) {
+      await ledgerService.recordOrderPayment({
+        orderId,
+        merchantId,
+        grossAmount: total,
+        taxableAmount: +(total / 1.18).toFixed(2),
+        cgstAmount: 0,
+        sgstAmount: 0,
+        deliveryFee: 0,
+        handlingFee: 0,
+      });
+    }
+
+    await freshPool.query(
+      `INSERT INTO delivery_trips (
+         id, order_id, trip_type, rider_id, status,
+         base_fare, distance_fare, surge_fare, total_rider_payout,
+         accepted_at, pickup_confirmed_at
+       )
+       VALUES (
+         $1, $2, 'FORWARD', $3, $4, 50, 15, 0, 65,
+         CASE WHEN $3 IS NOT NULL THEN NOW() ELSE NULL END,
+         CASE WHEN $4 = 'PICKED_UP' THEN NOW() ELSE NULL END
+       )`,
+      [tripId, orderId, opts.riderId, opts.tripStatus]
+    );
+
+    return { orderId, tripId, orderItemId, otp, total };
+  }
+
+  // 1. Real PG partial unique index enforcement (23505) on delivery_trips
+  const revBase = await seedOrderAndForwardTrip({
+    paymentMethod: 'Instant UPI',
+    paymentStatus: 'PAID',
+    status: 'delivered',
+    tripStatus: 'DELIVERED',
+    riderId: rider1Id,
+    totalAmount: unitPrice,
+    postPaymentGl: true,
+  });
+  await settlementAllocationService.allocateFulfilledOrder(revBase.orderId);
+
+  await assert.rejects(
+    () =>
+      freshPool.query(
+        `INSERT INTO delivery_trips (order_id, trip_type, status, base_fare, distance_fare, total_rider_payout)
+         VALUES ($1, 'FORWARD', 'BROADCASTING', 45, 0, 45)`,
+        [revBase.orderId]
+      ),
+    (err: any) => err?.code === '23505'
+  );
+
+  const ret1 = await returnService.requestReturn({
+    orderId: revBase.orderId,
+    userId,
+    items: [{ orderItemId: revBase.orderItemId, quantity: 1 }],
+    reasonCode: 'DEFECTIVE',
+  });
+  const revTrip1 = await dispatchService.createReversePickupTrip({
+    returnId: ret1.returnRequest.id,
+    orderId: revBase.orderId,
+    merchantId,
+  });
+
+  await assert.rejects(
+    () =>
+      freshPool.query(
+        `INSERT INTO delivery_trips (order_id, trip_type, return_id, status, base_fare, distance_fare, total_rider_payout)
+         VALUES ($1, 'REVERSE_PICKUP', $2, 'BROADCASTING', 45, 0, 45)`,
+        [revBase.orderId, ret1.returnRequest.id]
+      ),
+    (err: any) => err?.code === '23505'
+  );
+
+  const ret2Id = crypto.randomUUID();
+  await freshPool.query(
+    `INSERT INTO order_returns (id, return_number, order_id, user_id, merchant_id, status, reason_code)
+     VALUES ($1, $2, $3, $4, $5, 'APPROVED', 'DAMAGED')`,
+    [ret2Id, `RET-IT-${Date.now()}`, revBase.orderId, userId, merchantId]
+  );
+  await assert.rejects(
+    () =>
+      freshPool.query(
+        `INSERT INTO delivery_trips (order_id, trip_type, return_id, status, base_fare, distance_fare, total_rider_payout)
+         VALUES ($1, 'REVERSE_PICKUP', $2, 'BROADCASTING', 45, 0, 45)`,
+        [revBase.orderId, ret2Id]
+      ),
+    (err: any) => err?.code === '23505'
+  );
+
+  await dispatchService.cancelReversePickupTrip({ returnId: ret1.returnRequest.id });
+  const revTrip2 = await dispatchService.createReversePickupTrip({
+    returnId: ret2Id,
+    orderId: revBase.orderId,
+    merchantId,
+  });
+  assert.notEqual(revTrip2, revTrip1, 'New reverse pickup trip must succeed after prior reverse trip is CANCELLED');
+
+  // 2. Concurrent completeDeliveryWithOtp race on real PostgreSQL 16 + COD tamper guard
+  const concCod = await seedOrderAndForwardTrip({
+    paymentMethod: 'Pay on Delivery',
+    paymentStatus: 'PENDING',
+    status: 'out_for_delivery',
+    tripStatus: 'PICKED_UP',
+    riderId: rider1Id,
+    totalAmount: 480,
+  });
+  const floatPre = Number(
+    (await freshPool.query(`SELECT floating_cash_balance FROM riders WHERE id = $1`, [rider1Id])).rows[0]
+      .floating_cash_balance
+  );
+
+  const raceResults = await Promise.allSettled([
+    deliveryCompletionService.completeDeliveryWithOtp({
+      taskId: concCod.tripId,
+      otp: concCod.otp,
+      cashCollected: 12,
+      actor: { riderId: rider1Id, isDispatchAdmin: false, actorUserId: userId },
+    }),
+    deliveryCompletionService.completeDeliveryWithOtp({
+      taskId: concCod.tripId,
+      otp: concCod.otp,
+      cashCollected: 12,
+      actor: { riderId: rider1Id, isDispatchAdmin: false, actorUserId: userId },
+    }),
+  ]);
+  const fulfilledRace = raceResults.filter((r) => r.status === 'fulfilled');
+  const rejectedRace = raceResults.filter((r) => r.status === 'rejected');
+  assert.equal(fulfilledRace.length, 1, 'Exactly one concurrent completion must succeed on real PG 16.');
+  assert.equal(rejectedRace.length, 1, 'Second concurrent completion must be rejected cleanly.');
+  assert.equal((fulfilledRace[0] as PromiseFulfilledResult<any>).value.codCollectedAmount, 480);
+
+  const floatPost = Number(
+    (await freshPool.query(`SELECT floating_cash_balance FROM riders WHERE id = $1`, [rider1Id])).rows[0]
+      .floating_cash_balance
+  );
+  assert.equal(floatPost, floatPre + 480, 'Rider floating_cash_balance must increment exactly once.');
+  const allocCnt = Number(
+    (await freshPool.query(`SELECT COUNT(*) AS cnt FROM order_settlement_allocations WHERE order_id = $1`, [concCod.orderId]))
+      .rows[0].cnt
+  );
+  assert.equal(allocCnt, 1, 'Strictly one settlement allocation row per delivered order.');
+
+  // 3. Mid-TX failure injection on real PG 16 -> full atomic rollback -> retry succeeds
+  const failOrd = await seedOrderAndForwardTrip({
+    paymentMethod: 'Pay on Delivery',
+    paymentStatus: 'PENDING',
+    status: 'out_for_delivery',
+    tripStatus: 'PICKED_UP',
+    riderId: rider2Id,
+    totalAmount: 310,
+  });
+  const r2FloatPre = Number(
+    (await freshPool.query(`SELECT floating_cash_balance FROM riders WHERE id = $1`, [rider2Id])).rows[0]
+      .floating_cash_balance
+  );
+  const origAlloc = settlementAllocationService.allocateFulfilledOrder.bind(settlementAllocationService);
+  (settlementAllocationService as any).allocateFulfilledOrder = async () => {
+    throw new Error('PG_INJECTED_SETTLEMENT_ERROR');
+  };
+  try {
+    await assert.rejects(
+      () =>
+        deliveryCompletionService.completeDeliveryWithOtp({
+          taskId: failOrd.tripId,
+          otp: failOrd.otp,
+          actor: { riderId: rider2Id, isDispatchAdmin: false, actorUserId: userId },
+        }),
+      /PG_INJECTED_SETTLEMENT_ERROR/
+    );
+  } finally {
+    (settlementAllocationService as any).allocateFulfilledOrder = origAlloc;
+  }
+  const rolledBackOrd = (
+    await freshPool.query(`SELECT status, payment_status FROM orders WHERE id = $1`, [failOrd.orderId])
+  ).rows[0];
+  assert.equal(rolledBackOrd.status, 'out_for_delivery');
+  assert.equal(rolledBackOrd.payment_status, 'PENDING');
+  const r2FloatMid = Number(
+    (await freshPool.query(`SELECT floating_cash_balance FROM riders WHERE id = $1`, [rider2Id])).rows[0]
+      .floating_cash_balance
+  );
+  assert.equal(r2FloatMid, r2FloatPre);
+
+  const retryComplete = await deliveryCompletionService.completeDeliveryWithOtp({
+    taskId: failOrd.tripId,
+    otp: failOrd.otp,
+    actor: { riderId: rider2Id, isDispatchAdmin: false, actorUserId: userId },
+  });
+  assert.equal(retryComplete.codCollectedAmount, 310);
+
+  // 4. Lock-free external refund verified via pg_locks on real PostgreSQL 16
+  const cancelOrd = await seedOrderAndForwardTrip({
+    paymentMethod: 'Instant UPI',
+    paymentStatus: 'PAID',
+    status: 'placed',
+    tripStatus: 'BROADCASTING',
+    riderId: null,
+    totalAmount: 275,
+    postPaymentGl: true,
+  });
+  const origProvider = refundService.getProvider();
+  let notifyGatewayEntered!: () => void;
+  const gatewayEntered = new Promise<void>((resolve) => {
+    notifyGatewayEntered = resolve;
+  });
+  let releaseGateway!: () => void;
+  const gatewayGate = new Promise<void>((resolve) => {
+    releaseGateway = resolve;
+  });
+
+  const barrierProvider = Object.assign(Object.create(Object.getPrototypeOf(origProvider)), origProvider, {
+    async createRefund(req: { paymentId: string; amount: number; currency: string }) {
+      notifyGatewayEntered();
+      await gatewayGate;
+      return {
+        providerRefundId: `rfnd_pg_it_${Date.now()}`,
+        paymentId: req.paymentId,
+        amount: req.amount,
+        currency: req.currency || 'INR',
+        status: 'PROCESSED' as const,
+        timestamp: new Date().toISOString(),
+      };
+    },
+  });
+  refundService.setProvider(barrierProvider);
+
+  const pgIdemKey = `pg_cancel_${Date.now()}`;
+  const cancelPromise = cancellationService.cancelByCustomer({
+    orderId: cancelOrd.orderId,
+    userId,
+    reason: 'PG lock-free check',
+    idempotencyKey: pgIdemKey,
+  });
+  try {
+    await gatewayEntered;
+    const midOrderRow = (
+      await freshPool.query(`SELECT status FROM orders WHERE id = $1`, [cancelOrd.orderId])
+    ).rows[0];
+    assert.equal(midOrderRow.status, 'cancelled', 'Phase 1 TX must commit order cancellation before external refund HTTP call.');
+
+    const heldWriteLocks = await freshPool.query<{ relname: string; mode: string }>(
+      `SELECT c.relname, l.mode
+       FROM pg_locks l
+       JOIN pg_class c ON c.oid = l.relation
+       JOIN pg_stat_activity a ON a.pid = l.pid
+       WHERE a.datname = current_database()
+         AND l.pid <> pg_backend_pid()
+         AND l.granted = TRUE
+         AND c.relname IN ('orders', 'delivery_trips', 'store_inventory', 'order_returns')
+         AND l.mode IN ('RowExclusiveLock', 'ShareUpdateExclusiveLock', 'ExclusiveLock', 'AccessExclusiveLock')`
+    );
+    assert.equal(
+      heldWriteLocks.rowCount,
+      0,
+      `External gateway call must hold ZERO DB table/row write locks; found: ${JSON.stringify(heldWriteLocks.rows)}`
+    );
+  } finally {
+    releaseGateway();
+  }
+  const cancelDone = await cancelPromise;
+  refundService.setProvider(origProvider);
+  assert.equal(cancelDone.order.payment_status, 'REFUNDED');
+
+  await assert.rejects(
+    () =>
+      cancellationService.cancelByAdmin({
+        orderId: cancelOrd.orderId,
+        adminUserId: crypto.randomUUID(),
+        reason: 'Cross actor key reuse',
+        idempotencyKey: pgIdemKey,
+      }),
+    /IDEMPOTENCY_KEY_ACTOR_MISMATCH/
+  );
+
+  // 5. Real PG GPS filtering (NULL, (0,0), out-of-range, stale >10m)
+  await freshPool.query(`UPDATE riders SET status = 'OFFLINE'`);
+  const validGpsRiderId = crypto.randomUUID();
+  await freshPool.query(
+    `INSERT INTO riders (id, rider_code, name, phone, status, vehicle_type, payload_capacity_kg, latitude, longitude, location_updated_at)
+     VALUES
+       ($1, 'PG-NULL',  'PG Null',  '+91-9000100001', 'AVAILABLE', 'ev_scooter', 25, NULL, NULL, NOW()),
+       ($2, 'PG-ZERO',  'PG Zero',  '+91-9000100002', 'AVAILABLE', 'ev_scooter', 25, 0, 0, NOW()),
+       ($3, 'PG-BAD',   'PG Bad',   '+91-9000100003', 'AVAILABLE', 'ev_scooter', 25, 92.0, 185.0, NOW()),
+       ($4, 'PG-STALE', 'PG Stale', '+91-9000100004', 'AVAILABLE', 'ev_scooter', 25, $6, $7, NOW() - INTERVAL '20 minutes'),
+       ($5, 'PG-VALID', 'PG Valid', '+91-9000100005', 'AVAILABLE', 'ev_scooter', 25, $6, $7, NOW())`,
+    [
+      crypto.randomUUID(),
+      crypto.randomUUID(),
+      crypto.randomUUID(),
+      crypto.randomUUID(),
+      validGpsRiderId,
+      storeLat + 0.008,
+      storeLng + 0.008,
+    ]
+  );
+
+  const gpsCandidates = await candidateGenerator.generateCandidates({
+    orderId: revBase.orderId,
+    merchantId,
+    storeLocation: { latitude: storeLat, longitude: storeLng },
+    customerLocation: { latitude: storeLat + 0.02, longitude: storeLng + 0.02 },
+    itemsSubtotal: 500,
+    customerDeliveryFee: 20,
+    handlingFee: 5,
+  });
+  assert.deepEqual(gpsCandidates.map((c) => c.riderId), [validGpsRiderId]);
+
+  console.log('PostgreSQL 16 Sprint 15.7 checks (partial unique 23505, multi-conn OTP race, mid-TX rollback, pg_locks lock-free refund, GPS filtering) passed.');
 }
 
 async function runSuite(): Promise<void> {

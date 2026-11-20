@@ -532,8 +532,8 @@ export class RealtimeGateway {
       // Merchant ownership
       if (auth.merchantIds && auth.merchantIds.includes(order.merchant_id)) return true;
 
-      // Assigned Rider
-      if (auth.riderId && order.rider_id === auth.riderId) return true;
+      // Assigned Rider (forward or reverse trip)
+      if (auth.riderId && res.rows.some((row) => row.rider_id === auth.riderId)) return true;
 
       return false;
     } catch {

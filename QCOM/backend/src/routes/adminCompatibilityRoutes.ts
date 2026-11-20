@@ -386,15 +386,15 @@ adminCompatibilityRouter.post('/orders/:orderId/assign-rider', authenticate, adm
   try {
     const updateRes = await pool.query(
       `UPDATE delivery_trips 
-       SET rider_id = $1, status = 'ACCEPTED', accepted_at = NOW() 
-       WHERE order_id = $2 AND status IN ('BROADCASTING', 'CREATED', 'OFFERED', 'PENDING')
+       SET rider_id = $1, status = 'ACCEPTED', accepted_at = NOW(), updated_at = NOW() 
+       WHERE order_id = $2 AND trip_type = 'FORWARD' AND status IN ('BROADCASTING', 'CREATED', 'OFFERED', 'PENDING')
        RETURNING id, order_id, status, rider_id`,
       [riderId, orderId]
     );
 
     if (updateRes.rowCount === 0) {
       const existingTrip = await pool.query(
-        `SELECT id, rider_id, status FROM delivery_trips WHERE order_id = $1`,
+        `SELECT id, rider_id, status FROM delivery_trips WHERE order_id = $1 AND trip_type = 'FORWARD' LIMIT 1`,
         [orderId]
       );
       if (existingTrip.rows.length === 0) {

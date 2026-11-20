@@ -236,12 +236,23 @@ export async function runSprint14_3StagingReleaseCandidateTests(): Promise<void>
   const riderToken = riderVerify.data.token || riderVerify.data.accessToken;
 
   await apiCall('/api/partner/duty-status', { method: 'POST', token: riderToken, body: { isOnline: true } });
-  const tripRes = await stagingPool.query(`
-    INSERT INTO delivery_trips (order_id, status, total_rider_payout)
-    VALUES ($1, 'BROADCASTING', 50.00)
-    ON CONFLICT (order_id) DO UPDATE SET status = 'BROADCASTING'
-    RETURNING id
-  `, [orderId]);
+  let tripRes = await stagingPool.query(
+    `SELECT id FROM delivery_trips WHERE order_id = $1 AND trip_type = 'FORWARD' LIMIT 1`,
+    [orderId]
+  );
+  if (tripRes.rows.length > 0) {
+    tripRes = await stagingPool.query(
+      `UPDATE delivery_trips SET status = 'BROADCASTING' WHERE id = $1 RETURNING id`,
+      [tripRes.rows[0].id]
+    );
+  } else {
+    tripRes = await stagingPool.query(
+      `INSERT INTO delivery_trips (order_id, trip_type, status, base_fare, total_rider_payout)
+       VALUES ($1, 'FORWARD', 'BROADCASTING', 50.00, 50.00)
+       RETURNING id`,
+      [orderId]
+    );
+  }
   const tripId = tripRes.rows[0].id;
 
   const acceptRes = await apiCall(`/api/tasks/${tripId}/accept`, { method: 'POST', token: riderToken });

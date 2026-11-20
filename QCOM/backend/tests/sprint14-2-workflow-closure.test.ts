@@ -130,13 +130,24 @@ export async function runSprint14_2WorkflowClosureTests(): Promise<void> {
 
   await apiCall('/api/partner/duty-status', { method: 'POST', token: riderToken, body: { isOnline: true } });
   
-  // Create delivery trip
-  const tripRes = await realPool.query(`
-    INSERT INTO delivery_trips (order_id, status, total_rider_payout)
-    VALUES ($1, 'BROADCASTING', 45.00)
-    ON CONFLICT (order_id) DO UPDATE SET status = 'BROADCASTING'
-    RETURNING id
-  `, [orderId]);
+  // Create delivery trip (forward)
+  let tripRes = await realPool.query(
+    `SELECT id FROM delivery_trips WHERE order_id = $1 AND trip_type = 'FORWARD' LIMIT 1`,
+    [orderId]
+  );
+  if (tripRes.rows.length > 0) {
+    tripRes = await realPool.query(
+      `UPDATE delivery_trips SET status = 'BROADCASTING' WHERE id = $1 RETURNING id`,
+      [tripRes.rows[0].id]
+    );
+  } else {
+    tripRes = await realPool.query(
+      `INSERT INTO delivery_trips (order_id, trip_type, status, base_fare, total_rider_payout)
+       VALUES ($1, 'FORWARD', 'BROADCASTING', 45.00, 45.00)
+       RETURNING id`,
+      [orderId]
+    );
+  }
   const tripId = tripRes.rows[0].id;
 
   const acceptRes = await apiCall(`/api/tasks/${tripId}/accept`, { method: 'POST', token: riderToken });

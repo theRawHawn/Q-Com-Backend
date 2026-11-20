@@ -63,6 +63,15 @@ export class AsyncKeyedMutex {
   }
 }
 
+export interface PreparedRefundIntent {
+  refundRow: any;
+  paymentId: string;
+  requestedAmount: number;
+  durableIdempotencyKey: string;
+  isFull: boolean;
+  isDuplicate: boolean;
+}
+
 export class RefundService {
   private provider: PaymentProvider;
   private circuitBreaker: CircuitBreaker;
@@ -79,6 +88,20 @@ export class RefundService {
 
   public getProvider(): PaymentProvider {
     return this.provider;
+  }
+
+  private parseExplicitAmount(amount?: number): number | undefined {
+    if (amount === undefined) return undefined;
+    let bn;
+    try {
+      bn = toDecimal(amount);
+    } catch {
+      throw new Error('INVALID_REFUND_AMOUNT: Refund amount must be a valid finite number.');
+    }
+    if (bn.lte(0)) {
+      throw new Error('INVALID_REFUND_AMOUNT: Refund amount must be greater than zero.');
+    }
+    return Number(roundCurrency(bn));
   }
 
   private assertIdempotencyCompatibility(
@@ -103,221 +126,169 @@ export class RefundService {
   }
 
   /**
-   * Initiates a refund for an order with idempotency and ceiling guarantees.
-   * Completely decoupled into 3 phases:
-   *   STEP A (Prepare): Short transaction to lock order, verify ceiling, insert durable PROCESSING intent, and commit.
-   *   STEP B (Execute): External payment provider call completely outside of database transactions.
-   *   STEP C (Reconcile): Short transaction to update refund record, order status, and stage outbox events.
+   * STEP A (Transactional Prep): Locks order, verifies ceiling, inserts durable PROCESSING refund intent.
+   * Safe to run inside a larger DB transaction without performing any external HTTP calls.
    */
-  public async createRefund(params: CreateRefundParams): Promise<{ refund: RefundRecord; isDuplicate: boolean }> {
-    let explicitAmount: number | undefined;
-    if (params.amount !== undefined) {
-      let bn;
-      try {
-        bn = toDecimal(params.amount);
-      } catch {
-        throw new Error('INVALID_REFUND_AMOUNT: Refund amount must be a valid finite number.');
-      }
-      if (bn.lte(0)) {
-        throw new Error('INVALID_REFUND_AMOUNT: Refund amount must be greater than zero.');
-      }
-      explicitAmount = Number(roundCurrency(bn));
-    }
-    // -----------------------------------------------------------------
-    // STEP 0: Fast Idempotency Check
-    // -----------------------------------------------------------------
+  public async prepareRefundIntent(
+    params: CreateRefundParams,
+    client: pg.PoolClient
+  ): Promise<PreparedRefundIntent> {
+    const explicitAmount = this.parseExplicitAmount(params.amount);
+
     if (params.idempotencyKey) {
-      const pool = getPool();
-      const existingRefund = await pool.query(`
+      const existingLocked = await client.query(`
         SELECT * FROM refunds
         WHERE idempotency_key = $1
         LIMIT 1
+        FOR UPDATE
       `, [params.idempotencyKey]);
 
-      if (existingRefund.rows.length > 0) {
+      if (existingLocked.rows.length > 0) {
         this.assertIdempotencyCompatibility(
-          existingRefund.rows[0],
+          existingLocked.rows[0],
           params.orderId,
           explicitAmount,
           params.idempotencyKey
         );
         return {
-          refund: this.mapRow(existingRefund.rows[0]),
+          refundRow: existingLocked.rows[0],
+          paymentId: existingLocked.rows[0].payment_id,
+          requestedAmount: parseFloat(existingLocked.rows[0].amount),
+          durableIdempotencyKey: params.idempotencyKey,
+          isFull: existingLocked.rows[0].refund_type === 'FULL',
           isDuplicate: true,
         };
       }
     }
 
-    // -----------------------------------------------------------------
-    // STEP A: PREPARE INTENT (Short Database Transaction)
-    // -----------------------------------------------------------------
-    interface PreparedRefundIntent {
-      refundRow: any;
-      paymentId: string;
-      requestedAmount: number;
-      durableIdempotencyKey: string;
-      isFull: boolean;
-      isDuplicate: boolean;
+    const orderRes = await client.query(`
+      SELECT id, user_id, merchant_id, total_amount, payment_status, status
+      FROM orders
+      WHERE id = $1
+      FOR UPDATE
+    `, [params.orderId]);
+
+    if (orderRes.rows.length === 0) {
+      throw new Error(`ORDER_NOT_FOUND: Order '${params.orderId}' does not exist.`);
     }
 
-    const prepareIntent = async (client: pg.PoolClient): Promise<PreparedRefundIntent> => {
-      // Re-verify idempotency with row lock
-      if (params.idempotencyKey) {
-        const existingLocked = await client.query(`
-          SELECT * FROM refunds
-          WHERE idempotency_key = $1
-          LIMIT 1
-          FOR UPDATE
-        `, [params.idempotencyKey]);
+    const order = orderRes.rows[0];
+    if (order.payment_status === 'FAILED' || order.payment_status === 'REFUNDED') {
+      throw new Error(`ORDER_NOT_REFUNDABLE: Order payment status '${order.payment_status}' cannot be refunded.`);
+    }
+    const orderTotalBn = toDecimal(order.total_amount);
 
-        if (existingLocked.rows.length > 0) {
-          this.assertIdempotencyCompatibility(
-            existingLocked.rows[0],
-            params.orderId,
-            explicitAmount,
-            params.idempotencyKey
-          );
-          return {
-            refundRow: existingLocked.rows[0],
-            paymentId: existingLocked.rows[0].payment_id,
-            requestedAmount: parseFloat(existingLocked.rows[0].amount),
-            durableIdempotencyKey: params.idempotencyKey,
-            isFull: existingLocked.rows[0].refund_type === 'FULL',
-            isDuplicate: true,
-          };
-        }
-      }
+    const priorRefundsRes = await client.query(`
+      SELECT COALESCE(SUM(amount), 0) AS total_refunded
+      FROM refunds
+      WHERE order_id = $1 AND status IN ('REQUESTED', 'PENDING', 'PROCESSING', 'COMPLETED')
+    `, [params.orderId]);
 
-      // Lock and retrieve order for atomic ceiling calculation
-      const orderRes = await client.query(`
-        SELECT id, user_id, merchant_id, total_amount, payment_status, status
-        FROM orders
-        WHERE id = $1
-        FOR UPDATE
-      `, [params.orderId]);
+    const priorRefundedBn = toDecimal(priorRefundsRes.rows[0].total_refunded);
+    const remainingRefundableBn = subtract(orderTotalBn, priorRefundedBn);
+    const remainingRefundable = Number(roundCurrency(remainingRefundableBn));
 
-      if (orderRes.rows.length === 0) {
-        throw new Error(`ORDER_NOT_FOUND: Order '${params.orderId}' does not exist.`);
-      }
+    const requestedAmount = explicitAmount !== undefined ? explicitAmount : remainingRefundable;
+    const requestedAmountBn = toDecimal(requestedAmount);
+    if (requestedAmountBn.lte(0)) {
+      throw new Error('INVALID_REFUND_AMOUNT: Refund amount must be greater than zero.');
+    }
 
-      const order = orderRes.rows[0];
-      if (order.payment_status === 'FAILED' || order.payment_status === 'REFUNDED') {
-        throw new Error(`ORDER_NOT_REFUNDABLE: Order payment status '${order.payment_status}' cannot be refunded.`);
-      }
-      const orderTotalBn = toDecimal(order.total_amount);
+    if (requestedAmountBn.gt(toDecimal(remainingRefundable))) {
+      throw new Error(
+        `REFUND_CEILING_EXCEEDED: Requested refund amount ₹${requestedAmount} exceeds remaining refundable balance ₹${remainingRefundable} (Order Total: ₹${roundCurrency(orderTotalBn)}, Prior Refunded: ₹${roundCurrency(priorRefundedBn)}).`
+      );
+    }
 
-      // Check sum of prior refunds that are completed or in-flight (REQUESTED / PENDING / PROCESSING)
-      const priorRefundsRes = await client.query(`
-        SELECT COALESCE(SUM(amount), 0) AS total_refunded
-        FROM refunds
-        WHERE order_id = $1 AND status IN ('REQUESTED', 'PENDING', 'PROCESSING', 'COMPLETED')
-      `, [params.orderId]);
+    const isFull = add(priorRefundedBn, requestedAmountBn).gte(orderTotalBn.minus('0.01'));
+    const refundType = params.refundType || (isFull ? 'FULL' : 'PARTIAL');
 
-      const priorRefundedBn = toDecimal(priorRefundsRes.rows[0].total_refunded);
-      const remainingRefundableBn = subtract(orderTotalBn, priorRefundedBn);
-      const remainingRefundable = Number(roundCurrency(remainingRefundableBn));
+    const intentRes = await client.query(`
+      SELECT id, payment_order_id, provider_payment_id
+      FROM payment_intents
+      WHERE order_id = $1
+      ORDER BY created_at DESC
+      LIMIT 1
+    `, [params.orderId]);
 
-      const requestedAmount = explicitAmount !== undefined ? explicitAmount : remainingRefundable;
-      const requestedAmountBn = toDecimal(requestedAmount);
-      if (requestedAmountBn.lte(0)) {
-        throw new Error('INVALID_REFUND_AMOUNT: Refund amount must be greater than zero.');
-      }
+    const paymentId = intentRes.rows.length > 0
+      ? (intentRes.rows[0].provider_payment_id || intentRes.rows[0].payment_order_id)
+      : `pay_${crypto.randomBytes(6).toString('hex')}`;
 
-      if (requestedAmountBn.gt(toDecimal(remainingRefundable))) {
-        throw new Error(
-          `REFUND_CEILING_EXCEEDED: Requested refund amount ₹${requestedAmount} exceeds remaining refundable balance ₹${remainingRefundable} (Order Total: ₹${roundCurrency(orderTotalBn)}, Prior Refunded: ₹${roundCurrency(priorRefundedBn)}).`
-        );
-      }
+    const refundNumber = `REF_${Date.now()}_${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+    const durableIdempotencyKey = params.idempotencyKey || `ref_op_${params.orderId}_${requestedAmount}_${refundNumber}`;
 
-      const isFull = add(priorRefundedBn, requestedAmountBn).gte(orderTotalBn.minus('0.01'));
-      const refundType = params.refundType || (isFull ? 'FULL' : 'PARTIAL');
+    const rawCreator = params.createdBy || params.requestedBy;
+    const isUuid = rawCreator && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawCreator);
+    const createdByUuid = isUuid ? rawCreator : (order.user_id || null);
 
-      // Find payment intent / transaction ID
-      const intentRes = await client.query(`
-        SELECT id, payment_order_id, provider_payment_id
-        FROM payment_intents
-        WHERE order_id = $1
-        ORDER BY created_at DESC
-        LIMIT 1
-      `, [params.orderId]);
+    const insRes = await client.query(`
+      INSERT INTO refunds (
+        refund_number, order_id, payment_id, amount, currency,
+        reason_code, reason_description, refund_type, status,
+        idempotency_key, created_by
+      )
+      VALUES ($1, $2, $3, $4, 'INR', $5, $6, $7, 'PROCESSING', $8, $9)
+      RETURNING *
+    `, [
+      refundNumber,
+      params.orderId,
+      paymentId,
+      requestedAmount,
+      params.reasonCode,
+      params.reasonDescription || null,
+      refundType,
+      durableIdempotencyKey,
+      createdByUuid,
+    ]);
 
-      const paymentId = intentRes.rows.length > 0
-        ? (intentRes.rows[0].provider_payment_id || intentRes.rows[0].payment_order_id)
-        : `pay_${crypto.randomBytes(6).toString('hex')}`;
+    const refundRow = insRes.rows[0];
 
-      const refundNumber = `REF_${Date.now()}_${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
-      const durableIdempotencyKey = params.idempotencyKey || `ref_op_${params.orderId}_${requestedAmount}_${refundNumber}`;
+    await outboxService.stageEvent(client, {
+      eventType: 'RefundInitiated',
+      aggregateType: 'REFUND',
+      aggregateId: refundRow.id,
+      payload: {
+        refundId: refundRow.id,
+        refundNumber,
+        orderId: params.orderId,
+        amount: requestedAmount,
+        refundType,
+        idempotencyKey: durableIdempotencyKey,
+      },
+    });
 
-        const rawCreator = params.createdBy || params.requestedBy;
-        const isUuid = rawCreator && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawCreator);
-        const createdByUuid = isUuid ? rawCreator : (order.user_id || null);
-
-        // Insert durable refund intent in 'PROCESSING' state
-        const insRes = await client.query(`
-          INSERT INTO refunds (
-            refund_number, order_id, payment_id, amount, currency,
-            reason_code, reason_description, refund_type, status,
-            idempotency_key, created_by
-          )
-          VALUES ($1, $2, $3, $4, 'INR', $5, $6, $7, 'PROCESSING', $8, $9)
-          RETURNING *
-        `, [
-          refundNumber,
-          params.orderId,
-          paymentId,
-          requestedAmount,
-          params.reasonCode,
-          params.reasonDescription || null,
-          refundType,
-          durableIdempotencyKey,
-          createdByUuid,
-        ]);
-
-      const refundRow = insRes.rows[0];
-
-      // Stage Outbox Event: RefundInitiated
-      await outboxService.stageEvent(client, {
-        eventType: 'RefundInitiated',
-        aggregateType: 'REFUND',
-        aggregateId: refundRow.id,
-        payload: {
-          refundId: refundRow.id,
-          refundNumber,
-          orderId: params.orderId,
-          amount: requestedAmount,
-          refundType,
-          idempotencyKey: durableIdempotencyKey,
-        },
-      });
-
-      return {
-        refundRow,
-        paymentId,
-        requestedAmount,
-        durableIdempotencyKey,
-        isFull,
-        isDuplicate: false,
-      };
+    return {
+      refundRow,
+      paymentId,
+      requestedAmount,
+      durableIdempotencyKey,
+      isFull,
+      isDuplicate: false,
     };
+  }
 
-    let prepared: PreparedRefundIntent;
-    if (params.clientOverride) {
-      prepared = await prepareIntent(params.clientOverride);
-    } else {
-      prepared = await this.mutex.runExclusive(params.orderId, () => transaction(prepareIntent));
-    }
+  /**
+   * STEP B + STEP C: Executes external gateway call OUTSIDE DB transactions, then reconciles in a short DB TX.
+   */
+  public async executePreparedRefund(opts: {
+    prepared: PreparedRefundIntent;
+    orderId: string;
+    reasonCode: string;
+    clientOverride?: pg.PoolClient;
+  }): Promise<{ refund: RefundRecord; isDuplicate: boolean }> {
+    const { prepared, orderId, reasonCode, clientOverride } = opts;
 
     if (prepared.isDuplicate) {
+      if (prepared.refundRow?.id) {
+        bloomFilterService.add('refunds', prepared.refundRow.id);
+      }
       return {
         refund: this.mapRow(prepared.refundRow),
         isDuplicate: true,
       };
     }
 
-    // -----------------------------------------------------------------
-    // STEP B: EXECUTE (External Payment Provider - OUTSIDE ANY TRANSACTION)
-    // -----------------------------------------------------------------
-    // No database connection or row locks are held during gateway I/O.
     let providerRefundId: string | undefined;
     let providerStatus: 'COMPLETED' | 'FAILED' | 'PROCESSING' = 'COMPLETED';
     let outcomeUnknown = false;
@@ -330,7 +301,7 @@ export class RefundService {
               paymentId: prepared.paymentId,
               amount: prepared.requestedAmount,
               currency: 'INR',
-              reason: params.reasonCode,
+              reason: reasonCode,
               idempotencyKey: prepared.durableIdempotencyKey,
             });
           },
@@ -353,10 +324,6 @@ export class RefundService {
         outcomeUnknown = true;
       }
     } catch (provErr: any) {
-      // Critical Ambiguous Outcome Rule:
-      // If the gateway timed out or failed with a transient error after dispatch,
-      // we DO NOT assume failure and DO NOT allow duplicate attempts.
-      // We preserve status as PROCESSING (unknown outcome) for status reconciliation.
       if (isTransientFailure(provErr) || (provErr.message && provErr.message.toLowerCase().includes('timeout'))) {
         providerStatus = 'PROCESSING';
         outcomeUnknown = true;
@@ -365,11 +332,7 @@ export class RefundService {
       }
     }
 
-    // -----------------------------------------------------------------
-    // STEP C: RECONCILE (Short Database Transaction)
-    // -----------------------------------------------------------------
     const reconcileIntent = async (client: pg.PoolClient) => {
-      // Lock refund row against concurrent webhook reconciliation
       const refCheck = await client.query(`
         SELECT * FROM refunds WHERE id = $1 FOR UPDATE
       `, [prepared.refundRow.id]);
@@ -379,12 +342,10 @@ export class RefundService {
       }
 
       const currentRefund = refCheck.rows[0];
-      // If already finalized (e.g. by concurrent webhook), return current record
       if (currentRefund.status === 'COMPLETED' || currentRefund.status === 'FAILED') {
         return currentRefund;
       }
 
-      // Update refund status in PostgreSQL with explicit parameter type cast
       const finalRes = await client.query(`
         UPDATE refunds
         SET status = $1::varchar,
@@ -397,19 +358,17 @@ export class RefundService {
         RETURNING *
       `, [providerStatus, providerRefundId || null, prepared.refundRow.id]);
 
-      // If completed, update order payment status & stage RefundCompleted outbox event
       if (providerStatus === 'COMPLETED') {
         const newPaymentStatus = prepared.isFull ? 'REFUNDED' : 'PARTIALLY_REFUNDED';
         await client.query(`
           UPDATE orders
           SET payment_status = $1, updated_at = NOW()
           WHERE id = $2
-        `, [newPaymentStatus, params.orderId]);
+        `, [newPaymentStatus, orderId]);
 
-        // Post General Ledger Batch Q if pre-fulfillment cancellation
-        if (params.reasonCode?.startsWith('ORDER_CANCELLED_') || params.reasonCode === 'CANCELLATION') {
+        if (reasonCode?.startsWith('ORDER_CANCELLED_') || reasonCode === 'CANCELLATION') {
           await ledgerService.recordPreFulfillmentCancellationRefund({
-            orderId: params.orderId,
+            orderId,
             refundId: prepared.refundRow.id,
             refundNumber: prepared.refundRow.refund_number,
             amount: prepared.requestedAmount,
@@ -423,7 +382,7 @@ export class RefundService {
           aggregateId: prepared.refundRow.id,
           payload: {
             refundId: prepared.refundRow.id,
-            orderId: params.orderId,
+            orderId,
             amount: prepared.requestedAmount,
             providerRefundId,
             isFull: prepared.isFull,
@@ -436,7 +395,7 @@ export class RefundService {
           aggregateId: prepared.refundRow.id,
           payload: {
             refundId: prepared.refundRow.id,
-            orderId: params.orderId,
+            orderId,
             amount: prepared.requestedAmount,
             note: 'PROVIDER_OUTCOME_UNKNOWN: Awaiting gateway status reconciliation.',
           },
@@ -446,14 +405,10 @@ export class RefundService {
       return finalRes.rows[0];
     };
 
-    let reconciledRow: any;
-    if (params.clientOverride) {
-      reconciledRow = await reconcileIntent(params.clientOverride);
-    } else {
-      reconciledRow = await transaction(reconcileIntent);
-    }
+    const reconciledRow = clientOverride
+      ? await reconcileIntent(clientOverride)
+      : await transaction(reconcileIntent);
 
-    // Register committed refund ID into Bloom Filter post-commit
     if (reconciledRow && reconciledRow.id) {
       bloomFilterService.add('refunds', reconciledRow.id);
     }
@@ -463,6 +418,53 @@ export class RefundService {
       isDuplicate: false,
     };
   }
+
+  /**
+   * Initiates a refund for an order with idempotency and ceiling guarantees.
+   * Completely decoupled into 3 phases:
+   *   STEP A (Prepare): Short transaction to lock order, verify ceiling, insert durable PROCESSING intent, and commit.
+   *   STEP B (Execute): External payment provider call completely outside of database transactions.
+   *   STEP C (Reconcile): Short transaction to update refund record, order status, and stage outbox events.
+   */
+  public async createRefund(params: CreateRefundParams): Promise<{ refund: RefundRecord; isDuplicate: boolean }> {
+    const explicitAmount = this.parseExplicitAmount(params.amount);
+
+    if (params.idempotencyKey) {
+      const pool = getPool();
+      const existingRefund = await pool.query(`
+        SELECT * FROM refunds
+        WHERE idempotency_key = $1
+        LIMIT 1
+      `, [params.idempotencyKey]);
+
+      if (existingRefund.rows.length > 0) {
+        this.assertIdempotencyCompatibility(
+          existingRefund.rows[0],
+          params.orderId,
+          explicitAmount,
+          params.idempotencyKey
+        );
+        return {
+          refund: this.mapRow(existingRefund.rows[0]),
+          isDuplicate: true,
+        };
+      }
+    }
+
+    const prepared = params.clientOverride
+      ? await this.prepareRefundIntent(params, params.clientOverride)
+      : await this.mutex.runExclusive(params.orderId, () =>
+          transaction((client) => this.prepareRefundIntent(params, client))
+        );
+
+    return this.executePreparedRefund({
+      prepared,
+      orderId: params.orderId,
+      reasonCode: params.reasonCode,
+      clientOverride: params.clientOverride,
+    });
+  }
+
 
   /**
    * Fetch refund by ID with Bloom Filter negative lookup optimization

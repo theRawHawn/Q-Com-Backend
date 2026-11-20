@@ -5,6 +5,8 @@ import { candidateGenerator } from './candidateGenerator.js';
 import { defaultScoringStrategy } from './dispatchScoringStrategy.js';
 import { dispatchEventPublisher } from './dispatchEvents.js';
 import { outboxService } from '../outbox/outboxService.js';
+import { deliveryEconomicsService } from '../delivery/deliveryEconomicsService.js';
+import { routingService } from '../routing/routingService.js';
 import { DispatchAssignmentRecord, DispatchCandidateContext, DispatchOfferRecord, RiderCandidate } from './dispatchTypes.js';
 
 export class DispatchService {
@@ -218,7 +220,7 @@ export class DispatchService {
     const result = await transaction(async (client) => {
       // 1. Lock offer row
       const offerRes = await client.query(`
-        SELECT id, assignment_id, rider_id, order_id, status, expires_at
+        SELECT id, assignment_id, rider_id, order_id, status, expires_at, created_at, updated_at
         FROM dispatch_offers
         WHERE id = $1
         FOR UPDATE
@@ -238,7 +240,10 @@ export class DispatchService {
       // Idempotent return if already accepted
       if (offerRow.status === 'ACCEPTED') {
         const assignRes = await client.query(`SELECT * FROM dispatch_assignments WHERE id = $1`, [offerRow.assignment_id]);
-        const tripRes = await client.query(`SELECT id FROM delivery_trips WHERE order_id = $1`, [offerRow.order_id]);
+        const tripRes = await client.query(
+          `SELECT id FROM delivery_trips WHERE order_id = $1 AND trip_type = 'FORWARD' LIMIT 1`,
+          [offerRow.order_id]
+        );
         const a = assignRes.rows[0];
         return {
           assignment: {
@@ -258,8 +263,8 @@ export class DispatchService {
             orderId: offerRow.order_id,
             status: offerRow.status,
             expiresAt: offerRow.expires_at.toISOString(),
-            createdAt: offerRow.created_at.toISOString(),
-            updatedAt: offerRow.updated_at.toISOString(),
+            createdAt: (offerRow.created_at || new Date()).toISOString(),
+            updatedAt: (offerRow.updated_at || new Date()).toISOString(),
           },
           tripId: tripRes.rows[0]?.id || '',
         };
@@ -303,11 +308,55 @@ export class DispatchService {
         throw new Error(`ASSIGNMENT_MISMATCH: Offer '${offerId}' does not belong to assignment '${assignRow.id}'.`);
       }
 
-      // Lock rider row
+      // Lock rider row and verify eligibility (prevents accepting while OFFLINE or SUSPENDED)
       const riderLock = await client.query(`SELECT id, status FROM riders WHERE id = $1 FOR UPDATE`, [riderId]);
       if (riderLock.rows.length === 0) {
         throw new Error(`RIDER_NOT_FOUND: Rider '${riderId}' not found.`);
       }
+      if (['SUSPENDED', 'OFFLINE'].includes(riderLock.rows[0].status)) {
+        throw new Error(`RIDER_UNAVAILABLE: Rider '${riderId}' is in '${riderLock.rows[0].status}' status and cannot accept offers.`);
+      }
+
+      // Compute dynamic fare components from delivery_economics_configs + order/store route geometry
+      const econConfig = await deliveryEconomicsService.getConfig(client);
+      const orderLocRes = await client.query(
+        `SELECT o.jobsite_address, m.latitude AS merchant_lat, m.longitude AS merchant_lng
+         FROM orders o
+         JOIN merchants m ON o.merchant_id = m.id
+         WHERE o.id = $1
+         LIMIT 1`,
+        [offerRow.order_id]
+      );
+
+      let distanceKm = 0;
+      if (orderLocRes.rows.length > 0) {
+        const locRow = orderLocRes.rows[0];
+        const jobsite = typeof locRow.jobsite_address === 'string'
+          ? JSON.parse(locRow.jobsite_address)
+          : (locRow.jobsite_address || {});
+        const storeLat = Number(locRow.merchant_lat);
+        const storeLng = Number(locRow.merchant_lng);
+        const custLat = Number(jobsite.latitude);
+        const custLng = Number(jobsite.longitude);
+        if (
+          Number.isFinite(storeLat) && Number.isFinite(storeLng) &&
+          Number.isFinite(custLat) && Number.isFinite(custLng) &&
+          !(storeLat === 0 && storeLng === 0) && !(custLat === 0 && custLng === 0)
+        ) {
+          const routeRes = await routingService.calculateRoute(
+            { latitude: storeLat, longitude: storeLng },
+            { latitude: custLat, longitude: custLng },
+            'two_wheeler'
+          );
+          distanceKm = routeRes.selectedRoute.distanceKm;
+        }
+      }
+
+      const baseFare = Number(econConfig.riderBasePayout.toFixed(2));
+      const dynamicTotalPayout = deliveryEconomicsService.calculateRiderPayout(distanceKm, econConfig);
+      const distanceFare = Number(Math.max(0, dynamicTotalPayout - baseFare).toFixed(2));
+      const surgeFare = 0.00;
+      const totalRiderPayout = Number((baseFare + distanceFare + surgeFare).toFixed(2));
 
       // 3. Atomically update offer & assignment status to ACCEPTED
       await client.query(`UPDATE dispatch_offers SET status = 'ACCEPTED', updated_at = NOW() WHERE id = $1`, [offerId]);
@@ -316,21 +365,39 @@ export class DispatchService {
       // 4. Update rider status to ASSIGNED
       await client.query(`UPDATE riders SET status = 'ASSIGNED', updated_at = NOW() WHERE id = $1`, [riderId]);
 
-      // 5. Upsert delivery_trips record
+      // 5. Upsert FORWARD delivery_trips record (never touches REVERSE_PICKUP rows)
       let tripId = crypto.randomUUID();
-      const existingTrip = await client.query(`SELECT id FROM delivery_trips WHERE order_id = $1`, [offerRow.order_id]);
+      const existingTrip = await client.query(
+        `SELECT id, base_fare, distance_fare, surge_fare FROM delivery_trips WHERE order_id = $1 AND trip_type = 'FORWARD' FOR UPDATE`,
+        [offerRow.order_id]
+      );
       if (existingTrip.rows.length > 0) {
-        tripId = existingTrip.rows[0].id;
-        await client.query(`
-          UPDATE delivery_trips
-          SET rider_id = $1, status = 'ACCEPTED', accepted_at = NOW()
-          WHERE id = $2
-        `, [riderId, tripId]);
+        const existingRow = existingTrip.rows[0];
+        tripId = existingRow.id;
+        const hasExplicitFare = Number(existingRow.base_fare || 0) > 0 || Number(existingRow.distance_fare || 0) > 0;
+        if (hasExplicitFare) {
+          await client.query(`
+            UPDATE delivery_trips
+            SET rider_id = $1, status = 'ACCEPTED', accepted_at = NOW(), updated_at = NOW()
+            WHERE id = $2
+          `, [riderId, tripId]);
+        } else {
+          await client.query(`
+            UPDATE delivery_trips
+            SET rider_id = $1, status = 'ACCEPTED', accepted_at = NOW(),
+                base_fare = $2, distance_fare = $3, surge_fare = $4, total_rider_payout = $5,
+                updated_at = NOW()
+            WHERE id = $6
+          `, [riderId, baseFare, distanceFare, surgeFare, totalRiderPayout, tripId]);
+        }
       } else {
         await client.query(`
-          INSERT INTO delivery_trips (id, order_id, rider_id, status, accepted_at, base_fare, distance_fare, surge_fare, total_rider_payout)
-          VALUES ($1, $2, $3, 'ACCEPTED', NOW(), 35.00, 15.00, 0.00, 50.00)
-        `, [tripId, offerRow.order_id, riderId]);
+          INSERT INTO delivery_trips (
+            id, order_id, trip_type, rider_id, status, accepted_at,
+            base_fare, distance_fare, surge_fare, total_rider_payout
+          )
+          VALUES ($1, $2, 'FORWARD', $3, 'ACCEPTED', NOW(), $4, $5, $6, $7)
+        `, [tripId, offerRow.order_id, riderId, baseFare, distanceFare, surgeFare, totalRiderPayout]);
       }
 
       // Link trip ID back to assignment
@@ -703,19 +770,29 @@ export class DispatchService {
         `, [a.id]);
 
         if (a.rider_id) {
-          await client.query(`
-            UPDATE riders
-            SET status = 'IDLE_AT_HUB', updated_at = NOW()
-            WHERE id = $1 AND status IN ('PICKING_UP', 'IN_TRANSIT', 'ARRIVED_AT_DROP')
-          `, [a.rider_id]);
+          const otherActiveRes = await client.query(
+            `SELECT id FROM delivery_trips
+             WHERE rider_id = $1
+               AND order_id != $2
+               AND status IN ('ACCEPTED', 'ARRIVED_AT_PICKUP', 'PICKED_UP', 'ARRIVED_AT_DROP')
+             LIMIT 1`,
+            [a.rider_id, orderId]
+          );
+          if (otherActiveRes.rows.length === 0) {
+            await client.query(`
+              UPDATE riders
+              SET status = 'IDLE_AT_HUB', updated_at = NOW()
+              WHERE id = $1 AND status IN ('ASSIGNED', 'OFFERED', 'PICKING_UP', 'IN_TRANSIT', 'ARRIVED_AT_DROP')
+            `, [a.rider_id]);
+          }
         }
       }
 
-      // 2. Cancel active delivery trips (not delivered)
+      // 2. Cancel active FORWARD delivery trips (not delivered) without altering REVERSE_PICKUP trips
       await client.query(`
         UPDATE delivery_trips
-        SET status = 'CANCELLED'
-        WHERE order_id = $1 AND status NOT IN ('DELIVERED', 'CANCELLED')
+        SET status = 'CANCELLED', updated_at = NOW()
+        WHERE order_id = $1 AND trip_type = 'FORWARD' AND status NOT IN ('DELIVERED', 'CANCELLED')
       `, [orderId]);
     };
 
@@ -726,7 +803,11 @@ export class DispatchService {
   }
 
   /**
-   * Creates a reverse pickup trip for return logistics
+   * Creates an independent reverse pickup trip for return logistics without overwriting forward delivery history.
+   * Enforces:
+   * - Idempotent reuse by (trip_type = 'REVERSE_PICKUP', return_id)
+   * - Single concurrent active reverse trip per order
+   * - Dynamic rider fare computed from DeliveryEconomicsService
    */
   public async createReversePickupTrip(params: {
     returnId: string;
@@ -735,16 +816,120 @@ export class DispatchService {
     clientOverride?: pg.PoolClient;
   }): Promise<string> {
     const execute = async (client: pg.PoolClient) => {
-      const tripRes = await client.query(`SELECT id FROM delivery_trips WHERE order_id = $1 LIMIT 1`, [params.orderId]);
-      let tripId: string;
-      if (tripRes.rows.length > 0) {
-        tripId = tripRes.rows[0].id;
-      } else {
-        tripId = crypto.randomUUID();
-        await client.query(`
-          INSERT INTO delivery_trips (id, order_id, status, base_fare, total_rider_payout)
-          VALUES ($1, $2, 'ACCEPTED', 35.00, 35.00)
-        `, [tripId, params.orderId]);
+      // 1. Lock order row first (canonical ordering) and fetch route geometry
+      const orderRes = await client.query(
+        `SELECT o.id, o.jobsite_address, m.latitude AS merchant_lat, m.longitude AS merchant_lng
+         FROM orders o
+         JOIN merchants m ON o.merchant_id = m.id
+         WHERE o.id = $1
+         FOR UPDATE`,
+        [params.orderId]
+      );
+      if (orderRes.rows.length === 0) {
+        throw new Error(`ORDER_NOT_FOUND: Order '${params.orderId}' does not exist.`);
+      }
+
+      // 2. Lock return record
+      const retRes = await client.query(
+        `SELECT id, order_id, status, pickup_trip_id FROM order_returns WHERE id = $1 FOR UPDATE`,
+        [params.returnId]
+      );
+      if (retRes.rows.length === 0) {
+        throw new Error(`RETURN_NOT_FOUND: Return request '${params.returnId}' does not exist.`);
+      }
+
+      // 3. Idempotent return if this returnId already has a REVERSE_PICKUP trip
+      const existingForReturn = await client.query(
+        `SELECT id FROM delivery_trips
+         WHERE trip_type = 'REVERSE_PICKUP' AND return_id = $1
+         LIMIT 1
+         FOR UPDATE`,
+        [params.returnId]
+      );
+      if (existingForReturn.rows.length > 0) {
+        const existingTripId = existingForReturn.rows[0].id;
+        await client.query(
+          `UPDATE order_returns
+           SET pickup_trip_id = $1,
+               status = CASE WHEN status = 'REQUESTED' THEN 'PICKUP_ASSIGNED' ELSE status END,
+               approved_at = COALESCE(approved_at, NOW())
+           WHERE id = $2`,
+          [existingTripId, params.returnId]
+        );
+        return existingTripId;
+      }
+
+      // 4. Guard against concurrent active reverse trip on same order
+      const activeReverseRes = await client.query(
+        `SELECT id, return_id, status FROM delivery_trips
+         WHERE order_id = $1
+           AND trip_type = 'REVERSE_PICKUP'
+           AND status NOT IN ('DELIVERED', 'RETURNED_TO_HUB', 'CANCELLED')
+         LIMIT 1
+         FOR UPDATE`,
+        [params.orderId]
+      );
+      if (activeReverseRes.rows.length > 0) {
+        throw new Error(
+          `CONCURRENT_REVERSE_TRIP_EXISTS: Order '${params.orderId}' already has active reverse pickup trip '${activeReverseRes.rows[0].id}'.`
+        );
+      }
+
+      // 5. Compute dynamic reverse logistics fare from DeliveryEconomicsService
+      const econConfig = await deliveryEconomicsService.getConfig(client);
+      const locRow = orderRes.rows[0];
+      const jobsite = typeof locRow.jobsite_address === 'string'
+        ? JSON.parse(locRow.jobsite_address)
+        : (locRow.jobsite_address || {});
+      let distanceKm = 0;
+      const storeLat = Number(locRow.merchant_lat);
+      const storeLng = Number(locRow.merchant_lng);
+      const custLat = Number(jobsite.latitude);
+      const custLng = Number(jobsite.longitude);
+      if (
+        Number.isFinite(storeLat) && Number.isFinite(storeLng) &&
+        Number.isFinite(custLat) && Number.isFinite(custLng) &&
+        !(storeLat === 0 && storeLng === 0) && !(custLat === 0 && custLng === 0)
+      ) {
+        const routeRes = await routingService.calculateRoute(
+          { latitude: custLat, longitude: custLng },
+          { latitude: storeLat, longitude: storeLng },
+          'two_wheeler'
+        );
+        distanceKm = routeRes.selectedRoute.distanceKm;
+      }
+
+      const baseFare = Number(econConfig.riderBasePayout.toFixed(2));
+      const dynamicTotalPayout = deliveryEconomicsService.calculateRiderPayout(distanceKm, econConfig);
+      const distanceFare = Number(Math.max(0, dynamicTotalPayout - baseFare).toFixed(2));
+
+      const candidateTripId = crypto.randomUUID();
+      let tripId: string | undefined;
+      try {
+        const insRes = await client.query(
+          `INSERT INTO delivery_trips (
+             id, order_id, trip_type, return_id, status,
+             base_fare, distance_fare, surge_fare, total_rider_payout
+           )
+           VALUES ($1, $2, 'REVERSE_PICKUP', $3, 'BROADCASTING', $4, $5, 0.00, $6)
+           RETURNING id`,
+          [candidateTripId, params.orderId, params.returnId, baseFare, distanceFare, dynamicTotalPayout]
+        );
+        tripId = insRes.rows[0]?.id;
+      } catch (err: any) {
+        if (err?.code === '23505') {
+          const refetch = await client.query(
+            `SELECT id FROM delivery_trips WHERE trip_type = 'REVERSE_PICKUP' AND return_id = $1 LIMIT 1`,
+            [params.returnId]
+          );
+          if (refetch.rows.length > 0) {
+            tripId = refetch.rows[0].id;
+          } else {
+            throw err;
+          }
+        } else {
+          throw err;
+        }
       }
 
       await client.query(`
@@ -754,6 +939,131 @@ export class DispatchService {
       `, [tripId, params.returnId]);
 
       return tripId;
+    };
+
+    if (params.clientOverride) {
+      return execute(params.clientOverride);
+    }
+    return transaction(execute);
+  }
+
+  /**
+   * Assigns or reassigns a rider to an existing REVERSE_PICKUP trip while preserving forward trip history.
+   */
+  public async assignReversePickupRider(params: {
+    tripId: string;
+    riderId: string;
+    clientOverride?: pg.PoolClient;
+  }): Promise<{ tripId: string; riderId: string; status: string }> {
+    const execute = async (client: pg.PoolClient) => {
+      const tripRes = await client.query(
+        `SELECT id, order_id, rider_id, status, trip_type FROM delivery_trips WHERE id = $1 FOR UPDATE`,
+        [params.tripId]
+      );
+      if (tripRes.rows.length === 0) {
+        throw new Error(`TRIP_NOT_FOUND: Reverse trip '${params.tripId}' does not exist.`);
+      }
+      const trip = tripRes.rows[0];
+      if (trip.trip_type !== 'REVERSE_PICKUP') {
+        throw new Error(`INVALID_TRIP_TYPE: Trip '${params.tripId}' is not a REVERSE_PICKUP trip.`);
+      }
+      if (['PICKED_UP', 'ARRIVED_AT_DROP', 'DELIVERED', 'RETURNED_TO_HUB', 'CANCELLED'].includes(trip.status)) {
+        throw new Error(`INVALID_TRIP_STATE: Cannot reassign reverse pickup trip in '${trip.status}' status.`);
+      }
+
+      const riderRes = await client.query(`SELECT id, status FROM riders WHERE id = $1 FOR UPDATE`, [params.riderId]);
+      if (riderRes.rows.length === 0) {
+        throw new Error(`RIDER_NOT_FOUND: Rider '${params.riderId}' does not exist.`);
+      }
+      if (riderRes.rows[0].status === 'SUSPENDED') {
+        throw new Error(`RIDER_SUSPENDED: Cannot assign suspended rider '${params.riderId}'.`);
+      }
+
+      const previousRiderId = trip.rider_id;
+      await client.query(
+        `UPDATE delivery_trips
+         SET rider_id = $1, status = 'ACCEPTED', accepted_at = COALESCE(accepted_at, NOW()), updated_at = NOW()
+         WHERE id = $2`,
+        [params.riderId, params.tripId]
+      );
+
+      await client.query(`UPDATE riders SET status = 'ASSIGNED', updated_at = NOW() WHERE id = $1`, [params.riderId]);
+
+      if (previousRiderId && previousRiderId !== params.riderId) {
+        const otherActive = await client.query(
+          `SELECT id FROM delivery_trips
+           WHERE rider_id = $1 AND id != $2 AND status IN ('ACCEPTED', 'ARRIVED_AT_PICKUP', 'PICKED_UP', 'ARRIVED_AT_DROP')
+           LIMIT 1`,
+          [previousRiderId, params.tripId]
+        );
+        if (otherActive.rows.length === 0) {
+          await client.query(
+            `UPDATE riders SET status = 'IDLE_AT_HUB', updated_at = NOW()
+             WHERE id = $1 AND status NOT IN ('OFFLINE', 'SUSPENDED')`,
+            [previousRiderId]
+          );
+        }
+      }
+
+      return { tripId: params.tripId, riderId: params.riderId, status: 'ACCEPTED' };
+    };
+
+    if (params.clientOverride) {
+      return execute(params.clientOverride);
+    }
+    return transaction(execute);
+  }
+
+  /**
+   * Cancels a reverse pickup trip when a return is cancelled without touching the order's forward trip.
+   */
+  public async cancelReversePickupTrip(params: {
+    returnId: string;
+    clientOverride?: pg.PoolClient;
+  }): Promise<void> {
+    const execute = async (client: pg.PoolClient) => {
+      const retRes = await client.query(
+        `SELECT id, order_id, status FROM order_returns WHERE id = $1 FOR UPDATE`,
+        [params.returnId]
+      );
+      if (retRes.rows.length === 0) {
+        throw new Error(`RETURN_NOT_FOUND: Return '${params.returnId}' does not exist.`);
+      }
+
+      const tripRes = await client.query(
+        `SELECT id, rider_id, status FROM delivery_trips
+         WHERE trip_type = 'REVERSE_PICKUP' AND return_id = $1
+         FOR UPDATE`,
+        [params.returnId]
+      );
+
+      for (const trip of tripRes.rows) {
+        if (!['DELIVERED', 'RETURNED_TO_HUB', 'CANCELLED'].includes(trip.status)) {
+          await client.query(
+            `UPDATE delivery_trips SET status = 'CANCELLED', updated_at = NOW() WHERE id = $1`,
+            [trip.id]
+          );
+          if (trip.rider_id) {
+            const otherActive = await client.query(
+              `SELECT id FROM delivery_trips
+               WHERE rider_id = $1 AND id != $2 AND status IN ('ACCEPTED', 'ARRIVED_AT_PICKUP', 'PICKED_UP', 'ARRIVED_AT_DROP')
+               LIMIT 1`,
+              [trip.rider_id, trip.id]
+            );
+            if (otherActive.rows.length === 0) {
+              await client.query(
+                `UPDATE riders SET status = 'IDLE_AT_HUB', updated_at = NOW()
+                 WHERE id = $1 AND status IN ('ASSIGNED', 'OFFERED', 'PICKING_UP', 'IN_TRANSIT', 'ARRIVED_AT_DROP')`,
+                [trip.rider_id]
+              );
+            }
+          }
+        }
+      }
+
+      if (!['ACCEPTED', 'REJECTED', 'REJECTED_QC'].includes(retRes.rows[0].status)) {
+        await client.query(`UPDATE order_returns SET status = 'CANCELLED' WHERE id = $1`, [params.returnId]);
+      }
     };
 
     if (params.clientOverride) {

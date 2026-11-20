@@ -85,10 +85,10 @@ export class SettlementAllocationService {
         );
       }
 
-      // 3. Row-level lock on delivery_trip (if assigned)
+      // 3. Row-level lock on forward delivery_trip (if assigned)
       const tripRes = await client.query(`
         SELECT * FROM delivery_trips
-        WHERE order_id = $1
+        WHERE order_id = $1 AND trip_type = 'FORWARD'
         LIMIT 1
         FOR UPDATE
       `, [orderId]);
@@ -204,10 +204,10 @@ export class SettlementAllocationService {
 
       if (trip) {
         const grossRiderFareBn = add(
-          trip.base_fare || '35.00',
-          trip.distance_fare || '0.00',
-          trip.surge_fare || '0.00',
-          trip.wait_time_compensation || '0.00'
+          trip.base_fare ?? '0.00',
+          trip.distance_fare ?? '0.00',
+          trip.surge_fare ?? '0.00',
+          trip.wait_time_compensation ?? '0.00'
         );
         grossRiderFare = Number(roundCurrency(grossRiderFareBn));
 

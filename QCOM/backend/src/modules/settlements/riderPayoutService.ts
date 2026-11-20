@@ -76,12 +76,12 @@ export class RiderPayoutService {
     let totalNetEarningsBn = new BigNumber(0);
 
     const trips = tripsRes.rows.map((t) => {
-      const baseBn = toDecimal(t.base_fare || '35.00');
-      const distBn = toDecimal(t.distance_fare || '0.00');
-      const surgeBn = toDecimal(t.surge_fare || '0.00');
-      const waitBn = toDecimal(t.wait_time_compensation || '0.00');
-      const tipBn = toDecimal(t.tip_amount || '0.00');
-      const tdsBn = toDecimal(t.rider_withholding_amount || '0.00');
+      const baseBn = toDecimal(t.base_fare ?? '0.00');
+      const distBn = toDecimal(t.distance_fare ?? '0.00');
+      const surgeBn = toDecimal(t.surge_fare ?? '0.00');
+      const waitBn = toDecimal(t.wait_time_compensation ?? '0.00');
+      const tipBn = toDecimal(t.tip_amount ?? '0.00');
+      const tdsBn = toDecimal(t.rider_withholding_amount ?? '0.00');
       const tripGrossBn = add(baseBn, distBn, surgeBn, waitBn);
       const netBn = tripGrossBn.plus(tipBn).minus(tdsBn);
 

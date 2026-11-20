@@ -506,10 +506,20 @@ orderRouter.post('/:orderId/cancel', authenticate, requireOrderOwnership('orderI
       res.status(503).json({ success: false, error: 'DATABASE_UNAVAILABLE', message: 'Database temporarily unavailable.' });
       return;
     }
-    const status = err.message.includes('NOT_FOUND') ? 404 : 400;
+    const status = err.message.includes('IDEMPOTENCY_KEY_ACTOR_MISMATCH')
+      ? 403
+      : err.message.includes('CANCELLATION_IN_PROGRESS')
+        ? 409
+        : err.message.includes('NOT_FOUND')
+          ? 404
+          : 400;
     res.status(status).json({
       success: false,
-      error: 'CANCELLATION_FAILED',
+      error: err.message.includes('IDEMPOTENCY_KEY_ACTOR_MISMATCH')
+        ? 'IDEMPOTENCY_KEY_ACTOR_MISMATCH'
+        : err.message.includes('CANCELLATION_IN_PROGRESS')
+          ? 'CANCELLATION_IN_PROGRESS'
+          : 'CANCELLATION_FAILED',
       message: err.message || 'Failed to cancel order.',
     });
   }
@@ -571,10 +581,20 @@ orderRouter.post(
         res.status(503).json({ success: false, error: 'DATABASE_UNAVAILABLE', message: 'Database temporarily unavailable.' });
         return;
       }
-      const status = err.message.includes('NOT_FOUND') ? 404 : 400;
+      const status = err.message.includes('IDEMPOTENCY_KEY_ACTOR_MISMATCH')
+        ? 403
+        : err.message.includes('CANCELLATION_IN_PROGRESS')
+          ? 409
+          : err.message.includes('NOT_FOUND')
+            ? 404
+            : 400;
       res.status(status).json({
         success: false,
-        error: 'CANCELLATION_FAILED',
+        error: err.message.includes('IDEMPOTENCY_KEY_ACTOR_MISMATCH')
+          ? 'IDEMPOTENCY_KEY_ACTOR_MISMATCH'
+          : err.message.includes('CANCELLATION_IN_PROGRESS')
+            ? 'CANCELLATION_IN_PROGRESS'
+            : 'CANCELLATION_FAILED',
         message: err.message || 'Failed to cancel order.',
       });
     }
@@ -613,10 +633,20 @@ orderRouter.post(
         res.status(503).json({ success: false, error: 'DATABASE_UNAVAILABLE', message: 'Database temporarily unavailable.' });
         return;
       }
-      const status = err.message.includes('NOT_FOUND') ? 404 : 400;
+      const status = err.message.includes('IDEMPOTENCY_KEY_ACTOR_MISMATCH')
+        ? 403
+        : err.message.includes('CANCELLATION_IN_PROGRESS')
+          ? 409
+          : err.message.includes('NOT_FOUND')
+            ? 404
+            : 400;
       res.status(status).json({
         success: false,
-        error: 'CANCELLATION_FAILED',
+        error: err.message.includes('IDEMPOTENCY_KEY_ACTOR_MISMATCH')
+          ? 'IDEMPOTENCY_KEY_ACTOR_MISMATCH'
+          : err.message.includes('CANCELLATION_IN_PROGRESS')
+            ? 'CANCELLATION_IN_PROGRESS'
+            : 'CANCELLATION_FAILED',
         message: err.message || 'Failed to cancel order.',
       });
     }

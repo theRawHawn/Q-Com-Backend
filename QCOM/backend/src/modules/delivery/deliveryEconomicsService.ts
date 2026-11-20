@@ -1,3 +1,4 @@
+import pg from 'pg';
 import { getPool } from '../../database/connection.js';
 import { DeliveryEconomicsConfig } from './deliveryTypes.js';
 
@@ -5,9 +6,9 @@ export class DeliveryEconomicsService {
   /**
    * Retrieves active delivery economics configuration
    */
-  public async getConfig(): Promise<DeliveryEconomicsConfig> {
-    const pool = getPool();
-    const res = await pool.query(`
+  public async getConfig(clientOverride?: pg.PoolClient): Promise<DeliveryEconomicsConfig> {
+    const db = clientOverride || getPool();
+    const res = await db.query(`
       SELECT rider_base_payout, rider_per_km_rate, max_delivery_subsidy, pg_cost_percent, packaging_cost_inr, ops_cost_inr
       FROM delivery_economics_configs
       WHERE is_active = TRUE

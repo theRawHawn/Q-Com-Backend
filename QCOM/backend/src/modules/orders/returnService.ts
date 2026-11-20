@@ -3,7 +3,7 @@ import pg from 'pg';
 import { getPool, transaction } from '../../database/connection.js';
 import { inventoryService } from '../inventory/inventoryService.js';
 import { dispatchService } from '../dispatch/dispatchService.js';
-import { refundService, RefundRecord } from '../payments/refundService.js';
+import { refundService, PreparedRefundIntent, RefundRecord } from '../payments/refundService.js';
 import { sellerSettlementService } from '../settlements/sellerSettlementService.js';
 import { outboxService } from '../outbox/outboxService.js';
 import { bloomFilterService } from '../resilience/bloomFilterService.js';
@@ -408,7 +408,7 @@ export class ReturnService {
 
   /**
    * Merchant Store QC inspection: verifies item condition, selectively restocks,
-   * calculates proportional refund, issues gateway refund, and executes seller clawback.
+   * calculates proportional refund, issues gateway refund OUTSIDE DB TX locks, and executes seller clawback.
    */
   public async qcInspectAndResolve(params: {
     returnId: string;
@@ -417,7 +417,7 @@ export class ReturnService {
     qcNotes?: string;
     clientOverride?: pg.PoolClient;
   }): Promise<{ returnRecord: ReturnRecord; refund?: RefundRecord; clawback?: any }> {
-    const execute = async (client: pg.PoolClient) => {
+    const executeSingleTx = async (client: pg.PoolClient) => {
       const returnRes = await client.query(`
         SELECT * FROM order_returns
         WHERE id = $1 AND merchant_id = $2
@@ -429,10 +429,13 @@ export class ReturnService {
       }
 
       const ret = returnRes.rows[0];
+      if (['ACCEPTED', 'REJECTED', 'REJECTED_QC', 'CANCELLED'].includes(ret.status)) {
+        throw new Error(`INVALID_RETURN_STATE: Return '${params.returnId}' already finalized in '${ret.status}' status.`);
+      }
+
       let totalPassedUnits = 0;
       let totalRefundAmount = 0;
 
-      // 1. Process each return item decision
       for (const d of params.itemDecisions) {
         const itemRes = await client.query(`
           SELECT ori.*, oi.unit_price, oi.taxable_amount, oi.cgst_amount, oi.sgst_amount, oi.igst_amount, oi.quantity as orig_qty
@@ -445,16 +448,12 @@ export class ReturnService {
         if (itemRes.rows.length === 0) continue;
         const it = itemRes.rows[0];
         const qty = parseInt(it.quantity, 10);
-        const qcStatus = d.qcPassed ? 'PASSED' : 'FAILED';
 
         if (d.qcPassed) {
           totalPassedUnits += qty;
-          // Calculate proportional refund: unit_price * qty + GST
           const unitPrice = parseFloat(it.unit_price);
-          const itemTotal = unitPrice * qty;
-          totalRefundAmount += itemTotal;
+          totalRefundAmount += unitPrice * qty;
 
-          // Restock inventory directly into store_inventory
           await inventoryService.restockItem(ret.merchant_id, it.product_id, qty, client);
 
           await client.query(`
@@ -488,7 +487,6 @@ export class ReturnService {
       let clawbackResult: any;
 
       if (totalPassedUnits > 0 && totalRefundAmount > 0) {
-        // 2. Issue Gateway Refund via refundService
         const refRes = await refundService.createRefund({
           orderId: ret.order_id,
           amount: totalRefundAmount,
@@ -502,7 +500,6 @@ export class ReturnService {
           throw new Error(`RETURN_REFUND_FAILED: Payment gateway rejected refund for returned items (${refundRecord.refundNumber}).`);
         }
 
-        // 3. Process Seller Clawback or Return Debit in seller_ledgers & General Ledger
         clawbackResult = await sellerSettlementService.processSellerClawback({
           orderId: ret.order_id,
           merchantId: ret.merchant_id,
@@ -511,7 +508,6 @@ export class ReturnService {
           clientOverride: client,
         });
 
-        // 4. Update order_returns status to ACCEPTED
         await client.query(`
           UPDATE order_returns
           SET status = 'ACCEPTED',
@@ -539,7 +535,6 @@ export class ReturnService {
           },
         });
       } else {
-        // All items failed QC
         await client.query(`
           UPDATE order_returns
           SET status = 'REJECTED_QC',
@@ -569,9 +564,216 @@ export class ReturnService {
     };
 
     if (params.clientOverride) {
-      return execute(params.clientOverride);
+      return executeSingleTx(params.clientOverride);
     }
-    return transaction(execute);
+
+    // Decoupled 3-phase flow:
+    // Phase 1 (short TX): lock return, evaluate item decisions, prepare refund intent (no stock mutation yet!)
+    interface PreparedReturnQc {
+      earlyRejected?: ReturnRecord;
+      ret: any;
+      totalRefundAmount: number;
+      reasonCode: string;
+      preparedRefund?: PreparedRefundIntent;
+      passedItemIds: { id: string; productId: string; qty: number }[];
+      failedItemIds: string[];
+    }
+
+    const prep = await transaction(async (client): Promise<PreparedReturnQc> => {
+      const returnRes = await client.query(`
+        SELECT * FROM order_returns
+        WHERE id = $1 AND merchant_id = $2
+        FOR UPDATE
+      `, [params.returnId, params.merchantId]);
+
+      if (returnRes.rows.length === 0) {
+        throw new Error('RETURN_NOT_FOUND: Return not found or unauthorized for this merchant.');
+      }
+
+      const ret = returnRes.rows[0];
+      if (['ACCEPTED', 'REJECTED', 'REJECTED_QC', 'CANCELLED'].includes(ret.status)) {
+        throw new Error(`INVALID_RETURN_STATE: Return '${params.returnId}' already finalized in '${ret.status}' status.`);
+      }
+
+      let totalPassedUnits = 0;
+      let totalRefundAmount = 0;
+      const passedItemIds: { id: string; productId: string; qty: number }[] = [];
+      const failedItemIds: string[] = [];
+
+      for (const d of params.itemDecisions) {
+        const itemRes = await client.query(`
+          SELECT ori.*, oi.unit_price
+          FROM order_return_items ori
+          JOIN order_items oi ON ori.order_item_id = oi.id
+          WHERE ori.id = $1 AND ori.return_id = $2
+          FOR UPDATE
+        `, [d.returnItemId, ret.id]);
+
+        if (itemRes.rows.length === 0) continue;
+        const it = itemRes.rows[0];
+        const qty = parseInt(it.quantity, 10);
+
+        if (d.qcPassed) {
+          totalPassedUnits += qty;
+          totalRefundAmount += parseFloat(it.unit_price) * qty;
+          passedItemIds.push({ id: it.id, productId: it.product_id, qty });
+        } else {
+          failedItemIds.push(it.id);
+        }
+      }
+
+      totalRefundAmount = +totalRefundAmount.toFixed(2);
+
+      if (totalPassedUnits <= 0 || totalRefundAmount <= 0) {
+        for (const fid of failedItemIds) {
+          await client.query(
+            `UPDATE order_return_items SET qc_status = 'FAILED', restocked = FALSE WHERE id = $1`,
+            [fid]
+          );
+        }
+        await client.query(
+          `UPDATE order_returns SET status = 'REJECTED_QC', qc_notes = $1, completed_at = NOW() WHERE id = $2`,
+          [params.qcNotes || 'All return items failed quality inspection.', ret.id]
+        );
+        await outboxService.stageEvent(client, {
+          eventType: 'ReturnRejectedQC',
+          aggregateType: 'RETURN',
+          aggregateId: ret.id,
+          payload: { returnId: ret.id, orderId: ret.order_id, reason: params.qcNotes || 'Failed QC' },
+        });
+        const rejectedRecord = await this.getReturnById(ret.id, client);
+        return {
+          earlyRejected: rejectedRecord!,
+          ret,
+          totalRefundAmount: 0,
+          reasonCode: `RETURN_${ret.reason_code}`,
+          passedItemIds,
+          failedItemIds,
+        };
+      }
+
+      const reasonCode = `RETURN_${ret.reason_code}`;
+      const preparedRefund = await refundService.prepareRefundIntent(
+        {
+          orderId: ret.order_id,
+          amount: totalRefundAmount,
+          reasonCode,
+          reasonDescription: params.qcNotes || 'Return QC inspection passed.',
+        },
+        client
+      );
+
+      return {
+        ret,
+        totalRefundAmount,
+        reasonCode,
+        preparedRefund,
+        passedItemIds,
+        failedItemIds,
+      };
+    });
+
+    if (prep.earlyRejected) {
+      return { returnRecord: prep.earlyRejected };
+    }
+
+    // Phase 2 (OUTSIDE any DB TX): call payment gateway and persist refund state
+    const refExec = await refundService.executePreparedRefund({
+      prepared: prep.preparedRefund!,
+      orderId: prep.ret.order_id,
+      reasonCode: prep.reasonCode,
+    });
+    const refundRecord = refExec.refund;
+
+    if (refundRecord.status === 'FAILED') {
+      throw new Error(
+        `RETURN_REFUND_FAILED: Payment gateway rejected refund for returned items (${refundRecord.refundNumber}).`
+      );
+    }
+
+    // Phase 3 (short TX): apply restocks, seller clawback, and transition order_returns/orders atomically
+    return transaction(async (client) => {
+      const lockRet = await client.query(
+        `SELECT * FROM order_returns WHERE id = $1 AND merchant_id = $2 FOR UPDATE`,
+        [params.returnId, params.merchantId]
+      );
+      const curRet = lockRet.rows[0];
+      if (!curRet) {
+        throw new Error('RETURN_NOT_FOUND: Return missing during QC finalization.');
+      }
+      if (curRet.status === 'ACCEPTED') {
+        const existingRec = await this.getReturnById(curRet.id, client);
+        return { returnRecord: existingRec!, refund: refundRecord };
+      }
+
+      for (const pItem of prep.passedItemIds) {
+        await inventoryService.restockItem(curRet.merchant_id, pItem.productId, pItem.qty, client);
+        await client.query(
+          `UPDATE order_return_items SET qc_status = 'PASSED', restocked = TRUE WHERE id = $1`,
+          [pItem.id]
+        );
+        await outboxService.stageEvent(client, {
+          eventType: 'InventoryRestocked',
+          aggregateType: 'INVENTORY',
+          aggregateId: pItem.productId,
+          payload: {
+            merchantId: curRet.merchant_id,
+            productId: pItem.productId,
+            quantityRestocked: pItem.qty,
+            returnId: curRet.id,
+          },
+        });
+      }
+
+      for (const fid of prep.failedItemIds) {
+        await client.query(
+          `UPDATE order_return_items SET qc_status = 'FAILED', restocked = FALSE WHERE id = $1`,
+          [fid]
+        );
+      }
+
+      const clawbackResult = await sellerSettlementService.processSellerClawback({
+        orderId: curRet.order_id,
+        merchantId: curRet.merchant_id,
+        refundAmount: prep.totalRefundAmount,
+        returnId: curRet.id,
+        clientOverride: client,
+      });
+
+      await client.query(
+        `UPDATE order_returns
+         SET status = 'ACCEPTED',
+             refund_id = $1,
+             qc_notes = $2,
+             completed_at = NOW()
+         WHERE id = $3`,
+        [refundRecord.id, params.qcNotes || null, curRet.id]
+      );
+
+      await client.query(
+        `UPDATE orders SET status = 'returned', updated_at = NOW() WHERE id = $1`,
+        [curRet.order_id]
+      );
+
+      await outboxService.stageEvent(client, {
+        eventType: 'ReturnAccepted',
+        aggregateType: 'RETURN',
+        aggregateId: curRet.id,
+        payload: {
+          returnId: curRet.id,
+          orderId: curRet.order_id,
+          refundId: refundRecord.id,
+          refundAmount: prep.totalRefundAmount,
+        },
+      });
+
+      const finalRecord = await this.getReturnById(curRet.id, client);
+      return {
+        returnRecord: finalRecord!,
+        refund: refundRecord,
+        clawback: clawbackResult,
+      };
+    });
   }
 
   /**
