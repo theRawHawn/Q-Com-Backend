@@ -8,7 +8,7 @@
 - **Branch:** `main`
 - **Target Package:** `QCOM/backend`
 - **Starting SHA:** `fd96cafe69b44b710c31cad878b498a12ffd0dce`
-- **Ending SHA:** Pending final CI verification commit (updated upon CI completion)
+- **Verified Implementation SHA:** `3079b3353402ef7348218c8a36dca5a8ab1d9af8` (all code, migration, and integration changes verified green in CI Run `44772331343`; documentation closure commit follows immediately without source/migration/test modifications)
 
 ---
 
@@ -117,12 +117,40 @@ Delivery task execution across partner compatibility endpoints (`POST /api/tasks
 
 ## K. TEST EVIDENCE
 
-*(Local verification results completed cleanly; full 57-suite CI + real PG 16 / Redis 7.0.15 harness execution results will be recorded here immediately after GitHub Actions run completes.)*
+### 1. CI Service Versions & Infrastructure (Verified on GitHub Actions Run `44772331343`)
+- **CI Workflow URL:** `https://github.com/theRawHawn/Q-Com-Backend/actions/runs/44772331343`
+- **Job 1 (`test` / `136412951721`):** **PostgreSQL 16.16** (`postgres:16-alpine`), **Redis 7.0.15** (`redis:7.0.15-alpine`) — **SUCCESS**
+- **Job 2 (`real-services-integration` / `136412951096`):** **PostgreSQL 16.6** (`docker-compose.integration.yml`), **Redis 7.0.15** — **SUCCESS**
 
-- **Local TypeScript (`QCOM/backend`):** `npm --prefix QCOM/backend run build` (`tsc --noEmit`) — Passed (exit 0).
-- **Local Root Checks:** `npx tsc --noEmit && npm run lint && npm run build` (`vite build`) — Passed (exit 0).
-- **Local Suite Execution (`pg-mem` harness):** `tests/sprint15-7-transaction-cod-reverse-trip-integrity.test.ts` (9/9 sections passed), plus `sprint5-dispatch`, `sprint7-settlements`, `sprint9-returns-cancellations`, `four-app-compatibility`, `sprint14-2-workflow-closure`, `sprint14-3-staging-release-candidate` passed locally with 0 regressions.
-- **Real PostgreSQL 16 / Redis 7.0.15 Execution (`tests/run-all-tests.ts` 57 suites & `tests/integration/real-services.test.ts`):** Pending CI verification upon push to `main`.
+### 2. Automated Test Suites & Counts
+- **Full Backend Regression Runner (`tests/run-all-tests.ts`):** **57 / 57 test suites PASSED in 49.32s** against PostgreSQL 16.16 + Redis 7.0.15 (migrations `001`–`028` applied cleanly via `migrate.ts` & seeded via `seed.ts`).
+- **Sprint 15.7 Dedicated Suite (`tests/sprint15-7-transaction-cod-reverse-trip-integrity.test.ts`):** **9 / 9 test sections PASSED** (both locally on `pg-mem` and in CI):
+  1. Delivery lifecycle preconditions (`ACCEPTED -> ARRIVED_AT_PICKUP -> PICKED_UP -> DELIVERED`), rider ownership, prepaid `payment_status === 'PAID'` guard, 5-attempt OTP lockout (`429 OTP_ATTEMPTS_EXCEEDED`), and prepaid `cashCollected` zeroing.
+  2. Mid-transaction failure injection (`allocateFulfilledOrder`) atomic rollback + retry + negative COD rejection (`400`) + tampered COD override (`420` DB total overriding client `1`).
+  3. Concurrent delivery completion race (`[200, 409]`) with single settlement allocation, single `floating_cash_balance` increment, and balanced `TX_COD_COLLECT_<orderId>` GL batch.
+  4. Dynamic `delivery_economics_configs` fare computation and elimination of literal `35.00` fallback on `0.00` base fare statements.
+  5. Multi-trip availability (`ASSIGNED` preserved while holding second trip, `IDLE_AT_HUB` on last trip), stale-status offline blocking (`409 ACTIVE_DELIVERY_CANNOT_GO_OFFLINE`), invalid `(0,0)` coordinate rejection (`400`), and `SUSPENDED` status preservation upon COD limit breach + remittance unblock.
+  6. Lock-free cancellation external gateway boundary (Phase 1 `orders.status = 'cancelled'` committed before provider call) + cross-actor idempotency rejection (`403 IDEMPOTENCY_KEY_ACTOR_MISMATCH`).
+  7. Return QC non-transactional external refund isolation (`RETURN_REFUND_FAILED` prevents stock mutation) + restock & seller clawback on retry.
+  8. Reverse pickup independent trip creation (`REVERSE_PICKUP`), forward `DELIVERED` history preservation, `return_id` idempotency, independent reassignment/ownership visibility, and reverse cancellation.
+  9. GPS exclusion of `NULL`, `(0,0)`, out-of-range (`95.5, 200.1`), and stale (`> 10m`) rider coordinates with zero `storeLocation` substitution.
+- **Additional Regression Suites Verified Locally Before Push:** `sprint5-dispatch`, `sprint7-settlements`, `sprint9-returns-cancellations`, `four-app-compatibility`, `sprint14-2-workflow-closure`, `sprint14-3-staging-release-candidate` (all passed with 0 regressions).
+
+### 3. Real PostgreSQL 16.6 & Redis 7.0.15 Integration Harness (`tests/integration/real-services.test.ts`)
+- **Outcome:** **PASSED** (`PostgreSQL 16.6` & `Redis 7.0.15` in CI Job `136412951096`).
+- **Fresh & Upgrade Migrations (`001`–`028`):** Applied all 28 migrations cleanly on fresh PostgreSQL 16.6 DB and upgraded `001`–`024 -> 025`–`028`, verifying creation of `uq_delivery_trips_forward_order`, `uq_delivery_trips_reverse_return`, `uq_delivery_trips_active_reverse_order`, `idx_riders_dispatch_candidates`, and removal of unconditional `UNIQUE (order_id)`.
+- **Real Constraint & Concurrency Checks (`runSprint15_7PostgresChecks`):**
+  - Partial unique index `23505` enforcement verified on real PG 16.6 for duplicate `FORWARD` trip, duplicate `REVERSE_PICKUP` per `return_id`, and concurrent active `REVERSE_PICKUP` per `order_id` (while permitting recreation after `'CANCELLED'`).
+  - Concurrent multi-connection `completeDeliveryWithOtp` race strictly yielded `[1 fulfilled, 1 rejected]`, single allocation row, and single COD cash increment (`480`).
+  - Real PG mid-transaction `allocateFulfilledOrder` failure injection rolled back order, trip, rider balance, and ledger cleanly and succeeded on retry.
+  - Live `pg_locks` inspection from an independent PostgreSQL connection while mocked `provider.createRefund` paused mid-flight proved **0** table/row write locks (`RowExclusiveLock`+) held on `orders`, `delivery_trips`, `store_inventory`, or `order_returns`, while `orders.status` was already `'cancelled'`, plus `IDEMPOTENCY_KEY_ACTOR_MISMATCH` enforcement.
+  - Real PG SQL filtering excluded `NULL`, `(0,0)`, invalid `(92.0, 185.0)`, and `20m`-stale GPS riders.
+
+### 4. TypeScript, Lint & Build Results (Verified Both Locally & in CI Job `136412951721`)
+- **Backend TypeScript (`npm --prefix QCOM/backend run build` / `tsc --noEmit`):** **PASSED** (exit 0).
+- **Root TypeScript (`npx tsc --noEmit`):** **PASSED** (exit 0).
+- **Root Lint (`npm run lint` / `tsc --noEmit`):** **PASSED** (exit 0).
+- **Root Production Build (`npm run build` / `vite build`):** **PASSED** (exit 0, built in 2.26s).
 
 ---
 
@@ -142,9 +170,12 @@ Delivery task execution across partner compatibility endpoints (`POST /api/tasks
 
 ## M. GIT SYNCHRONIZATION
 
-- **Commit SHA:** Pending commit
-- **Push Status:** Pending push to `origin/main`
-- **Local / Remote Equality:** Pending push
-- **Working Tree Status:** Pending clean sync
-- **CI Run:** Pending GitHub Actions execution
-- **CI Jobs:** Pending (`test` and `real-services-integration`)
+- **Baseline Commit SHA (`origin/main` start):** `fd96cafe69b44b710c31cad878b498a12ffd0dce`
+- **Verified Implementation Commit SHA:** `3079b3353402ef7348218c8a36dca5a8ab1d9af8` (followed by this documentation-only report closure commit on `main`)
+- **Push Status:** Synchronized to `https://github.com/theRawHawn/Q-Com-Backend.git` branch `main` via non-force push (`git push origin main`).
+- **Local / Remote Equality:** Verified `git rev-parse HEAD` equals `origin/main` after push & fetch; frontend directories (`QCOM/customer-app`, `QCOM/seller-app`, `QCOM/delivery-app`, `QCOM/admin-portal`) and migrations `001`–`027` untouched.
+- **Working Tree Status:** Clean after commit (`nothing to commit`).
+- **CI Run (Implementation & Full Verification):** Run `44772331343` (`https://github.com/theRawHawn/Q-Com-Backend/actions/runs/44772331343`) — conclusion `success`.
+- **CI Jobs:**
+  - `All 56 Test Suites & Infrastructure Verification` (`136412951721`, executes all 57 registered suites + `tsc` + `lint` + `build`): `completed / success`
+  - `Real-Services Integration Harness (PG 16 & Redis 7.0.15)` (`136412951096`, PostgreSQL 16.6 + Redis 7.0.15): `completed / success`
