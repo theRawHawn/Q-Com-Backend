@@ -617,7 +617,7 @@ async function runSprint15_7PostgresChecks(freshPool: import('pg').Pool): Promis
       `INSERT INTO delivery_trips (
          id, order_id, trip_type, rider_id, status,
          base_fare, distance_fare, surge_fare, total_rider_payout,
-         accepted_at, pickup_confirmed_at
+         accepted_at, picked_up_at
        )
        VALUES (
          $1, $2, 'FORWARD', $3, $4, 50, 15, 0, 65,
