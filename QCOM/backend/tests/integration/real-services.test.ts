@@ -926,7 +926,7 @@ async function runSprint15_8PostgresChecks(freshPool: import('pg').Pool): Promis
   const { idempotencyService, computeCanonicalFingerprint } = await import('../../src/modules/payments/idempotencyService.js');
   const { paymentReconciliationService } = await import('../../src/modules/reconciliation/paymentReconciliationService.js');
   const { financialRecoveryWorker } = await import('../../src/modules/recovery/financialRecoveryWorker.js');
-  const { setRedisClient } = await import('../../src/database/redis.js');
+  const { setRedisClient, getRedisClient } = await import('../../src/database/redis.js');
 
   const merchRow = (
     await freshPool.query(`SELECT id, latitude, longitude FROM merchants WHERE merchant_code = 'MERCH-BLR-01' LIMIT 1`)
@@ -947,6 +947,7 @@ async function runSprint15_8PostgresChecks(freshPool: import('pg').Pool): Promis
   const userId = userRow.id as string;
 
   // 1. Verify Migration 029 tables and partial unique indexes exist on real PostgreSQL 16
+  console.log('[PG16-15.8] Verifying Migration 029 partial unique indexes...');
   const m029Indexes = await freshPool.query<{ indexname: string }>(
     `SELECT indexname FROM pg_indexes
      WHERE schemaname = current_schema()
@@ -962,6 +963,7 @@ async function runSprint15_8PostgresChecks(freshPool: import('pg').Pool): Promis
   assert.equal(m029Indexes.rowCount, 6, 'All 6 Migration 029 partial unique indexes must exist on real PostgreSQL 16.');
 
   // 2. Concurrent payment order creation yields single active intent & single active attempt
+  console.log('[PG16-15.8] Verifying concurrent payment initiation & 23505 capture uniqueness...');
   const ordConc = await orderService.createOrder({
     userId,
     merchantId,
@@ -1012,8 +1014,10 @@ async function runSprint15_8PostgresChecks(freshPool: import('pg').Pool): Promis
   );
 
   // 3. Concurrent PG-backed idempotency claim race (without Redis) -> strictly 1 claimant wins
+  console.log('[PG16-15.8] Verifying PostgreSQL-backed idempotency claim race without Redis...');
   const raceIdemKey = `pg16_race_idem_${crypto.randomUUID()}`;
   const fp = computeCanonicalFingerprint({ orderId: ordConc.order.id, currency: 'INR' });
+  const prevRedisClient = getRedisClient();
   setRedisClient({
     get: async () => { throw new Error('ECONNREFUSED'); },
     set: async () => { throw new Error('ECONNREFUSED'); },
@@ -1061,10 +1065,11 @@ async function runSprint15_8PostgresChecks(freshPool: import('pg').Pool): Promis
       'Remaining concurrent claims must observe PROCESSING status cleanly.'
     );
   } finally {
-    setRedisClient(null);
+    setRedisClient(prevRedisClient);
   }
 
   // 4. Concurrent partial refunds racing on capture ceiling -> strictly 1 succeeds under FOR UPDATE
+  console.log('[PG16-15.8] Verifying concurrent partial refund ceiling...');
   const over60Percent = Number((ordConc.order.totalAmount * 0.6).toFixed(2));
   const refRace = await Promise.allSettled([
     refundService.createRefund({
@@ -1089,6 +1094,7 @@ async function runSprint15_8PostgresChecks(freshPool: import('pg').Pool): Promis
   assert.match(String((refFail[0] as PromiseRejectedResult).reason?.message || ''), /REFUND_CEILING_EXCEEDED/);
 
   // 5. Internal Reconciliation discrepancy persistence & bounded worker REQUIRES_REVIEW escalation on PG 16
+  console.log('[PG16-15.8] Verifying internal reconciliation upsert and bounded worker escalation...');
   const anomOrd = await orderService.createOrder({
     userId,
     merchantId,
