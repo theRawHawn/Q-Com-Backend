@@ -2,7 +2,7 @@
 
 **Engine Requirement:** PostgreSQL 16+<br>
 **Migration Tool:** Custom Idempotent Advisory-Locked Migrator (`scripts/migrate.ts`)<br>
-**Migrations Defined:** 001 through 025; deployed application of Migration 025 must be verified per environment.
+**Migrations Defined:** 001 through 029; deployed application of Migration 029 must be verified per environment.
 
 ---
 
@@ -35,6 +35,10 @@
 | **023** | `023_add_payment_intent_recovery_leases.sql`| `payment_intent_recovery_leases` for distributed worker fencing |
 | **024** | `024_add_password_hash_and_otp_salt.sql`| `salt` on `otp_challenges`; `password_hash`, `password_updated_at`, `failed_password_attempts`, `password_locked_until` on `users` |
 | **025** | `025_add_outbox_worker_leases.sql` | `lease_token` and `lease_expires_at` for durable outbox worker fencing |
+| **026** | `026_sprint15_2_capacity_indexes_and_concurrency.sql` | Capacity indexes, order/dispatch concurrency constraints |
+| **027** | `027_sprint15_5_financial_ledger_settlement_integrity.sql` | Financial ledger balance/reference uniqueness & settlement/payout constraints |
+| **028** | `028_sprint15_7_transaction_cod_reverse_trip_integrity.sql` | COD receivable/collection uniqueness & reverse pickup trip constraints |
+| **029** | `029_sprint15_8_gateway_agnostic_payment_integrity.sql` | `payment_transactions`, `reconciliation_runs`, `reconciliation_discrepancies`, partial unique single-capture/single-active-intent indexes, scoped `idempotency_keys`, expanded `UNKNOWN`/`EXPIRED`/`REQUIRES_REVIEW` checks |
 
 ---
 
@@ -45,11 +49,18 @@
 2. **Double-Entry General Ledger Balance:**<br>
    Every `journal_batches` record must contain journal entries where:
    $$\sum \text{Debit Amounts} == \sum \text{Credit Amounts}$$
-3. **Idempotency Guarantees:**<br>
+3. **Single-Obligation & Single-Capture Payment Invariants (Migration 029):**<br>
+   - `uq_payment_intents_single_captured_per_order`: At most one `CAPTURED`/`REFUND_*` intent per `order_id`.
+   - `uq_payment_intents_single_active_per_order`: At most one active/in-flight/review intent per `order_id`.
+   - `uq_payment_attempts_single_succeeded_per_order` & `uq_payment_attempts_single_active_per_order`: Prevents duplicate active or succeeded payment attempts per order.
+   - `uq_payment_tx_single_capture_per_order` & `uq_payment_receipts_order_success`: Enforces at most one confirmed `CAPTURE` transaction and one `SUCCESS` receipt per order.
+4. **Idempotency Guarantees:**<br>
+   - PostgreSQL `idempotency_keys` stores `actor_id`, `operation_type`, `endpoint`, `request_fingerprint` (canonical SHA-256), `locked_until`, and `expires_at` so idempotency survives crashes and Redis outages.
    - Webhook events: `UNIQUE (event_id)`.
    - Payment attempts: `UNIQUE (order_id, attempt_number)` and `UNIQUE (provider_id, provider_reference)`.
    - Payout releases: `UNIQUE (idempotency_key)`.
-4. **Advisory Lock Migrations:**<br>
+5. **Advisory Lock Migrations:**<br>
    Migrations use a serialized advisory lock (`SELECT pg_advisory_lock(42424242)`) to ensure multiple backend instances starting concurrently do not run race-conditioned migrations.
-5. **Outbox Worker Fencing:**
-    Migration 025 leases pending events for five minutes without changing their business status. Expired claims are reclaimable; only the current, unexpired token may mark an event published or retry it. Event consumers must remain idempotent because delivery is at-least-once if a lease expires after an external side effect.
+6. **Outbox Worker Fencing & Financial Lock Ordering:**
+   Migration 025 leases pending events cleanly without changing business status. Across payment/refund/cancellation workflows, locks are strictly ordered (`orders -> inventory_reservations -> payment_intents -> payment_attempts -> payment_transactions / refunds -> journal_batches`).
+

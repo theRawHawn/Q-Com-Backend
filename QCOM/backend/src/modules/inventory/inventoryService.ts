@@ -11,6 +11,7 @@ import {
   StockAlertPayload,
 } from './inventoryTypes.js';
 import { outboxService } from '../outbox/outboxService.js';
+import { transitionPaymentIntentState, transitionPaymentAttemptState } from '../payments/paymentStateMachine.js';
 
 export class InventoryService {
   /**
@@ -619,11 +620,35 @@ export class InventoryService {
             WHERE id = $1 AND payment_status = 'PENDING'
           `, [orderId]);
 
-          await client.query(`
-            UPDATE payment_intents
-            SET status = 'CANCELLED', updated_at = NOW()
-            WHERE order_id = $1 AND status IN ('CREATED', 'PENDING', 'AUTHORIZED')
-          `, [orderId]);
+          const expIntentRes = await client.query(
+            `SELECT id FROM payment_intents
+             WHERE order_id = $1 AND status IN ('CREATED', 'INITIATED', 'PENDING', 'PROCESSING', 'AUTHORIZED')
+             FOR UPDATE`,
+            [orderId]
+          );
+          for (const row of expIntentRes.rows) {
+            await transitionPaymentIntentState(client, row.id, 'CANCELLED', {
+              errorCode: 'RESERVATION_EXPIRED',
+              errorDescription: 'Payment reservation window expired.',
+              failureClassification: 'POLICY',
+            });
+          }
+          try {
+            const expAttRes = await client.query(
+              `SELECT id FROM payment_attempts
+               WHERE order_id = $1 AND status IN ('INITIATED', 'PENDING', 'PROCESSING')
+               FOR UPDATE`,
+              [orderId]
+            );
+            for (const att of expAttRes.rows) {
+              await transitionPaymentAttemptState(client, att.id, 'CANCELLED', {
+                errorCode: 'RESERVATION_EXPIRED',
+                errorMessage: 'Payment reservation window expired.',
+                failureClassification: 'POLICY',
+                retryEligible: false,
+              });
+            }
+          } catch {}
         }
 
         await this.evaluateAndTriggerStockAlerts(resRow.merchant_id, resRow.product_id, client);

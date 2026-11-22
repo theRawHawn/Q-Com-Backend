@@ -57,11 +57,12 @@ import { runSprint15_2_5GitSyncAndFinancialIntegrityTests } from './sprint15-2-5
 import { runSprint15_4SecurityAndAccessControlHardeningTests } from './sprint15-4-security-and-access-control-hardening.test.js';
 import { runSprint15_5FinancialLedgerSettlementIntegrityTests } from './sprint15-5-financial-ledger-settlement-integrity.test.js';
 import { runSprint15_7TransactionCodReverseTripIntegrityTests } from './sprint15-7-transaction-cod-reverse-trip-integrity.test.js';
+import { runSprint15_8GatewayAgnosticPaymentInfrastructureTests } from './sprint15-8-gateway-agnostic-payment-infrastructure.test.js';
 import { verifyRedisExactVersion } from '../scripts/verify-redis-version.js';
 
 async function runAllTests() {
   console.log('===========================================================');
-  console.log('  QCOM Unified Backend Engine — Automated Test Suite (Sprint 1–15.7)');
+  console.log('  QCOM Unified Backend Engine — Automated Test Suite (Sprint 1–15.8)');
   console.log('===========================================================');
   const start = Date.now();
   try {
@@ -203,6 +204,9 @@ async function runAllTests() {
 
     // Sprint 15.7 Transaction, COD, Reverse-Trip & GPS Integrity Tests
     await runSprint15_7TransactionCodReverseTripIntegrityTests();
+
+    // Sprint 15.8 Gateway-Agnostic Payment Infrastructure & Integrity Tests
+    await runSprint15_8GatewayAgnosticPaymentInfrastructureTests();
 
     const duration = ((Date.now() - start) / 1000).toFixed(2);
     console.log('\n===========================================================');

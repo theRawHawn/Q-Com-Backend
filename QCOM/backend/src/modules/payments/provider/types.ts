@@ -56,7 +56,7 @@ export interface VerifyPaymentParams {
 
 export interface PaymentVerificationResult {
   readonly verified: boolean;
-  readonly status: 'SUCCEEDED' | 'FAILED' | 'PENDING' | 'RECONCILIATION_REQUIRED';
+  readonly status: 'SUCCEEDED' | 'FAILED' | 'PENDING' | 'UNKNOWN' | 'RECONCILIATION_REQUIRED';
   readonly providerPaymentId: string;
   readonly amount: number;
   readonly currency: string;

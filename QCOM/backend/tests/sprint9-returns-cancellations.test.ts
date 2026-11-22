@@ -525,7 +525,7 @@ export async function runSprint9ReturnsCancellationsTests(): Promise<void> {
     // Test 18: Store Receipt & QC Inspection with Selective Restocking
     // -------------------------------------------------------------
     console.log('[Test 18] Testing Store Receipt & QC Inspection with Selective Restock...');
-    const ord18 = await createTestOrder({ status: 'delivered', deliveredMinutesAgo: 40, itemQty: 2, totalAmount: 500.00 });
+    const ord18 = await createTestOrder({ status: 'delivered', paymentStatus: 'PAID', deliveredMinutesAgo: 40, itemQty: 2, totalAmount: 500.00 });
     const ret18Req = await returnService.requestReturn({
       orderId: ord18.orderId,
       userId: customerId,

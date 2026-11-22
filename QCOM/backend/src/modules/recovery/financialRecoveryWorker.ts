@@ -6,6 +6,15 @@ import { refundService } from '../payments/refundService.js';
 import { paymentService } from '../payments/paymentService.js';
 import { sellerSettlementService } from '../settlements/sellerSettlementService.js';
 import { riderPayoutService } from '../settlements/riderPayoutService.js';
+import { transitionPaymentIntentState } from '../payments/paymentStateMachine.js';
+import { paymentLogger } from '../payments/paymentLogger.js';
+import { paymentReconciliationService } from '../reconciliation/paymentReconciliationService.js';
+
+function computeWorkerBackoff(attempts: number): Date {
+  const exp = Math.min(Math.max(attempts, 1), 8);
+  const delaySec = Math.min(1800, 15 * Math.pow(2, exp - 1));
+  return new Date(Date.now() + delaySec * 1000);
+}
 
 export interface RecoveryWorkerOptions {
   pollIntervalMs?: number;
@@ -219,47 +228,59 @@ export class FinancialRecoveryWorker {
   }
 
   /**
-   * Recovers stale or ambiguous payment intents (Sprint 12.0 / Sprint 12.5)
+   * Recovers stale or ambiguous payment intents (Sprint 12.0, 12.5 & 15.8).
+   * Enforces distributed lease claiming, exponential backoff (next_retry_at),
+   * and bounded retry escalation to REQUIRES_REVIEW + reconciliation_discrepancies.
    */
   public async recoverPendingPayments(summary?: RecoveryCycleSummary): Promise<number> {
     const pool = getPool();
     const staleCutoffDate = new Date(Date.now() - this.staleThresholdSec * 1000);
+    const maxAgeCutoffDate = new Date(Date.now() - this.maxAgeHours * 3600 * 1000);
     const leaseExpiryDate = new Date(Date.now() + this.leaseDurationSec * 1000);
 
     let claimedOrderIds: string[] = [];
+    const escalationsToRecord: Array<{ intentId: string; orderId: string; attempts: number; createdAt: Date }> = [];
+
     try {
       claimedOrderIds = await transaction(async (client) => {
         let candidatesRes;
         try {
-          candidatesRes = await client.query(`
-            SELECT id, order_id FROM payment_intents
-            WHERE status IN ('PROCESSING', 'RECONCILIATION_REQUIRED')
-              AND (recovery_lease_expires_at IS NULL OR recovery_lease_expires_at < NOW())
-              AND created_at < $1
-            ORDER BY created_at ASC
-            LIMIT $2
-            FOR UPDATE SKIP LOCKED
-          `, [staleCutoffDate, this.batchSize]);
+          candidatesRes = await client.query(
+            `SELECT id, order_id, status, reconciliation_attempts, created_at, next_retry_at
+             FROM payment_intents
+             WHERE status IN ('PROCESSING', 'UNKNOWN', 'RECONCILIATION_REQUIRED')
+               AND (recovery_lease_expires_at IS NULL OR recovery_lease_expires_at < NOW())
+               AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+               AND created_at < $1
+             ORDER BY created_at ASC
+             LIMIT $2
+             FOR UPDATE SKIP LOCKED`,
+            [staleCutoffDate, this.batchSize]
+          );
         } catch {
-          // Graceful fallback if recovery_lease_expires_at not present or SKIP LOCKED unsupported
           try {
-            candidatesRes = await client.query(`
-              SELECT id, order_id FROM payment_intents
-              WHERE status IN ('PROCESSING', 'RECONCILIATION_REQUIRED')
-                AND (recovery_lease_expires_at IS NULL OR recovery_lease_expires_at < NOW())
-                AND created_at < $1
-              ORDER BY created_at ASC
-              LIMIT $2
-              FOR UPDATE
-            `, [staleCutoffDate, this.batchSize]);
+            candidatesRes = await client.query(
+              `SELECT id, order_id, status, reconciliation_attempts, created_at, next_retry_at
+               FROM payment_intents
+               WHERE status IN ('PROCESSING', 'UNKNOWN', 'RECONCILIATION_REQUIRED')
+                 AND (recovery_lease_expires_at IS NULL OR recovery_lease_expires_at < NOW())
+                 AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+                 AND created_at < $1
+               ORDER BY created_at ASC
+               LIMIT $2
+               FOR UPDATE`,
+              [staleCutoffDate, this.batchSize]
+            );
           } catch {
-            candidatesRes = await client.query(`
-              SELECT id, order_id FROM payment_intents
-              WHERE status IN ('PROCESSING', 'RECONCILIATION_REQUIRED')
-                AND created_at < $1
-              ORDER BY created_at ASC
-              LIMIT $2
-            `, [staleCutoffDate, this.batchSize]);
+            candidatesRes = await client.query(
+              `SELECT id, order_id, status, reconciliation_attempts, created_at
+               FROM payment_intents
+               WHERE status IN ('PROCESSING', 'RECONCILIATION_REQUIRED')
+                 AND created_at < $1
+               ORDER BY created_at ASC
+               LIMIT $2`,
+              [staleCutoffDate, this.batchSize]
+            );
           }
         }
 
@@ -267,27 +288,87 @@ export class FinancialRecoveryWorker {
 
         const orderIds: string[] = [];
         for (const row of candidatesRes.rows) {
-          try {
-            await client.query(`
-              UPDATE payment_intents
-              SET recovery_lease_id = $1,
-                  recovery_lease_expires_at = $2,
-                  reconciliation_attempts = reconciliation_attempts + 1,
-                  last_reconciled_at = NOW(),
-                  updated_at = NOW()
-              WHERE id = $3
-            `, [this.workerId, leaseExpiryDate, row.id]);
-          } catch {
-            // In case recovery_lease columns not yet in table schema
+          const attempts = parseInt(row.reconciliation_attempts || '0', 10);
+          const createdAt = new Date(row.created_at);
+
+          if (attempts >= this.maxAttempts || createdAt < maxAgeCutoffDate) {
+            this.stats.escalations++;
+            if (summary) summary.reconciled.escalated++;
+            paymentLogger.increment('recoveryEscalations');
+            paymentLogger.log('error', 'PAYMENT_RECOVERY_EXHAUSTED_ESCALATED', {
+              orderId: row.order_id,
+              paymentIntentId: row.id,
+            }, { attempts, maxAttempts: this.maxAttempts });
+
+            try {
+              await transitionPaymentIntentState(client, row.id, 'REQUIRES_REVIEW', {
+                requiresManualReview: true,
+                failureClassification: 'AMBIGUOUS',
+                errorCode: 'RECOVERY_RETRY_EXHAUSTED',
+                errorDescription: `Exceeded max recovery attempts (${attempts}/${this.maxAttempts}) or age threshold.`,
+                nextRetryAt: null,
+              });
+            } catch {
+              await client.query(
+                `UPDATE payment_intents
+                 SET last_reconciled_at = NOW(), updated_at = NOW()
+                 WHERE id = $1`,
+                [row.id]
+              ).catch(() => {});
+            }
+
+            escalationsToRecord.push({
+              intentId: row.id,
+              orderId: row.order_id,
+              attempts,
+              createdAt,
+            });
+            continue;
           }
+
+          try {
+            const nextBackoff = computeWorkerBackoff(attempts + 1);
+            await client.query(
+              `UPDATE payment_intents
+               SET recovery_lease_id = $1,
+                   recovery_lease_expires_at = $2,
+                   reconciliation_attempts = reconciliation_attempts + 1,
+                   last_reconciled_at = NOW(),
+                   next_retry_at = $3,
+                   updated_at = NOW()
+               WHERE id = $4`,
+              [this.workerId, leaseExpiryDate, nextBackoff, row.id]
+            );
+          } catch {
+            // Legacy column fallback
+          }
+
           if (!orderIds.includes(row.order_id)) {
             orderIds.push(row.order_id);
           }
         }
         return orderIds;
       });
-    } catch {
-      return 0; // Return if table not yet migrated in test harness
+    } catch (err: any) {
+      const msg = (err.message || '').toLowerCase();
+      if (msg.includes('does not exist')) return 0;
+      throw err;
+    }
+
+    for (const esc of escalationsToRecord) {
+      await paymentReconciliationService.recordEscalationDiscrepancy({
+        discrepancyKey: `PAYMENT_RECOVERY_EXHAUSTED:${esc.intentId}`,
+        category: 'PAYMENT_RECOVERY_EXHAUSTED',
+        severity: 'HIGH',
+        orderId: esc.orderId,
+        paymentIntentId: esc.intentId,
+        details: {
+          attempts: esc.attempts,
+          maxAttempts: this.maxAttempts,
+          createdAt: esc.createdAt.toISOString(),
+        },
+        triggeredBy: this.workerId,
+      });
     }
 
     if (claimedOrderIds.length === 0) return 0;
@@ -299,23 +380,29 @@ export class FinancialRecoveryWorker {
         if (res.reconciled) {
           recovered++;
           if (summary) summary.reconciled.completed++;
+        } else if (summary) {
+          summary.reconciled.stillPending++;
+          this.stats.stillPending++;
         }
-        await pool.query(`
-          UPDATE payment_intents
-          SET recovery_lease_id = NULL,
-              recovery_lease_expires_at = NULL,
-              updated_at = NOW()
-          WHERE order_id = $1 AND recovery_lease_id = $2
-        `, [orderId, this.workerId]).catch(() => {});
+        await pool.query(
+          `UPDATE payment_intents
+           SET recovery_lease_id = NULL,
+               recovery_lease_expires_at = NULL,
+               updated_at = NOW()
+           WHERE order_id = $1 AND recovery_lease_id = $2`,
+          [orderId, this.workerId]
+        ).catch(() => {});
       } catch (err: any) {
-        console.warn(`[FinancialRecoveryWorker] Payment reconciliation failed for order ${orderId}:`, err.message);
-        await pool.query(`
-          UPDATE payment_intents
-          SET recovery_lease_id = NULL,
-              recovery_lease_expires_at = NULL,
-              updated_at = NOW()
-          WHERE order_id = $1 AND recovery_lease_id = $2
-        `, [orderId, this.workerId]).catch(() => {});
+        this.stats.errors++;
+        paymentLogger.log('warn', 'PAYMENT_RECOVERY_ATTEMPT_FAILED', { orderId }, { error: err.message });
+        await pool.query(
+          `UPDATE payment_intents
+           SET recovery_lease_id = NULL,
+               recovery_lease_expires_at = NULL,
+               updated_at = NOW()
+           WHERE order_id = $1 AND recovery_lease_id = $2`,
+          [orderId, this.workerId]
+        ).catch(() => {});
       }
     }
     return recovered;
@@ -365,6 +452,8 @@ export class FinancialRecoveryWorker {
     const staleCutoffDate = new Date(Date.now() - this.staleThresholdSec * 1000);
     const maxAgeCutoffDate = new Date(Date.now() - this.maxAgeHours * 3600 * 1000);
 
+    const refundEscalations: Array<{ refundId: string; orderId?: string; attempts: number; createdAt: Date }> = [];
+
     // Step A: Atomic lease claim in short database transaction with SKIP LOCKED
     const claimedRefundIds = await transaction(async (client) => {
       const candidateRes = await this.queryClaimCandidates(client, 'refunds', staleCutoffDate, this.batchSize);
@@ -380,16 +469,29 @@ export class FinancialRecoveryWorker {
         if (attempts >= this.maxAttempts || createdAt < maxAgeCutoffDate) {
           this.stats.escalations++;
           summary.reconciled.escalated++;
-          console.warn(
-            `[FinancialRecoveryWorker] ESCALATION REQUIRED: Refund '${row.id}' has exceeded recovery thresholds (Attempts: ${attempts}/${this.maxAttempts}, Created: ${createdAt.toISOString()}). Preserving PROCESSING for manual finance audit.`
-          );
-          // Update last_reconciled_at to prevent immediate tight-loop re-scanning
-          await client.query(`
-            UPDATE refunds
-            SET last_reconciled_at = NOW(),
-                updated_at = NOW()
-            WHERE id = $1
-          `, [row.id]);
+          paymentLogger.increment('recoveryEscalations');
+          paymentLogger.log('error', 'REFUND_RECOVERY_EXHAUSTED_ESCALATED', { refundId: row.id }, {
+            attempts,
+            maxAttempts: this.maxAttempts,
+          });
+          // Preserve PROCESSING for manual finance audit; mark requires_manual_review if present
+          try {
+            await client.query(`
+              UPDATE refunds
+              SET requires_manual_review = TRUE,
+                  last_reconciled_at = NOW(),
+                  updated_at = NOW()
+              WHERE id = $1
+            `, [row.id]);
+          } catch {
+            await client.query(`
+              UPDATE refunds
+              SET last_reconciled_at = NOW(),
+                  updated_at = NOW()
+              WHERE id = $1
+            `, [row.id]);
+          }
+          refundEscalations.push({ refundId: row.id, attempts, createdAt });
           continue;
         }
 
@@ -408,6 +510,21 @@ export class FinancialRecoveryWorker {
       }
       return ids;
     });
+
+    for (const esc of refundEscalations) {
+      await paymentReconciliationService.recordEscalationDiscrepancy({
+        discrepancyKey: `REFUND_RECOVERY_EXHAUSTED:${esc.refundId}`,
+        category: 'REFUND_RECOVERY_EXHAUSTED',
+        severity: 'HIGH',
+        refundId: esc.refundId,
+        details: {
+          attempts: esc.attempts,
+          maxAttempts: this.maxAttempts,
+          createdAt: esc.createdAt.toISOString(),
+        },
+        triggeredBy: this.workerId,
+      });
+    }
 
     summary.claimed.refunds += claimedRefundIds.length;
     this.stats.claimedRefunds += claimedRefundIds.length;

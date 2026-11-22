@@ -9,7 +9,8 @@ import { outboxService } from '../outbox/outboxService.js';
 import { settlementEventPublisher } from '../settlements/settlementEvents.js';
 import { bloomFilterService } from '../resilience/bloomFilterService.js';
 import { applyPayoutToAllocationsFIFO, revertAllocationsFIFOForReversal } from '../settlements/sellerSettlementService.js';
-import { add, roundCurrency } from '../pricing/money.js';
+import { add, roundCurrency, toDecimal } from '../pricing/money.js';
+import { transitionPaymentIntentState } from './paymentStateMachine.js';
 
 export interface WebhookResult {
   success: boolean;
@@ -23,22 +24,17 @@ export interface WebhookResult {
 }
 
 export class FinancialWebhookService {
-  private paymentProvider = getPaymentProvider();
-  private payoutProvider = getPayoutProvider();
-
   /**
-   * Verifies HMAC SHA256 webhook signature across standard payment and payout webhook secrets.
+   * Verifies HMAC SHA256 webhook signature across active payment and payout providers.
    */
-  public verifySignature(rawBody: Buffer | string, signature: string): boolean {
+  public verifySignature(rawBody: Buffer | string, signature: string, gateway?: string): boolean {
     if (!signature || !rawBody) return false;
 
-    // Check against current active Payment Provider verification
-    const activePaymentProvider = getPaymentProvider();
+    const activePaymentProvider = getPaymentProvider(gateway);
     if (activePaymentProvider.verifyWebhookSignature({ rawBody, signature })) {
       return true;
     }
 
-    // Check against Payout Provider verification
     const activePayoutProvider = getPayoutProvider();
     if (activePayoutProvider.verifyWebhookSignature && activePayoutProvider.verifyWebhookSignature({ rawBody, signature })) {
       return true;
@@ -55,10 +51,10 @@ export class FinancialWebhookService {
     signature: string;
     gateway?: string;
   }): Promise<WebhookResult> {
-    const { rawBody, signature, gateway = 'RAZORPAY' } = params;
+    const { rawBody, signature, gateway = 'UNSELECTED' } = params;
 
     // 1. Authenticate signature
-    const isValid = this.verifySignature(rawBody, signature);
+    const isValid = this.verifySignature(rawBody, signature, gateway === 'UNSELECTED' ? undefined : gateway);
     if (!isValid) {
       throw new Error('INVALID_WEBHOOK_SIGNATURE: Webhook cryptographic signature verification failed.');
     }
@@ -244,14 +240,36 @@ export class FinancialWebhookService {
           WHERE id = $2
         `, [providerRefundId || null, refund.id]);
 
-        // Update parent order payment status
-        const isFull = refund.refund_type === 'FULL';
-        const newPaymentStatus = isFull ? 'REFUNDED' : 'PARTIALLY_REFUNDED';
+        // Calculate cumulative completed refunds against order total
+        const orderLock = await client.query(`SELECT total_amount FROM orders WHERE id = $1 FOR UPDATE`, [refund.order_id]);
+        const orderTotal = parseFloat(orderLock.rows[0]?.total_amount || refund.amount);
+        const completedSumRes = await client.query(
+          `SELECT COALESCE(SUM(amount), 0) AS completed_total FROM refunds WHERE order_id = $1 AND status = 'COMPLETED'`,
+          [refund.order_id]
+        );
+        const isFullyRefunded = toDecimal(completedSumRes.rows[0].completed_total).gte(toDecimal(orderTotal).minus('0.01'));
+        const newPaymentStatus = isFullyRefunded ? 'REFUNDED' : 'PARTIALLY_REFUNDED';
         await client.query(`
           UPDATE orders
           SET payment_status = $1, updated_at = NOW()
           WHERE id = $2
         `, [newPaymentStatus, refund.order_id]);
+
+        const intentLock = await client.query(
+          `SELECT id FROM payment_intents
+           WHERE order_id = $1 AND status IN ('CAPTURED', 'REFUND_PENDING', 'PARTIALLY_REFUNDED')
+           ORDER BY created_at DESC LIMIT 1 FOR UPDATE`,
+          [refund.order_id]
+        );
+        if (intentLock.rows.length > 0) {
+          try {
+            await transitionPaymentIntentState(
+              client,
+              intentLock.rows[0].id,
+              isFullyRefunded ? 'REFUNDED' : 'PARTIALLY_REFUNDED'
+            );
+          } catch {}
+        }
 
         // Post General Ledger cancellation/escrow release entry if pre-fulfillment and no GL refund exists yet
         if (refund.reason_code?.startsWith('ORDER_CANCELLED_') || refund.reason_code === 'CANCELLATION') {

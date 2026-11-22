@@ -41,12 +41,12 @@ export class PaymentProviderRegistry {
     }
 
     // Set default based on configuration
-    const configuredMode = env.PAYMENT_MODE;
+    const configuredMode = process.env.PAYMENT_MODE || env.PAYMENT_MODE;
     if (configuredMode === 'none') {
       this.defaultProviderId = 'none';
     } else if (this.providers.has(configuredMode)) {
       this.defaultProviderId = configuredMode;
-    } else if (env.NODE_ENV === 'production') {
+    } else if ((env.NODE_ENV === 'production' || process.env.NODE_ENV === 'production')) {
       this.defaultProviderId = 'none';
     } else {
       this.defaultProviderId = 'mock';
@@ -60,6 +60,7 @@ export class PaymentProviderRegistry {
     if (!provider || !provider.providerId) {
       throw new Error('INVALID_PROVIDER: PaymentProvider must have a valid providerId');
     }
+    const isProduction = (env.NODE_ENV === 'production' || process.env.NODE_ENV === 'production');
     const isMock = provider.isSimulated === true ||
       provider.providerId === 'mock' ||
       provider.providerId === 'razorpay_test' ||
@@ -67,7 +68,7 @@ export class PaymentProviderRegistry {
       provider.providerId.toLowerCase().includes('test') ||
       provider.providerId.toLowerCase().includes('simulat');
 
-    if (env.NODE_ENV === 'production' && isMock) {
+    if (isProduction && isMock) {
       throw new Error(`SECURITY_VIOLATION: Mock or simulated payment provider '${provider.providerId}' cannot be registered in production mode.`);
     }
     this.providers.set(provider.providerId, provider);
@@ -78,19 +79,50 @@ export class PaymentProviderRegistry {
   }
 
   /**
+   * Sets the default provider ID explicitly (must already be registered).
+   */
+  public setDefaultProvider(providerId: string): void {
+    const normalized = providerId.toLowerCase().trim();
+    if (normalized === 'none' || normalized === 'unselected') {
+      this.defaultProviderId = 'none';
+      return;
+    }
+    if (!this.hasProvider(providerId)) {
+      throw new Error(`UNREGISTERED_PAYMENT_PROVIDER: Provider '${providerId}' is not registered`);
+    }
+    const prov = this.getProvider(providerId);
+    const isProduction = (env.NODE_ENV === 'production' || process.env.NODE_ENV === 'production');
+    if (isProduction && prov.isSimulated) {
+      throw new Error(`SECURITY_VIOLATION: Mock or simulated payment provider '${providerId}' cannot be set as default in production mode.`);
+    }
+    this.defaultProviderId = prov.providerId;
+  }
+
+  public getDefaultProviderId(): string {
+    return this.defaultProviderId;
+  }
+
+  /**
    * Retrieves provider by ID, or returns the default active provider.
-   * In strict mode and in production, unknown providers throw UNREGISTERED_PAYMENT_PROVIDER
-   * with zero silent fallback to mock.
+   * When providerId is 'none' or 'UNSELECTED', strictly returns DisabledPaymentProvider.
+   * In production, unknown or simulated providers fail closed with ZERO silent fallback to mock.
    */
   public getProvider(providerId?: string): PaymentProvider {
+    const isProduction = (env.NODE_ENV === 'production' || process.env.NODE_ENV === 'production');
+    const runtimeMode = process.env.PAYMENT_MODE || env.PAYMENT_MODE;
+
     if (providerId) {
       const normalizedId = providerId.toLowerCase().trim();
+      if (normalizedId === 'none' || normalizedId === 'unselected') {
+        return this.providers.get('none')!;
+      }
+
       let provider = this.providers.get(providerId) || this.providers.get(normalizedId);
-      if (!provider && env.NODE_ENV !== 'production' && (normalizedId === 'razorpay' || normalizedId === 'mock')) {
+      if (!provider && !isProduction && (normalizedId === 'razorpay' || normalizedId === 'mock')) {
         provider = this.providers.get('razorpay_test') || this.providers.get('mock');
       }
 
-      if (env.NODE_ENV === 'production' && provider) {
+      if (isProduction && provider) {
         const isMock = provider.isSimulated === true ||
           provider.providerId === 'mock' ||
           provider.providerId === 'razorpay_test' ||
@@ -102,7 +134,7 @@ export class PaymentProviderRegistry {
         }
       }
       if (!provider) {
-        if (env.NODE_ENV === 'production') {
+        if (isProduction) {
           throw new Error(`UNREGISTERED_PAYMENT_PROVIDER: Provider '${providerId}' is not registered`);
         }
         return this.getProvider();
@@ -110,10 +142,15 @@ export class PaymentProviderRegistry {
       return provider;
     }
 
+    // Check dynamic runtime mode override
+    if (runtimeMode === 'none') {
+      return this.providers.get('none')!;
+    }
+
     // Default provider requested
     const provider = this.providers.get(this.defaultProviderId);
-    if (!provider || (env.NODE_ENV === 'production' && provider.isSimulated)) {
-      if (env.NODE_ENV === 'production') {
+    if (!provider || (isProduction && provider.isSimulated)) {
+      if (isProduction) {
         const disabled = this.providers.get('none');
         if (disabled) return disabled;
         throw new Error('PAYMENT_GATEWAY_NOT_CONFIGURED: No payment gateway is configured in production.');
@@ -129,7 +166,9 @@ export class PaymentProviderRegistry {
    * Returns whether a real or configured payment provider is active
    */
   public isPaymentConfigured(): boolean {
-    return this.defaultProviderId !== 'none';
+    const runtimeMode = process.env.PAYMENT_MODE || env.PAYMENT_MODE;
+    if (runtimeMode === 'none') return false;
+    return this.defaultProviderId !== 'none' && this.defaultProviderId !== 'UNSELECTED';
   }
 
   /**
@@ -141,14 +180,25 @@ export class PaymentProviderRegistry {
   }
 
   /**
-   * Returns list of all registered provider IDs and their display names
+   * Returns list of unique registered providers (excluding simulated providers in production).
    */
-  public listProviders(): { providerId: string; displayName: string; isDefault: boolean }[] {
-    return Array.from(this.providers.values()).map(p => ({
-      providerId: p.providerId,
-      displayName: p.displayName,
-      isDefault: p.providerId === this.defaultProviderId,
-    }));
+  public listProviders(): { providerId: string; displayName: string; isDefault: boolean; isSimulated: boolean }[] {
+    const isProduction = (env.NODE_ENV === 'production' || process.env.NODE_ENV === 'production');
+    const seen = new Set<string>();
+    const list: { providerId: string; displayName: string; isDefault: boolean; isSimulated: boolean }[] = [];
+
+    for (const p of this.providers.values()) {
+      if (seen.has(p.providerId)) continue;
+      if (isProduction && p.isSimulated) continue;
+      seen.add(p.providerId);
+      list.push({
+        providerId: p.providerId,
+        displayName: p.displayName,
+        isDefault: p.providerId === this.defaultProviderId,
+        isSimulated: Boolean(p.isSimulated),
+      });
+    }
+    return list;
   }
 
   /**

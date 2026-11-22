@@ -294,8 +294,9 @@ async function runPostgresChecks(): Promise<void> {
         migrationFiles.length,
         `Fresh database must apply all ${migrationFiles.length} migrations (001–026+).`
       );
-      assert.ok(applied.length >= 26, `Expected at least 26 migrations, got ${applied.length}.`);
+      assert.ok(applied.length >= 29, `Expected at least 29 migrations, got ${applied.length}.`);
       assert.ok(applied.some((name) => name.startsWith('026_')), 'Fresh database must apply migration 026.');
+      assert.ok(applied.some((name) => name.startsWith('029_')), 'Fresh database must apply migration 029.');
       assert.deepEqual(await runMigrations({ poolOverride: freshPool }), [], 'A migration rerun must apply no changes.');
 
       const previousFiles = migrationFiles.filter((migration) => Number(migration.version) < 25);
@@ -320,6 +321,7 @@ async function runPostgresChecks(): Promise<void> {
       assert.ok(upgradeApplied.some((name) => name.startsWith('026_')), 'Upgrade must apply migration 026.');
       assert.ok(upgradeApplied.some((name) => name.startsWith('027_')), 'Upgrade must apply migration 027.');
       assert.ok(upgradeApplied.some((name) => name.startsWith('028_')), 'Upgrade must apply migration 028.');
+      assert.ok(upgradeApplied.some((name) => name.startsWith('029_')), 'Upgrade must apply migration 029.');
       const upgradedTripIndexes = await upgradePool.query<{ indexname: string }>(
         `SELECT indexname FROM pg_indexes
          WHERE schemaname = current_schema()
@@ -469,8 +471,9 @@ async function runPostgresChecks(): Promise<void> {
       assert.equal(handlerRuns, 2, 'An over-lease handler may be delivered twice; consumers must be idempotent.');
 
       await runSprint15_7PostgresChecks(freshPool);
+      await runSprint15_8PostgresChecks(freshPool);
 
-      console.log('PostgreSQL 16 fresh/upgrade migrations, Sprint 15.7 integrity/concurrency/pg_locks checks, outbox claims, fencing, and rollback checks passed.');
+      console.log('PostgreSQL 16 fresh/upgrade migrations, Sprint 15.7 & 15.8 integrity/concurrency/pg_locks checks, outbox claims, fencing, and rollback checks passed.');
     } finally {
       setPool(null);
       await Promise.all([freshPool.end(), upgradePool.end()]);
@@ -913,6 +916,222 @@ async function runSprint15_7PostgresChecks(freshPool: import('pg').Pool): Promis
   assert.deepEqual(gpsCandidates.map((c) => c.riderId), [validGpsRiderId]);
 
   console.log('PostgreSQL 16 Sprint 15.7 checks (partial unique 23505, multi-conn OTP race, mid-TX rollback, pg_locks lock-free refund, GPS filtering) passed.');
+}
+
+async function runSprint15_8PostgresChecks(freshPool: import('pg').Pool): Promise<void> {
+  const crypto = await import('node:crypto');
+  const { orderService } = await import('../../src/modules/orders/orderService.js');
+  const { paymentService } = await import('../../src/modules/payments/paymentService.js');
+  const { refundService } = await import('../../src/modules/payments/refundService.js');
+  const { idempotencyService, computeCanonicalFingerprint } = await import('../../src/modules/payments/idempotencyService.js');
+  const { paymentReconciliationService } = await import('../../src/modules/reconciliation/paymentReconciliationService.js');
+  const { financialRecoveryWorker } = await import('../../src/modules/recovery/financialRecoveryWorker.js');
+  const { setRedisClient } = await import('../../src/database/redis.js');
+
+  const merchRow = (
+    await freshPool.query(`SELECT id, latitude, longitude FROM merchants WHERE merchant_code = 'MERCH-BLR-01' LIMIT 1`)
+  ).rows[0];
+  const merchantId = merchRow.id as string;
+  const storeLat = Number(merchRow.latitude);
+  const storeLng = Number(merchRow.longitude);
+
+  const prodRow = (
+    await freshPool.query(
+      `SELECT p.id FROM products p JOIN store_inventory si ON si.product_id = p.id
+       WHERE si.merchant_id = $1 AND si.stock_count >= 20 LIMIT 1`,
+      [merchantId]
+    )
+  ).rows[0];
+  const productId = prodRow.id as string;
+  const userRow = (await freshPool.query(`SELECT id FROM users ORDER BY created_at ASC LIMIT 1`)).rows[0];
+  const userId = userRow.id as string;
+
+  // 1. Verify Migration 029 tables and partial unique indexes exist on real PostgreSQL 16
+  const m029Indexes = await freshPool.query<{ indexname: string }>(
+    `SELECT indexname FROM pg_indexes
+     WHERE schemaname = current_schema()
+       AND indexname IN (
+         'uq_payment_intents_single_captured_per_order',
+         'uq_payment_intents_single_active_per_order',
+         'uq_payment_attempts_single_succeeded_per_order',
+         'uq_payment_attempts_single_active_per_order',
+         'uq_payment_tx_single_capture_per_order',
+         'uq_payment_receipts_order_success'
+       )`
+  );
+  assert.equal(m029Indexes.rowCount, 6, 'All 6 Migration 029 partial unique indexes must exist on real PostgreSQL 16.');
+
+  // 2. Concurrent payment order creation yields single active intent & single active attempt
+  const ordConc = await orderService.createOrder({
+    userId,
+    merchantId,
+    items: [{ productId, quantity: 2 }],
+    jobSite: { address: 'PG16 S15.8 Concurrent Site', latitude: storeLat + 0.01, longitude: storeLng + 0.01 },
+    paymentMethod: 'Instant UPI',
+  });
+
+  const concIntents = await Promise.all([
+    paymentService.createPaymentOrder(ordConc.order.id, userId),
+    paymentService.createPaymentOrder(ordConc.order.id, userId),
+    paymentService.createPaymentOrder(ordConc.order.id, userId),
+  ]);
+  const distinctIntentIds = new Set(concIntents.map((i) => i.id));
+  assert.equal(distinctIntentIds.size, 1, 'Concurrent createPaymentOrder calls must converge to a single active intent row.');
+
+  // Direct PostgreSQL 23505 check on duplicate active payment_intent
+  await assert.rejects(
+    () =>
+      freshPool.query(
+        `INSERT INTO payment_intents (payment_order_id, order_id, user_id, payment_method, amount, currency, status, signature)
+         VALUES ($1, $2, $3, 'Instant UPI', $4, 'INR', 'CREATED', 'dup_sig')`,
+        [`po_dup_${crypto.randomBytes(6).toString('hex')}`, ordConc.order.id, userId, ordConc.order.totalAmount]
+      ),
+    (err: any) => err?.code === '23505'
+  );
+
+  // Verify single capture succeeds, second direct CAPTURE/SUCCEEDED insert hits 23505
+  const onlyIntent = concIntents[0];
+  await paymentService.verifyPayment({
+    orderId: ordConc.order.id,
+    transactionId: `pay_pg16_158_${Date.now()}`,
+    timestamp: Date.parse(onlyIntent.timestamp),
+    signature: onlyIntent.signature,
+    userId,
+    razorpayOrderId: onlyIntent.paymentOrderId,
+  });
+
+  await assert.rejects(
+    () =>
+      freshPool.query(
+        `INSERT INTO payment_transactions (
+           internal_reference, order_id, payment_intent_id, transaction_type, status, amount, currency, provider_id
+         ) VALUES ($1, $2, $3, 'CAPTURE', 'SUCCEEDED', $4, 'INR', 'mock')`,
+        [`ptx_dup_cap_${crypto.randomBytes(6).toString('hex')}`, ordConc.order.id, onlyIntent.id, ordConc.order.totalAmount]
+      ),
+    (err: any) => err?.code === '23505'
+  );
+
+  // 3. Concurrent PG-backed idempotency claim race (without Redis) -> strictly 1 claimant wins
+  const raceIdemKey = `pg16_race_idem_${crypto.randomUUID()}`;
+  const fp = computeCanonicalFingerprint({ orderId: ordConc.order.id, currency: 'INR' });
+  setRedisClient({
+    get: async () => { throw new Error('ECONNREFUSED'); },
+    set: async () => { throw new Error('ECONNREFUSED'); },
+    del: async () => { throw new Error('ECONNREFUSED'); },
+  } as any);
+  try {
+    const claims = await Promise.all([
+      idempotencyService.claimKey({
+        pool: freshPool,
+        idempotencyKey: raceIdemKey,
+        actorId: userId,
+        operationType: 'PAYMENT_CREATE_ORDER',
+        endpoint: '/api/v1/payments/create-order',
+        requestFingerprint: fp,
+      }),
+      idempotencyService.claimKey({
+        pool: freshPool,
+        idempotencyKey: raceIdemKey,
+        actorId: userId,
+        operationType: 'PAYMENT_CREATE_ORDER',
+        endpoint: '/api/v1/payments/create-order',
+        requestFingerprint: fp,
+      }),
+      idempotencyService.claimKey({
+        pool: freshPool,
+        idempotencyKey: raceIdemKey,
+        actorId: userId,
+        operationType: 'PAYMENT_CREATE_ORDER',
+        endpoint: '/api/v1/payments/create-order',
+        requestFingerprint: fp,
+      }),
+      idempotencyService.claimKey({
+        pool: freshPool,
+        idempotencyKey: raceIdemKey,
+        actorId: userId,
+        operationType: 'PAYMENT_CREATE_ORDER',
+        endpoint: '/api/v1/payments/create-order',
+        requestFingerprint: fp,
+      }),
+    ]);
+    assert.equal(claims.filter((c) => c.claimed).length, 1, 'Exactly one concurrent PostgreSQL idempotency claim must win.');
+    assert.equal(
+      claims.filter((c) => !c.claimed && c.status === 'PROCESSING').length,
+      3,
+      'Remaining concurrent claims must observe PROCESSING status cleanly.'
+    );
+  } finally {
+    setRedisClient(null);
+  }
+
+  // 4. Concurrent partial refunds racing on capture ceiling -> strictly 1 succeeds under FOR UPDATE
+  const over60Percent = Number((ordConc.order.totalAmount * 0.6).toFixed(2));
+  const refRace = await Promise.allSettled([
+    refundService.createRefund({
+      orderId: ordConc.order.id,
+      amount: over60Percent,
+      reasonCode: 'PG16_RACE_1',
+      refundType: 'PARTIAL',
+      idempotencyKey: `pg16_ref_race_1_${ordConc.order.id}`,
+    }),
+    refundService.createRefund({
+      orderId: ordConc.order.id,
+      amount: over60Percent,
+      reasonCode: 'PG16_RACE_2',
+      refundType: 'PARTIAL',
+      idempotencyKey: `pg16_ref_race_2_${ordConc.order.id}`,
+    }),
+  ]);
+  const refOk = refRace.filter((r) => r.status === 'fulfilled');
+  const refFail = refRace.filter((r) => r.status === 'rejected');
+  assert.equal(refOk.length, 1, 'Strictly one 60% partial refund must succeed concurrently.');
+  assert.equal(refFail.length, 1, 'Second concurrent 60% partial refund must be rejected cleanly.');
+  assert.match(String((refFail[0] as PromiseRejectedResult).reason?.message || ''), /REFUND_CEILING_EXCEEDED/);
+
+  // 5. Internal Reconciliation discrepancy persistence & bounded worker REQUIRES_REVIEW escalation on PG 16
+  const anomOrd = await orderService.createOrder({
+    userId,
+    merchantId,
+    items: [{ productId, quantity: 1 }],
+    jobSite: { address: 'PG16 Reco Site', latitude: storeLat + 0.01, longitude: storeLng + 0.01 },
+    paymentMethod: 'Instant UPI',
+  });
+  await freshPool.query(`UPDATE orders SET payment_status = 'PAID' WHERE id = $1`, [anomOrd.order.id]);
+  await paymentReconciliationService.runReconciliation({ orderId: anomOrd.order.id, runType: 'TEST', triggeredBy: 'pg16_it' });
+  await paymentReconciliationService.runReconciliation({ orderId: anomOrd.order.id, runType: 'TEST', triggeredBy: 'pg16_it_2' });
+  const pgDisc = await freshPool.query(
+    `SELECT occurrence_count FROM reconciliation_discrepancies
+     WHERE order_id = $1 AND category = 'PAID_ORDER_WITHOUT_CAPTURE'`,
+    [anomOrd.order.id]
+  );
+  assert.equal(pgDisc.rowCount, 1);
+  assert.equal(Number(pgDisc.rows[0].occurrence_count), 2);
+
+  const escOrd = await orderService.createOrder({
+    userId,
+    merchantId,
+    items: [{ productId, quantity: 1 }],
+    jobSite: { address: 'PG16 Escalation Site', latitude: storeLat + 0.01, longitude: storeLng + 0.01 },
+    paymentMethod: 'Instant UPI',
+  });
+  const escIntent = await paymentService.createPaymentOrder(escOrd.order.id, userId);
+  await freshPool.query(
+    `UPDATE payment_intents
+     SET status = 'RECONCILIATION_REQUIRED',
+         reconciliation_attempts = 10,
+         created_at = NOW() - INTERVAL '2 minutes'
+     WHERE id = $1`,
+    [escIntent.id]
+  );
+  await financialRecoveryWorker.recoverPendingPayments();
+  const escRow = (
+    await freshPool.query(`SELECT status, requires_manual_review, error_code FROM payment_intents WHERE id = $1`, [escIntent.id])
+  ).rows[0];
+  assert.equal(escRow.status, 'REQUIRES_REVIEW');
+  assert.equal(escRow.requires_manual_review, true);
+  assert.equal(escRow.error_code, 'RECOVERY_RETRY_EXHAUSTED');
+
+  console.log('PostgreSQL 16 Sprint 15.8 checks (Migration 029 23505 indexes, concurrent intents, PG idempotency race, concurrent refund ceiling, reconciliation & worker escalation) passed.');
 }
 
 async function runSuite(): Promise<void> {

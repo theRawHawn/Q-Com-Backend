@@ -65,4 +65,16 @@ export function isPrivateOrReservedIp(ip: string): boolean {
 | **Quote & Calc** | `rl:quote` | 60s | 60 | `/api/checkout/quote`, `/api/routing/calculate` |
 | **Sensitive Ops**| `rl:sens` | 60s | 40 | Payout releases, refunds, KYC approval, RBAC changes |
 | **Order Placement**| `rl:ord` | 60s | 10 | `/api/orders/create` |
+| **Payment Initiation**| `rl:pay` | 60s | 20 | `/api/v1/payments/create-order`, `/verify`, `/attempt` |
 | **Authentication**| `rl:otp` | 600s | 3 | `/api/auth/request-otp` |
+
+---
+
+## 3. Payment Infrastructure Security Controls (Sprint 15.8)
+
+- **Unselected Gateway Fail-Closed Posture**: When `PAYMENT_MODE=none` or an unknown provider is referenced in non-test environments, `DisabledPaymentProvider` rejects online initiation, verification, webhook processing, and gateway refunds with `503 PAYMENT_GATEWAY_NOT_CONFIGURED`. `MockPaymentProvider` is strictly prohibited when `NODE_ENV=production`.
+- **Canonical Scoped PostgreSQL Idempotency**: `idempotency_keys` enforces `(actor_id, operation_type, endpoint, request_fingerprint)` SHA-256 verification so stolen or cross-operation keys return `403` or `422`.
+- **Server-Authoritative Amount & Currency Enforcement**: Client-submitted amounts on `/create-order` or `/attempt` mismatching `orders.total_amount` are rejected (`PAYMENT_AMOUNT_TAMPERED`), and non-`INR` currencies are rejected (`UNSUPPORTED_CURRENCY`).
+- **Sensitive Data & Log Redaction**: `paymentLogger.ts` and `paymentEvents.ts` strip credentials, signatures, tokens, card/PAN/CVV/bank fields, and PII before emitting structured JSON logs or outbox events.
+- **Operator RBAC**: Financial reconciliation, discrepancy resolution, and observability endpoints are restricted to `SUPER_ADMIN` and `FINANCE_ADMIN` via `authenticate` + `requireRole` + `adminSensitiveRateLimiter`.
+

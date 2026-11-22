@@ -1,7 +1,8 @@
 import { Router, Request, Response } from 'express';
-import crypto from 'crypto';
 import { paymentService } from '../modules/payments/paymentService.js';
 import { paymentProviderRegistry } from '../modules/payments/paymentProvider.js';
+import { idempotencyService, computeCanonicalFingerprint } from '../modules/payments/idempotencyService.js';
+import { paymentLogger } from '../modules/payments/paymentLogger.js';
 import { authenticate } from '../middleware/auth.js';
 import { requireOrderOwnership } from '../middleware/resourceOwnership.js';
 import { getPool } from '../database/connection.js';
@@ -30,11 +31,15 @@ export async function handleWebhookRequest(req: Request, res: Response): Promise
     return;
   }
 
-  // Raw body preserved by express.json verify hook
   const rawBody = (req as any).rawBody || Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body));
 
   try {
-    const gateway = (req.params.providerId || req.query.provider || (req.path.includes('razorpay') || req.headers['x-razorpay-signature'] ? 'razorpay' : 'mock')) as string;
+    const gateway = (
+      req.params.providerId ||
+      req.query.provider ||
+      (req.path.includes('razorpay') || req.headers['x-razorpay-signature'] ? 'razorpay' : undefined)
+    ) as string | undefined;
+
     const result = await paymentService.processWebhook({
       rawBody,
       signature,
@@ -59,6 +64,15 @@ export async function handleWebhookRequest(req: Request, res: Response): Promise
     }
 
     const msg = (err.message || '').toLowerCase();
+    if (msg.includes('payment_gateway_not_configured')) {
+      res.status(503).json({
+        success: false,
+        error: 'PAYMENT_GATEWAY_NOT_CONFIGURED',
+        message: err.message || 'No payment gateway is configured.',
+      });
+      return;
+    }
+
     if (msg.includes('invalid_webhook_signature') || msg.includes('signature verification failed')) {
       res.status(400).json({
         success: false,
@@ -86,10 +100,10 @@ export async function handleWebhookRequest(req: Request, res: Response): Promise
       return;
     }
 
-    if (msg.includes('payment_amount_mismatch')) {
+    if (msg.includes('payment_amount_mismatch') || msg.includes('currency_mismatch')) {
       res.status(400).json({
         success: false,
-        error: 'PAYMENT_AMOUNT_MISMATCH',
+        error: msg.includes('currency_mismatch') ? 'CURRENCY_MISMATCH' : 'PAYMENT_AMOUNT_MISMATCH',
         message: err.message,
       });
       return;
@@ -103,196 +117,54 @@ export async function handleWebhookRequest(req: Request, res: Response): Promise
   }
 }
 
-/**
- * Atomic Idempotency Claim and Completion Helpers
- * Prevents concurrency race conditions, payload tampering, and cross-account key hijacking.
- */
-async function claimIdempotencyKey(params: {
-  pool: any;
-  idempotencyKey: string;
-  actorId: string;
-  endpoint: string;
-  requestFingerprint: string;
-}): Promise<
-  | { claimed: true }
-  | { claimed: false; status: 'COMPLETED'; statusCode: number; responseBody: any }
-  | { claimed: false; status: 'PROCESSING'; conflictError: string }
-  | { claimed: false; status: 'MISMATCH'; mismatchError: string }
-  | { claimed: false; status: 'UNAUTHORIZED'; authError: string }
-> {
-  const { pool, idempotencyKey, actorId, endpoint, requestFingerprint } = params;
-
-  // 1. Authoritative check on existing record
-  const existingKeyRes = await pool.query(
-    `SELECT status, status_code, response_body, request_fingerprint, actor_id, created_at
-     FROM idempotency_keys
-     WHERE idempotency_key = $1`,
-    [idempotencyKey]
-  );
-
-  if (existingKeyRes.rows.length > 0) {
-    const existing = existingKeyRes.rows[0];
-
-    // Actor ownership verification: Prevent cross-user key hijacking
-    if (existing.actor_id && existing.actor_id !== actorId) {
-      return {
-        claimed: false,
-        status: 'UNAUTHORIZED',
-        authError: 'This Idempotency-Key belongs to a different user account.',
-      };
-    }
-
-    // Payload mismatch check: Reused key with incompatible payload rejected
-    if (existing.request_fingerprint && existing.request_fingerprint !== requestFingerprint) {
-      return {
-        claimed: false,
-        status: 'MISMATCH',
-        mismatchError: 'This Idempotency-Key was already used with a different request payload.',
-      };
-    }
-
-    // Completed check: Return cached response directly
-    if (existing.status === 'COMPLETED') {
-      // Phase D: Close Payment Reconciliation Response-Caching Risk
-      // If the cached response was RECONCILIATION_REQUIRED (202), verify whether
-      // the payment was subsequently reconciled and settled (via authoritative webhook or background worker).
-      const cachedBody = typeof existing.response_body === 'string'
-        ? JSON.parse(existing.response_body)
-        : existing.response_body;
-
-      if (existing.status_code === 202 || cachedBody?.status === 'RECONCILIATION_REQUIRED' || cachedBody?.isReconciliationRequired === true) {
-        const orderId = cachedBody?.order?.id || cachedBody?.orderId || cachedBody?.paymentReceipt?.orderId;
-        if (orderId) {
-          const durableRes = await pool.query(
-            `SELECT o.id, o.status, o.payment_status, pi.status as intent_status
-             FROM orders o
-             LEFT JOIN payment_intents pi ON pi.order_id = o.id
-             WHERE o.id = $1
-             ORDER BY pi.created_at DESC LIMIT 1`,
-            [orderId]
-          );
-          if (durableRes.rows.length > 0) {
-            const row = durableRes.rows[0];
-            if (row.payment_status === 'PAID' || row.intent_status === 'CAPTURED') {
-              const updatedBody = {
-                ...cachedBody,
-                success: true,
-                message: 'Payment verified and captured successfully (reconciliation resolved).',
-                order: { ...cachedBody.order, id: row.id, status: row.status, payment_status: row.payment_status },
-                isDuplicate: false,
-                isReconciliationRequired: false,
-                status: 'CAPTURED',
-              };
-              await pool.query(
-                `UPDATE idempotency_keys
-                 SET status_code = 200, response_body = $1
-                 WHERE idempotency_key = $2`,
-                [JSON.stringify(updatedBody), idempotencyKey]
-              );
-              return {
-                claimed: false,
-                status: 'COMPLETED',
-                statusCode: 200,
-                responseBody: updatedBody,
-              };
-            }
-          }
-        }
-      }
-
-      return {
-        claimed: false,
-        status: 'COMPLETED',
-        statusCode: existing.status_code || 200,
-        responseBody: existing.response_body,
-      };
-    }
-
-    // Processing check: If actively in progress (< 2 minutes old), block concurrent attempt
-    if (existing.status === 'PROCESSING') {
-      const ageMs = Date.now() - new Date(existing.created_at || Date.now()).getTime();
-      if (ageMs <= 120000) {
-        return {
-          claimed: false,
-          status: 'PROCESSING',
-          conflictError: 'An operation with this Idempotency-Key is currently in progress.',
-        };
-      }
-    }
-
-    // Stale PROCESSING (> 2 minutes) or FAILED state: Reclamation scoped to actor
-    const reclaimRes = await pool.query(
-      `UPDATE idempotency_keys
-       SET status = 'PROCESSING', request_fingerprint = $1, created_at = NOW()
-       WHERE idempotency_key = $2 AND (actor_id = $3 OR actor_id IS NULL)
-       RETURNING idempotency_key`,
-      [requestFingerprint, idempotencyKey, actorId]
-    );
-    if (reclaimRes.rows.length > 0) {
-      return { claimed: true };
-    }
-    return {
-      claimed: false,
-      status: 'PROCESSING',
-      conflictError: 'An operation with this Idempotency-Key is currently in progress.',
-    };
+function handleIdempotencyClaimRejection(
+  claim: Exclude<Awaited<ReturnType<typeof idempotencyService.claimKey>>, { claimed: true }>,
+  res: Response,
+  requestId: string | string[],
+  inProgressCode: string
+): void {
+  if (claim.status === 'UNAUTHORIZED') {
+    res.status(403).json({
+      success: false,
+      error: 'UNAUTHORIZED_IDEMPOTENCY_KEY_ACCESS',
+      message: claim.authError,
+      requestId,
+    });
+    return;
   }
-
-  // 2. Insert initial PROCESSING state
-  try {
-    await pool.query(
-      `INSERT INTO idempotency_keys (idempotency_key, actor_id, endpoint, status, request_fingerprint, created_at, expires_at)
-       VALUES ($1, $2, $3, 'PROCESSING', $4, NOW(), NOW() + interval '24 hours')`,
-      [idempotencyKey, actorId, endpoint, requestFingerprint]
-    );
-    return { claimed: true };
-  } catch (err: any) {
-    if (err.code === '23505' || err.message?.includes('unique') || err.message?.includes('duplicate')) {
-      const reCheck = await pool.query(
-        `SELECT status, status_code, response_body, request_fingerprint, actor_id, created_at
-         FROM idempotency_keys WHERE idempotency_key = $1`,
-        [idempotencyKey]
-      );
-      if (reCheck.rows.length > 0) {
-        const existing = reCheck.rows[0];
-        if (existing.status === 'COMPLETED') {
-          return {
-            claimed: false,
-            status: 'COMPLETED',
-            statusCode: existing.status_code || 200,
-            responseBody: existing.response_body,
-          };
-        }
-        return {
-          claimed: false,
-          status: 'PROCESSING',
-          conflictError: 'An operation with this Idempotency-Key is currently in progress.',
-        };
-      }
-    }
-    throw err;
+  if (claim.status === 'SCOPE_MISMATCH') {
+    res.status(422).json({
+      success: false,
+      error: 'IDEMPOTENCY_SCOPE_MISMATCH',
+      message: claim.scopeError,
+      requestId,
+    });
+    return;
   }
-}
-
-async function markIdempotencyCompleted(pool: any, key: string, statusCode: number, responseBody: any): Promise<void> {
-  await pool.query(
-    `UPDATE idempotency_keys
-     SET status = 'COMPLETED', status_code = $1, response_body = $2
-     WHERE idempotency_key = $3`,
-    [statusCode, JSON.stringify(responseBody), key]
-  );
-}
-
-async function markIdempotencyFailed(pool: any, key: string): Promise<void> {
-  await pool.query(
-    `UPDATE idempotency_keys SET status = 'FAILED' WHERE idempotency_key = $1 AND status = 'PROCESSING'`,
-    [key]
-  );
+  if (claim.status === 'MISMATCH') {
+    res.status(422).json({
+      success: false,
+      error: 'IDEMPOTENCY_PAYLOAD_MISMATCH',
+      message: claim.mismatchError,
+      requestId,
+    });
+    return;
+  }
+  if (claim.status === 'COMPLETED') {
+    res.status(claim.statusCode).json(claim.responseBody);
+    return;
+  }
+  res.status(409).json({
+    success: false,
+    error: inProgressCode,
+    message: claim.conflictError,
+    requestId,
+  });
 }
 
 /**
  * POST /api/payment/create-order & POST /api/v1/payments/create-order
- * Protected by customer authentication and Idempotency-Key
+ * Protected by customer authentication, rate limiting, and durable PostgreSQL Idempotency-Key
  */
 paymentRouter.post('/create-order', authenticate, paymentInitiationRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const pool = getPool();
@@ -300,62 +172,33 @@ paymentRouter.post('/create-order', authenticate, paymentInitiationRateLimiter, 
   const cleanKey = idempotencyKey && typeof idempotencyKey === 'string' ? idempotencyKey.trim().slice(0, 120) : undefined;
   const requestId = (req as any).requestId || req.headers['x-request-id'] || 'req-payment-order';
 
-  const { orderId } = req.body;
+  const { orderId, amount, currency } = req.body;
   if (!orderId) {
     res.status(400).json({ success: false, error: 'MISSING_ORDER_ID', message: 'orderId is required.' });
     return;
   }
 
-  // 1. Deterministic Request Fingerprint
-  const normalizedPayload = {
+  const requestFingerprint = computeCanonicalFingerprint({
     userId: req.auth!.userId,
     orderId,
-  };
-  const requestFingerprint = crypto.createHash('sha256').update(JSON.stringify(normalizedPayload)).digest('hex');
+    ...(amount !== undefined ? { amount: Number(amount) } : {}),
+    ...(currency !== undefined ? { currency: String(currency).toUpperCase() } : {}),
+  });
 
-  // 2. Atomic Idempotency Claim
   if (cleanKey) {
     try {
-      const claim = await claimIdempotencyKey({
+      const claim = await idempotencyService.claimKey({
         pool,
         idempotencyKey: cleanKey,
         actorId: req.auth!.userId,
+        operationType: 'PAYMENT_CREATE_ORDER',
         endpoint: req.originalUrl,
         requestFingerprint,
       });
 
       if (!claim.claimed) {
-        if (claim.status === 'UNAUTHORIZED') {
-          res.status(403).json({
-            success: false,
-            error: 'UNAUTHORIZED_IDEMPOTENCY_KEY_ACCESS',
-            message: claim.authError,
-            requestId,
-          });
-          return;
-        }
-        if (claim.status === 'MISMATCH') {
-          res.status(422).json({
-            success: false,
-            error: 'IDEMPOTENCY_PAYLOAD_MISMATCH',
-            message: claim.mismatchError,
-            requestId,
-          });
-          return;
-        }
-        if (claim.status === 'COMPLETED') {
-          res.status(claim.statusCode).json(claim.responseBody);
-          return;
-        }
-        if (claim.status === 'PROCESSING') {
-          res.status(409).json({
-            success: false,
-            error: 'PAYMENT_ORDER_IN_PROGRESS',
-            message: claim.conflictError,
-            requestId,
-          });
-          return;
-        }
+        handleIdempotencyClaimRejection(claim, res, requestId, 'PAYMENT_ORDER_IN_PROGRESS');
+        return;
       }
     } catch (err: any) {
       if (paymentService.isDatabaseUnavailable(err)) {
@@ -374,7 +217,10 @@ paymentRouter.post('/create-order', authenticate, paymentInitiationRateLimiter, 
   }
 
   try {
-    const paymentOrder = await paymentService.createPaymentOrder(orderId, req.auth!.userId);
+    const paymentOrder = await paymentService.createPaymentOrder(orderId, req.auth!.userId, undefined, {
+      clientAmount: amount,
+      clientCurrency: currency,
+    });
 
     const responseBody = {
       success: true,
@@ -383,7 +229,7 @@ paymentRouter.post('/create-order', authenticate, paymentInitiationRateLimiter, 
 
     if (cleanKey) {
       try {
-        await markIdempotencyCompleted(pool, cleanKey, 200, responseBody);
+        await idempotencyService.markCompleted(pool, cleanKey, 200, responseBody);
       } catch (err: any) {
         if (paymentService.isDatabaseUnavailable(err)) {
           res.setHeader('Retry-After', '3');
@@ -403,10 +249,8 @@ paymentRouter.post('/create-order', authenticate, paymentInitiationRateLimiter, 
   } catch (err: any) {
     if (cleanKey) {
       try {
-        await markIdempotencyFailed(pool, cleanKey);
-      } catch {
-        // Suppress secondary error
-      }
+        await idempotencyService.markFailed(pool, cleanKey);
+      } catch {}
     }
 
     if (paymentService.isDatabaseUnavailable(err)) {
@@ -423,12 +267,14 @@ paymentRouter.post('/create-order', authenticate, paymentInitiationRateLimiter, 
 
     const msg = (err.message || '').toLowerCase();
     const isUnauthorized = msg.includes('unauthorized');
-    const isNotFound = msg.includes('order not found') || (msg.includes('not found') && !msg.includes('column') && !msg.includes('relation'));
+    const isNotFound = msg.includes('order_not_found') || msg.includes('order not found') || (msg.includes('not found') && !msg.includes('column') && !msg.includes('relation'));
     const isCod = msg.includes('cod_order');
-    const isAlreadyPaid = msg.includes('already_paid');
+    const isAmountTampered = msg.includes('payment_amount_tampered');
+    const isUnsupportedCurrency = msg.includes('unsupported_currency');
     const isGatewayNotConfigured = msg.includes('payment_gateway_not_configured');
+    const isConflict = msg.includes('payment_reconciliation_pending') || msg.includes('attempt_already_in_progress');
 
-    const statusCode = isUnauthorized ? 403 : isNotFound ? 404 : isGatewayNotConfigured ? 503 : isCod || isAlreadyPaid ? 400 : 400;
+    const statusCode = isUnauthorized ? 403 : isNotFound ? 404 : isGatewayNotConfigured ? 503 : isConflict ? 409 : isCod ? 400 : 400;
 
     res.status(statusCode).json({
       success: false,
@@ -438,8 +284,14 @@ paymentRouter.post('/create-order', authenticate, paymentInitiationRateLimiter, 
         ? 'ORDER_NOT_FOUND'
         : isGatewayNotConfigured
         ? 'PAYMENT_GATEWAY_NOT_CONFIGURED'
+        : isConflict
+        ? 'PAYMENT_RECONCILIATION_PENDING'
         : isCod
         ? 'COD_ORDER_CANNOT_INITIATE_ONLINE_PAYMENT'
+        : isAmountTampered
+        ? 'PAYMENT_AMOUNT_TAMPERED'
+        : isUnsupportedCurrency
+        ? 'UNSUPPORTED_CURRENCY'
         : 'PAYMENT_INTENT_FAILED',
       message: err.message || 'Failed to generate payment intent.',
       requestId,
@@ -449,15 +301,15 @@ paymentRouter.post('/create-order', authenticate, paymentInitiationRateLimiter, 
 
 /**
  * POST /api/payment/verify & POST /api/v1/payments/verify
- * Protected by customer authentication and Idempotency-Key
+ * Protected by customer authentication, rate limiting, and durable PostgreSQL Idempotency-Key
  */
-paymentRouter.post('/verify', authenticate, async (req: Request, res: Response): Promise<void> => {
+paymentRouter.post('/verify', authenticate, paymentInitiationRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const pool = getPool();
   const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
   const cleanKey = idempotencyKey && typeof idempotencyKey === 'string' ? idempotencyKey.trim().slice(0, 120) : undefined;
   const requestId = (req as any).requestId || req.headers['x-request-id'] || 'req-payment-verify';
 
-  const { orderId, transactionId, timestamp, signature, amount, razorpayOrderId } = req.body;
+  const { orderId, transactionId, timestamp, signature, amount, currency, razorpayOrderId } = req.body;
 
   if (!orderId || !transactionId || !timestamp || !signature) {
     res.status(400).json({
@@ -469,58 +321,28 @@ paymentRouter.post('/verify', authenticate, async (req: Request, res: Response):
     return;
   }
 
-  // 1. Deterministic Request Fingerprint
-  const normalizedPayload = {
+  const requestFingerprint = computeCanonicalFingerprint({
     userId: req.auth!.userId,
     orderId,
     transactionId,
     amount: amount !== undefined ? Number(amount) : null,
-  };
-  const requestFingerprint = crypto.createHash('sha256').update(JSON.stringify(normalizedPayload)).digest('hex');
+    currency: currency || 'INR',
+  });
 
-  // 2. Atomic Idempotency Claim
   if (cleanKey) {
     try {
-      const claim = await claimIdempotencyKey({
+      const claim = await idempotencyService.claimKey({
         pool,
         idempotencyKey: cleanKey,
         actorId: req.auth!.userId,
+        operationType: 'PAYMENT_VERIFY',
         endpoint: req.originalUrl,
         requestFingerprint,
       });
 
       if (!claim.claimed) {
-        if (claim.status === 'UNAUTHORIZED') {
-          res.status(403).json({
-            success: false,
-            error: 'UNAUTHORIZED_IDEMPOTENCY_KEY_ACCESS',
-            message: claim.authError,
-            requestId,
-          });
-          return;
-        }
-        if (claim.status === 'MISMATCH') {
-          res.status(422).json({
-            success: false,
-            error: 'IDEMPOTENCY_PAYLOAD_MISMATCH',
-            message: claim.mismatchError,
-            requestId,
-          });
-          return;
-        }
-        if (claim.status === 'COMPLETED') {
-          res.status(claim.statusCode).json(claim.responseBody);
-          return;
-        }
-        if (claim.status === 'PROCESSING') {
-          res.status(409).json({
-            success: false,
-            error: 'PAYMENT_VERIFICATION_IN_PROGRESS',
-            message: claim.conflictError,
-            requestId,
-          });
-          return;
-        }
+        handleIdempotencyClaimRejection(claim, res, requestId, 'PAYMENT_VERIFICATION_IN_PROGRESS');
+        return;
       }
     } catch (err: any) {
       if (paymentService.isDatabaseUnavailable(err)) {
@@ -545,6 +367,7 @@ paymentRouter.post('/verify', authenticate, async (req: Request, res: Response):
       timestamp: Number(timestamp),
       signature,
       amount: amount !== undefined ? Number(amount) : undefined,
+      currency,
       userId: req.auth!.userId,
       razorpayOrderId,
     });
@@ -568,7 +391,7 @@ paymentRouter.post('/verify', authenticate, async (req: Request, res: Response):
 
     if (cleanKey) {
       try {
-        await markIdempotencyCompleted(pool, cleanKey, statusCode, responseBody);
+        await idempotencyService.markCompleted(pool, cleanKey, statusCode, responseBody);
       } catch (err: any) {
         if (paymentService.isDatabaseUnavailable(err)) {
           res.setHeader('Retry-After', '3');
@@ -596,13 +419,11 @@ paymentRouter.post('/verify', authenticate, async (req: Request, res: Response):
 
     res.status(200).json(responseBody);
   } catch (err: any) {
-    console.error('PAYMENT_VERIFY_ERROR_CAUGHT:', err?.message || err);
+    paymentLogger.log('error', 'PAYMENT_VERIFY_FAILED', { orderId, userId: req.auth!.userId }, { error: err?.message });
     if (cleanKey) {
       try {
-        await markIdempotencyFailed(pool, cleanKey);
-      } catch {
-        // Suppress secondary error
-      }
+        await idempotencyService.markFailed(pool, cleanKey);
+      } catch {}
     }
 
     if (paymentService.isDatabaseUnavailable(err)) {
@@ -619,14 +440,16 @@ paymentRouter.post('/verify', authenticate, async (req: Request, res: Response):
 
     const msg = (err.message || '').toLowerCase();
     const isAmountMismatch = msg.includes('payment_amount_mismatch');
-    const isDuplicateKey = msg.includes('duplicate key') || msg.includes('unique constraint');
+    const isCurrencyMismatch = msg.includes('currency_mismatch');
+    const isDuplicateKey = msg.includes('duplicate key') || msg.includes('unique constraint') || msg.includes('duplicate_payment_capture');
     const isReplay = msg.includes('replay') || isDuplicateKey;
     const isSignature = msg.includes('signature') && !isDuplicateKey;
     const isStateTransition = msg.includes('invalid_payment_state_transition');
     const isUnauthorized = msg.includes('unauthorized');
-    const isNotFound = msg.includes('order not found') || (msg.includes('not found') && !msg.includes('column') && !msg.includes('relation'));
+    const isGatewayNotConfigured = msg.includes('payment_gateway_not_configured');
+    const isNotFound = msg.includes('order_not_found') || msg.includes('order not found') || (msg.includes('not found') && !msg.includes('column') && !msg.includes('relation'));
 
-    const statusCode = isAmountMismatch
+    const statusCode = isAmountMismatch || isCurrencyMismatch
       ? 400
       : isReplay || isStateTransition
       ? 409
@@ -634,12 +457,16 @@ paymentRouter.post('/verify', authenticate, async (req: Request, res: Response):
       ? 400
       : isUnauthorized
       ? 403
+      : isGatewayNotConfigured
+      ? 503
       : isNotFound
       ? 404
       : 500;
 
     const errorCode = isAmountMismatch
       ? 'PAYMENT_AMOUNT_MISMATCH'
+      : isCurrencyMismatch
+      ? 'CURRENCY_MISMATCH'
       : isReplay
       ? 'REPLAY_ATTACK_DETECTED'
       : isSignature
@@ -648,6 +475,8 @@ paymentRouter.post('/verify', authenticate, async (req: Request, res: Response):
       ? 'INVALID_PAYMENT_STATE_TRANSITION'
       : isUnauthorized
       ? 'UNAUTHORIZED_PAYMENT_ACCESS'
+      : isGatewayNotConfigured
+      ? 'PAYMENT_GATEWAY_NOT_CONFIGURED'
       : isNotFound
       ? 'ORDER_NOT_FOUND'
       : 'VERIFICATION_FAILED';
@@ -669,7 +498,6 @@ paymentRouter.post('/razorpay-webhook', paymentWebhookRateLimiter, handleWebhook
 
 /**
  * GET /api/payment/providers & GET /api/v1/payments/providers
- * Returns registered payment providers and their capabilities
  */
 paymentRouter.get('/providers/list', (_req: Request, res: Response): void => {
   const providers = paymentProviderRegistry.listProviders().map(p => {
@@ -694,7 +522,6 @@ paymentRouter.get('/providers', (_req: Request, res: Response): void => {
 
 /**
  * GET /api/payment/status/:orderId & GET /api/v1/payments/status/:orderId
- * Safe payment status query for authenticated order owner
  */
 paymentRouter.get('/status/:orderId', authenticate, async (req: Request, res: Response): Promise<void> => {
   const { orderId } = req.params;
@@ -739,7 +566,6 @@ paymentRouter.get('/status/:orderId', authenticate, async (req: Request, res: Re
 
 /**
  * GET /api/payment/:orderId & GET /api/v1/payments/:orderId
- * Safe payment status query for authenticated order owner
  */
 paymentRouter.get('/:orderId', authenticate, async (req: Request, res: Response): Promise<void> => {
   const { orderId } = req.params;
@@ -784,21 +610,62 @@ paymentRouter.get('/:orderId', authenticate, async (req: Request, res: Response)
 
 /**
  * POST /api/payment/webhook/:providerId
- * Provider-specific webhook ingestion route
  */
 paymentRouter.post('/webhook/:providerId', paymentWebhookRateLimiter, handleWebhookRequest);
 
 /**
  * POST /api/payment/attempt
- * Provider-agnostic payment attempt creation
+ * Provider-agnostic payment attempt creation with durable PostgreSQL idempotency & rate limiting
  */
-paymentRouter.post('/attempt', authenticate, async (req: Request, res: Response): Promise<void> => {
-  const { orderId, providerId } = req.body;
-  const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
+paymentRouter.post('/attempt', authenticate, paymentInitiationRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  const pool = getPool();
+  const { orderId, providerId, amount, currency } = req.body;
+  const rawKey = req.headers['idempotency-key'] as string | undefined;
+  const cleanKey = rawKey && typeof rawKey === 'string' ? rawKey.trim().slice(0, 120) : undefined;
+  const requestId = (req as any).requestId || req.headers['x-request-id'] || 'req-payment-attempt';
 
   if (!orderId) {
-    res.status(400).json({ success: false, error: 'MISSING_ORDER_ID', message: 'orderId is required.' });
+    res.status(400).json({ success: false, error: 'MISSING_ORDER_ID', message: 'orderId is required.', requestId });
     return;
+  }
+
+  const requestFingerprint = computeCanonicalFingerprint({
+    userId: req.auth!.userId,
+    orderId,
+    providerId: providerId || null,
+    ...(amount !== undefined ? { amount: Number(amount) } : {}),
+    ...(currency !== undefined ? { currency: String(currency).toUpperCase() } : {}),
+  });
+
+  if (cleanKey) {
+    try {
+      const claim = await idempotencyService.claimKey({
+        pool,
+        idempotencyKey: cleanKey,
+        actorId: req.auth!.userId,
+        operationType: 'PAYMENT_ATTEMPT',
+        endpoint: req.originalUrl,
+        requestFingerprint,
+      });
+
+      if (!claim.claimed) {
+        handleIdempotencyClaimRejection(claim, res, requestId, 'PAYMENT_ATTEMPT_IN_PROGRESS');
+        return;
+      }
+    } catch (err: any) {
+      if (paymentService.isDatabaseUnavailable(err)) {
+        res.setHeader('Retry-After', '3');
+        res.status(503).json({
+          success: false,
+          error: 'DATABASE_UNAVAILABLE',
+          message: 'PostgreSQL database is currently unavailable.',
+          retryAfterSeconds: 3,
+          requestId,
+        });
+        return;
+      }
+      throw err;
+    }
   }
 
   try {
@@ -806,15 +673,43 @@ paymentRouter.post('/attempt', authenticate, async (req: Request, res: Response)
       orderId,
       userId: req.auth!.userId,
       providerId,
-      idempotencyKey,
+      idempotencyKey: cleanKey,
+      clientAmount: amount,
+      clientCurrency: currency,
     });
-    res.status(200).json({ success: true, ...result });
+    const responseBody = { success: true, ...result };
+
+    if (cleanKey) {
+      await idempotencyService.markCompleted(pool, cleanKey, 200, responseBody).catch(() => {});
+    }
+
+    res.status(200).json(responseBody);
   } catch (err: any) {
+    if (cleanKey) {
+      await idempotencyService.markFailed(pool, cleanKey).catch(() => {});
+    }
+
+    if (paymentService.isDatabaseUnavailable(err)) {
+      res.setHeader('Retry-After', '3');
+      res.status(503).json({
+        success: false,
+        error: 'DATABASE_UNAVAILABLE',
+        message: 'PostgreSQL database is currently unavailable.',
+        retryAfterSeconds: 3,
+        requestId,
+      });
+      return;
+    }
+
     const msg = (err.message || '').toLowerCase();
     const isUnauthorized = msg.includes('unauthorized');
-    const isNotFound = msg.includes('not found');
+    const isNotFound = msg.includes('order_not_found') || msg.includes('not found');
+    const isAmountTampered = msg.includes('payment_amount_tampered');
+    const isUnsupportedCurrency = msg.includes('unsupported_currency');
     const isGatewayNotConfigured = msg.includes('payment_gateway_not_configured');
-    res.status(isUnauthorized ? 403 : isNotFound ? 404 : isGatewayNotConfigured ? 503 : 400).json({
+    const isConflict = msg.includes('payment_attempt_already_in_progress') || msg.includes('payment_reconciliation_pending');
+
+    res.status(isUnauthorized ? 403 : isNotFound ? 404 : isGatewayNotConfigured ? 503 : isConflict ? 409 : 400).json({
       success: false,
       error: isUnauthorized
         ? 'UNAUTHORIZED_ORDER_ACCESS'
@@ -822,8 +717,15 @@ paymentRouter.post('/attempt', authenticate, async (req: Request, res: Response)
         ? 'ORDER_NOT_FOUND'
         : isGatewayNotConfigured
         ? 'PAYMENT_GATEWAY_NOT_CONFIGURED'
+        : isConflict
+        ? 'PAYMENT_ATTEMPT_ALREADY_IN_PROGRESS'
+        : isAmountTampered
+        ? 'PAYMENT_AMOUNT_TAMPERED'
+        : isUnsupportedCurrency
+        ? 'UNSUPPORTED_CURRENCY'
         : 'PAYMENT_ATTEMPT_FAILED',
       message: err.message || 'Failed to create payment attempt.',
+      requestId,
     });
   }
 });

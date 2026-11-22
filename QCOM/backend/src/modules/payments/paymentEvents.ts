@@ -1,13 +1,18 @@
 import crypto from 'crypto';
+import { redactPaymentLogPayload } from './paymentLogger.js';
 
 export interface PaymentDomainEvent {
   eventId: string;
   eventType:
     | 'PaymentCreated'
+    | 'PaymentInitiated'
     | 'PaymentAuthorized'
     | 'PaymentCaptured'
     | 'PaymentFailed'
     | 'PaymentCancelled'
+    | 'PaymentExpired'
+    | 'PaymentUnknown'
+    | 'PaymentRequiresReview'
     | 'PaymentRefunded';
   timestamp: string;
   payload: any;
@@ -21,13 +26,20 @@ export class PaymentEventPublisher {
       eventId: crypto.randomUUID(),
       eventType,
       timestamp: new Date().toISOString(),
-      payload,
+      payload: redactPaymentLogPayload(payload),
     };
   }
 
   public publish(event: PaymentDomainEvent): void {
-    this.eventsLog.push(event);
-    console.log(`[PaymentDomainEvent] [${event.eventType}] ID: ${event.eventId}`, JSON.stringify(event.payload));
+    const redactedEvent: PaymentDomainEvent = {
+      ...event,
+      payload: redactPaymentLogPayload(event.payload),
+    };
+    this.eventsLog.push(redactedEvent);
+    console.log(
+      `[PaymentDomainEvent] [${redactedEvent.eventType}] ID: ${redactedEvent.eventId}`,
+      JSON.stringify(redactedEvent.payload)
+    );
   }
 
   public publishAll(events: PaymentDomainEvent[]): void {

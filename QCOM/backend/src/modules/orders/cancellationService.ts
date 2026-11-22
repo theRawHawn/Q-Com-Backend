@@ -4,6 +4,7 @@ import { inventoryService } from '../inventory/inventoryService.js';
 import { dispatchService } from '../dispatch/dispatchService.js';
 import { refundService, PreparedRefundIntent, RefundRecord } from '../payments/refundService.js';
 import { outboxService } from '../outbox/outboxService.js';
+import { transitionPaymentIntentState, transitionPaymentAttemptState } from '../payments/paymentStateMachine.js';
 
 export interface CancellationResult {
   order: any;
@@ -140,12 +141,35 @@ export class CancellationService {
         );
       }
 
-      await client.query(
-        `UPDATE payment_intents
-         SET status = 'CANCELLED', updated_at = NOW()
-         WHERE order_id = $1 AND status IN ('CREATED', 'PENDING', 'AUTHORIZED')`,
+      const intentRes = await client.query(
+        `SELECT id FROM payment_intents
+         WHERE order_id = $1 AND status IN ('CREATED', 'INITIATED', 'PENDING', 'PROCESSING', 'AUTHORIZED', 'UNKNOWN', 'RECONCILIATION_REQUIRED')
+         FOR UPDATE`,
         [orderId]
       );
+      for (const row of intentRes.rows) {
+        await transitionPaymentIntentState(client, row.id, 'CANCELLED', {
+          errorCode: reasonCode,
+          errorDescription: reason,
+          failureClassification: 'POLICY',
+        });
+      }
+      try {
+        const attRes = await client.query(
+          `SELECT id FROM payment_attempts
+           WHERE order_id = $1 AND status IN ('INITIATED', 'PENDING', 'PROCESSING', 'UNKNOWN', 'RECONCILIATION_REQUIRED')
+           FOR UPDATE`,
+          [orderId]
+        );
+        for (const att of attRes.rows) {
+          await transitionPaymentAttemptState(client, att.id, 'CANCELLED', {
+            errorCode: reasonCode,
+            errorMessage: reason,
+            failureClassification: 'POLICY',
+            retryEligible: false,
+          });
+        }
+      } catch {}
 
       const finalReason = `[${cancelledBy}] ${reason}`;
       const updRes = await client.query(
@@ -457,11 +481,35 @@ export class CancellationService {
       refundRecord = refundRes.refund;
     }
 
-    await client.query(`
-      UPDATE payment_intents
-      SET status = 'CANCELLED', updated_at = NOW()
-      WHERE order_id = $1 AND status IN ('CREATED', 'PENDING', 'AUTHORIZED')
-    `, [orderId]);
+    const singleIntentRes = await client.query(
+      `SELECT id FROM payment_intents
+       WHERE order_id = $1 AND status IN ('CREATED', 'INITIATED', 'PENDING', 'PROCESSING', 'AUTHORIZED', 'UNKNOWN', 'RECONCILIATION_REQUIRED')
+       FOR UPDATE`,
+      [orderId]
+    );
+    for (const row of singleIntentRes.rows) {
+      await transitionPaymentIntentState(client, row.id, 'CANCELLED', {
+        errorCode: `ORDER_CANCELLED_${cancelledBy}`,
+        errorDescription: reason,
+        failureClassification: 'POLICY',
+      });
+    }
+    try {
+      const singleAttRes = await client.query(
+        `SELECT id FROM payment_attempts
+         WHERE order_id = $1 AND status IN ('INITIATED', 'PENDING', 'PROCESSING', 'UNKNOWN', 'RECONCILIATION_REQUIRED')
+         FOR UPDATE`,
+        [orderId]
+      );
+      for (const att of singleAttRes.rows) {
+        await transitionPaymentAttemptState(client, att.id, 'CANCELLED', {
+          errorCode: `ORDER_CANCELLED_${cancelledBy}`,
+          errorMessage: reason,
+          failureClassification: 'POLICY',
+          retryEligible: false,
+        });
+      }
+    } catch {}
 
     const finalReason = `[${cancelledBy}] ${reason}`;
     const markRefunded = refundRecord?.status === 'COMPLETED';

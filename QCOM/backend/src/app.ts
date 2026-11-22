@@ -107,8 +107,12 @@ export function createApp(): Express {
     const dbHealth = await checkDatabaseHealth();
     const cacheHealth = await checkRedisHealth();
 
-    const isPaymentConfigured = env.PAYMENT_MODE !== 'none';
+    const activePaymentMode = process.env.PAYMENT_MODE || env.PAYMENT_MODE;
+    const isPaymentConfigured = activePaymentMode !== 'none';
     const paymentStatus = isPaymentConfigured ? 'READY' : 'UNCONFIGURED';
+    const paymentProvider = activePaymentMode === 'none'
+      ? 'UNSELECTED'
+      : (process.env.PAYMENT_PROVIDER || env.PAYMENT_PROVIDER || activePaymentMode);
 
     if (dbHealth.alive) {
       res.status(200).json({
@@ -126,8 +130,8 @@ export function createApp(): Express {
         },
         payments: {
           status: paymentStatus,
-          mode: env.PAYMENT_MODE,
-          provider: env.PAYMENT_PROVIDER || env.PAYMENT_MODE,
+          mode: activePaymentMode,
+          provider: paymentProvider,
           onlinePaymentsAvailable: isPaymentConfigured,
         },
         timestamp: new Date().toISOString(),
@@ -147,8 +151,8 @@ export function createApp(): Express {
         },
         payments: {
           status: paymentStatus,
-          mode: env.PAYMENT_MODE,
-          provider: env.PAYMENT_PROVIDER || env.PAYMENT_MODE,
+          mode: activePaymentMode,
+          provider: paymentProvider,
           onlinePaymentsAvailable: isPaymentConfigured,
         },
         timestamp: new Date().toISOString(),

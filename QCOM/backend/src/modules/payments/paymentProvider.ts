@@ -441,6 +441,7 @@ export class RazorpayPaymentProvider implements AgnosticPaymentProvider, LegacyP
   public readonly providerId: string;
   public readonly displayName: string;
   public readonly mode: string;
+  public readonly isSimulated: boolean;
 
   private keySecret: string;
   private webhookSecret: string;
@@ -449,9 +450,13 @@ export class RazorpayPaymentProvider implements AgnosticPaymentProvider, LegacyP
   private sessionsByRef = new Map<string, { orderId: string; amount: number; status: string; paymentId?: string }>();
 
   constructor(mode: 'razorpay_test' | 'production') {
+    if (mode === 'production') {
+      throw new Error('PAYMENT_GATEWAY_NOT_CONFIGURED: No live external payment gateway SDK is implemented in QCOM.');
+    }
     this.mode = mode;
     this.providerId = mode;
-    this.displayName = `Razorpay Gateway (${mode})`;
+    this.isSimulated = true;
+    this.displayName = `Simulated Legacy Gateway Adapter (${mode})`;
     this.keySecret = env.RAZORPAY_KEY_SECRET || env.PAYMENT_SECRET;
     this.webhookSecret = env.RAZORPAY_WEBHOOK_SECRET;
   }
@@ -534,14 +539,26 @@ export class RazorpayPaymentProvider implements AgnosticPaymentProvider, LegacyP
   }
 
   public async getPaymentStatus(providerReference: string, providerPaymentId?: string): Promise<ProviderPaymentStatus> {
+    const tracked = this.sessionsByRef.get(providerReference);
+    if (!tracked) {
+      return {
+        providerId: this.providerId,
+        providerReference,
+        providerPaymentId,
+        status: 'UNKNOWN',
+        amount: 0,
+        currency: 'INR',
+        rawStatus: 'UNKNOWN',
+      };
+    }
     return {
       providerId: this.providerId,
       providerReference,
-      providerPaymentId,
-      status: 'SUCCEEDED',
-      amount: 0,
+      providerPaymentId: providerPaymentId || tracked.paymentId,
+      status: tracked.status === 'CAPTURED' || tracked.status === 'SUCCEEDED' ? 'SUCCEEDED' : tracked.status === 'FAILED' ? 'FAILED' : 'PENDING',
+      amount: tracked.amount,
       currency: 'INR',
-      rawStatus: 'CAPTURED',
+      rawStatus: tracked.status,
     };
   }
 
@@ -738,12 +755,16 @@ export class RazorpayPaymentProvider implements AgnosticPaymentProvider, LegacyP
 /**
  * Returns provider instance according to PAYMENT_MODE setting
  */
-export function getPaymentProvider(): AgnosticPaymentProvider {
-  if (env.PAYMENT_MODE === 'none') {
+export function getPaymentProvider(providerId?: string): AgnosticPaymentProvider {
+  const activeMode = process.env.PAYMENT_MODE || env.PAYMENT_MODE;
+  if (activeMode === 'none') {
     return paymentProviderRegistry.getProvider('none');
   }
-  if (env.PAYMENT_MODE === 'razorpay_test') {
-    return new RazorpayPaymentProvider(env.PAYMENT_MODE);
+  if (providerId) {
+    return paymentProviderRegistry.getProvider(providerId);
+  }
+  if (activeMode === 'razorpay_test') {
+    return new RazorpayPaymentProvider('razorpay_test');
   }
   return paymentProviderRegistry.getProvider();
 }
