@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import pg from 'pg';
 import BigNumber from 'bignumber.js';
 import { getPool, transaction } from '../../database/connection.js';
-import { ledgerService } from '../ledger/ledgerService.js';
+import { ledgerService, isCodPaymentMethod } from '../ledger/ledgerService.js';
 import { getPayoutProvider, PayoutProvider, PayoutDisbursementResult } from './payoutProvider.js';
 import { SellerSettlementStatement, PayoutResult } from './settlementTypes.js';
 import { settlementEventPublisher, SettlementDomainEvent } from './settlementEvents.js';
@@ -1030,7 +1030,10 @@ export class SellerSettlementService {
 
       const newBalance = Number(roundCurrency(runningAfterBn));
 
-      // Record balanced General Ledger Entry (Reversal of fees + delay penalty + 2020 and/or 1040 vs Cr 1010)
+      const ordMethodRes = await client.query(`SELECT payment_method FROM orders WHERE id = $1 LIMIT 1`, [params.orderId]);
+      const isCodOrder = isCodPaymentMethod(ordMethodRes.rows[0]?.payment_method);
+
+      // Record balanced General Ledger Entry (Reversal of fees + delay penalty + 2020 and/or 1040 vs Cr 1010/1020)
       await ledgerService.recordReturnRefund({
         orderId: params.orderId,
         merchantId: params.merchantId,
@@ -1044,6 +1047,7 @@ export class SellerSettlementService {
         storeDelayPenalty: Number(roundCurrency(revDelayPenaltyBn)),
         isPostPayout,
         returnId: params.returnId,
+        creditAccountCode: isCodOrder ? '1020' : '1010',
         client,
       });
 

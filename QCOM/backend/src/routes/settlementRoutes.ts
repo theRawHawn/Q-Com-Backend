@@ -5,14 +5,73 @@ import { env } from '../config/env.js';
 import { authenticate } from '../middleware/auth.js';
 import { requireRole } from '../middleware/rbac.js';
 import { requireRiderOwnership } from '../middleware/resourceOwnership.js';
-import { paymentWebhookRateLimiter } from '../middleware/rateLimiter.js';
+import {
+  paymentWebhookRateLimiter,
+  adminSensitiveRateLimiter,
+  codRemittanceRateLimiter,
+} from '../middleware/rateLimiter.js';
 import { settlementAllocationService } from '../modules/settlements/settlementAllocationService.js';
 import { sellerSettlementService } from '../modules/settlements/sellerSettlementService.js';
 import { riderPayoutService } from '../modules/settlements/riderPayoutService.js';
+import {
+  codCashAccountabilityService,
+  CodAccountabilityError,
+} from '../modules/settlements/codCashAccountabilityService.js';
 import { ledgerService } from '../modules/ledger/ledgerService.js';
 import { getPool } from '../database/connection.js';
 
 export const settlementRouter = Router();
+
+function isGlobalOpsOrFinanceAdmin(req: Request): boolean {
+  return Boolean(
+    req.auth?.isSuperAdmin ||
+      req.auth?.roles?.some((r) => ['ADMIN', 'SUPER_ADMIN', 'FINANCE_ADMIN', 'OPERATIONS'].includes(r))
+  );
+}
+
+function sendCodErrorResponse(
+  res: Response,
+  err: any,
+  fallbackCode: string,
+  fallbackMessage: string
+): void {
+  if (isDatabaseUnavailable(err)) {
+    res.setHeader('Retry-After', '3');
+    res.status(503).json({
+      success: false,
+      error: 'DATABASE_UNAVAILABLE',
+      message: 'Database is temporarily unavailable. Please retry.',
+      retryAfterSeconds: 3,
+    });
+    return;
+  }
+
+  if (err instanceof CodAccountabilityError || err?.name === 'CodAccountabilityError') {
+    res.status(err.statusCode || 400).json({
+      success: false,
+      error: err.errorCode || fallbackCode,
+      message: err.message,
+      ...(err.details ? { details: err.details } : {}),
+    });
+    return;
+  }
+
+  const msg = String(err?.message || '').toLowerCase();
+  if (msg.includes('not_found') || msg.includes('does not exist')) {
+    res.status(404).json({
+      success: false,
+      error: 'RESOURCE_NOT_FOUND',
+      message: err?.message || fallbackMessage,
+    });
+    return;
+  }
+
+  res.status(400).json({
+    success: false,
+    error: fallbackCode,
+    message: err?.message || fallbackMessage,
+  });
+}
 
 function isDatabaseUnavailable(err: any): boolean {
   if (!err) return false;
@@ -474,70 +533,477 @@ settlementRouter.post('/rider/payout', authenticate, async (req: Request, res: R
 
 /**
  * POST /api/v1/settlements/cod/remit
- * Rider remits collected Cash on Delivery funds via UPI or hub deposit
+ * Rider submits a Cash on Delivery remittance request for physical receipt & finance verification.
+ * Security invariant: Never clears rider cash liability on submission alone.
  */
-settlementRouter.post('/cod/remit', authenticate, requireRiderOwnership('riderId'), async (req: Request, res: Response): Promise<void> => {
-  const { riderId, amount, method, reference } = req.body;
-
-  if (!riderId || amount === undefined) {
-    res.status(400).json({
-      success: false,
-      error: 'MISSING_FIELDS',
-      message: 'riderId and amount are required.',
-    });
-    return;
-  }
-
-  try {
-    const result = await riderPayoutService.remitCodCash({
+settlementRouter.post(
+  '/cod/remit',
+  authenticate,
+  codRemittanceRateLimiter,
+  requireRiderOwnership('riderId'),
+  async (req: Request, res: Response): Promise<void> => {
+    const {
       riderId,
-      amount: parseFloat(amount),
-      method: method || 'UPI',
+      amount,
+      method,
       reference,
-    });
+      collectionIds,
+      orderIds,
+      collectionLocation,
+      evidenceReference,
+    } = req.body || {};
 
-    res.status(200).json({
-      message: 'COD cash remitted successfully.',
-      ...result,
-    });
-  } catch (err: any) {
-    if (isDatabaseUnavailable(err)) {
-      res.setHeader('Retry-After', '3');
-      res.status(503).json({
-        success: false,
-        error: 'DATABASE_UNAVAILABLE',
-        message: 'Database is temporarily unavailable during COD remittance. Please retry.',
-        retryAfterSeconds: 3,
-      });
-      return;
-    }
-
-    const msg = (err.message || '').toLowerCase();
-    if (msg.includes('rider_not_found') || msg.includes('does not exist')) {
-      res.status(404).json({
-        success: false,
-        error: 'RIDER_NOT_FOUND',
-        message: err.message,
-      });
-      return;
-    }
-
-    if (msg.includes('invalid_remittance_amount') || msg.includes('exceeds')) {
+    if (!riderId || amount === undefined) {
       res.status(400).json({
         success: false,
-        error: 'INVALID_REMITTANCE_AMOUNT',
-        message: err.message,
+        error: 'MISSING_FIELDS',
+        message: 'riderId and amount are required.',
       });
       return;
     }
 
-    res.status(400).json({
-      success: false,
-      error: 'COD_REMITTANCE_FAILED',
-      message: err.message || 'Failed to process COD remittance.',
-    });
+    const rawIdemp = req.headers['idempotency-key'] || req.headers['x-idempotency-key'] || req.body?.idempotencyKey;
+    const idempotencyKey = rawIdemp ? String(rawIdemp).trim() : undefined;
+
+    try {
+      const result = await riderPayoutService.remitCodCash({
+        riderId,
+        amount: typeof amount === 'number' ? amount : Number(amount),
+        method: method || 'UPI',
+        reference,
+        idempotencyKey,
+        collectionLocation,
+        evidenceReference,
+        collectionIds: Array.isArray(collectionIds) ? collectionIds : undefined,
+        orderIds: Array.isArray(orderIds) ? orderIds : undefined,
+        submittedByUserId: req.auth!.userId,
+      });
+
+      res.status(200).json({
+        message: 'COD remittance submitted awaiting physical receipt and finance verification.',
+        ...result,
+      });
+    } catch (err: any) {
+      sendCodErrorResponse(res, err, 'COD_REMITTANCE_FAILED', 'Failed to process COD remittance.');
+    }
   }
-});
+);
+
+/**
+ * GET /api/v1/settlements/rider/:riderId/cod-summary
+ * Authoritative PostgreSQL rider COD cash liability metrics (A-H) and breakdown.
+ */
+settlementRouter.get(
+  '/rider/:riderId/cod-summary',
+  authenticate,
+  requireRiderOwnership('riderId'),
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const summary = await codCashAccountabilityService.getRiderCashSummary(req.params.riderId);
+      res.status(200).json({
+        success: true,
+        summary,
+      });
+    } catch (err: any) {
+      sendCodErrorResponse(res, err, 'COD_SUMMARY_FAILED', 'Failed to retrieve rider COD summary.');
+    }
+  }
+);
+
+/**
+ * GET /api/v1/settlements/cod/observability
+ * Portfolio-wide COD cash accountability metrics for operations & finance monitoring.
+ */
+settlementRouter.get(
+  '/cod/observability',
+  authenticate,
+  requireRole(['SUPER_ADMIN', 'FINANCE_ADMIN', 'OPERATIONS']),
+  async (_req: Request, res: Response): Promise<void> => {
+    try {
+      const metrics = await codCashAccountabilityService.getPortfolioCodObservability();
+      res.status(200).json({
+        success: true,
+        metrics,
+      });
+    } catch (err: any) {
+      sendCodErrorResponse(res, err, 'COD_OBSERVABILITY_FAILED', 'Failed to retrieve COD observability metrics.');
+    }
+  }
+);
+
+/**
+ * POST /api/v1/settlements/cod/remittances
+ * Initiates a COD remittance (DRAFT or SUBMITTED) with FIFO or explicit order/collection allocation.
+ */
+settlementRouter.post(
+  '/cod/remittances',
+  authenticate,
+  codRemittanceRateLimiter,
+  requireRiderOwnership('riderId'),
+  async (req: Request, res: Response): Promise<void> => {
+    const {
+      riderId,
+      amount,
+      method,
+      reference,
+      collectionIds,
+      orderIds,
+      collectionLocation,
+      evidenceReference,
+      asDraft,
+    } = req.body || {};
+
+    if (!riderId || amount === undefined) {
+      res.status(400).json({
+        success: false,
+        error: 'MISSING_FIELDS',
+        message: 'riderId and amount are required.',
+      });
+      return;
+    }
+
+    const rawIdemp = req.headers['idempotency-key'] || req.headers['x-idempotency-key'] || req.body?.idempotencyKey;
+    const idempotencyKey = rawIdemp ? String(rawIdemp).trim() : undefined;
+
+    try {
+      const remittance = await codCashAccountabilityService.submitRemittance({
+        riderId,
+        amount,
+        method: method || 'CASH_HUB',
+        reference,
+        idempotencyKey,
+        collectionIds: Array.isArray(collectionIds) ? collectionIds : undefined,
+        orderIds: Array.isArray(orderIds) ? orderIds : undefined,
+        collectionLocation,
+        evidenceReference,
+        asDraft: Boolean(asDraft),
+        submittedByUserId: req.auth!.userId,
+      });
+
+      res.status(remittance.idempotentReplay ? 200 : 201).json({
+        success: true,
+        remittance,
+      });
+    } catch (err: any) {
+      sendCodErrorResponse(res, err, 'COD_REMITTANCE_CREATE_FAILED', 'Failed to create COD remittance.');
+    }
+  }
+);
+
+/**
+ * POST /api/v1/settlements/cod/remittances/:remittanceId/submit
+ * Finalizes a DRAFT COD remittance into SUBMITTED state.
+ */
+settlementRouter.post(
+  '/cod/remittances/:remittanceId/submit',
+  authenticate,
+  codRemittanceRateLimiter,
+  async (req: Request, res: Response): Promise<void> => {
+    const isAdmin = isGlobalOpsOrFinanceAdmin(req);
+    if (!isAdmin && !req.auth?.riderId) {
+      res.status(403).json({
+        success: false,
+        error: 'RIDER_ACCESS_DENIED',
+        message: 'Only the owning rider or an authorized operations/finance admin can finalize a COD remittance.',
+      });
+      return;
+    }
+
+    try {
+      const result = await codCashAccountabilityService.finalizeDraftSubmission({
+        remittanceId: req.params.remittanceId,
+        actorUserId: req.auth!.userId,
+        riderId: isAdmin ? undefined : req.auth!.riderId,
+      });
+      res.status(200).json({
+        success: true,
+        remittance: result,
+      });
+    } catch (err: any) {
+      sendCodErrorResponse(res, err, 'COD_REMITTANCE_SUBMIT_FAILED', 'Failed to submit COD remittance.');
+    }
+  }
+);
+
+/**
+ * POST /api/v1/settlements/cod/remittances/:remittanceId/receive
+ * Authorized hub/cashier physical receipt acknowledgment (cannot be executed by the submitting rider).
+ */
+settlementRouter.post(
+  '/cod/remittances/:remittanceId/receive',
+  authenticate,
+  requireRole(['OPERATIONS', 'DISPATCHER', 'FINANCE_ADMIN', 'SUPER_ADMIN']),
+  adminSensitiveRateLimiter,
+  async (req: Request, res: Response): Promise<void> => {
+    const {
+      receivedAmount,
+      collectionLocation,
+      evidenceReference,
+      moveToVerificationPending,
+    } = req.body || {};
+    const rawIdemp = req.headers['idempotency-key'] || req.headers['x-idempotency-key'] || req.body?.idempotencyKey;
+
+    try {
+      const result = await codCashAccountabilityService.acknowledgeReceipt({
+        remittanceId: req.params.remittanceId,
+        receiverUserId: req.auth!.userId,
+        receivedAmount,
+        collectionLocation,
+        evidenceReference,
+        moveToVerificationPending: Boolean(moveToVerificationPending),
+        idempotencyKey: rawIdemp ? String(rawIdemp).trim() : undefined,
+      });
+      res.status(200).json({
+        success: true,
+        remittance: result,
+      });
+    } catch (err: any) {
+      sendCodErrorResponse(res, err, 'COD_REMITTANCE_RECEIVE_FAILED', 'Failed to acknowledge receipt of COD remittance.');
+    }
+  }
+);
+
+/**
+ * POST /api/v1/settlements/cod/remittances/:remittanceId/verify
+ * Independent finance verifier confirms deposited amount and posts authoritative GL clearance.
+ * Enforces two-person integrity (verifier !== submitter && verifier !== receiver).
+ */
+settlementRouter.post(
+  '/cod/remittances/:remittanceId/verify',
+  authenticate,
+  requireRole(['FINANCE_ADMIN', 'SUPER_ADMIN']),
+  adminSensitiveRateLimiter,
+  async (req: Request, res: Response): Promise<void> => {
+    const { verifiedAmount, discrepancyNotes, evidenceReference } = req.body || {};
+    const rawIdemp = req.headers['idempotency-key'] || req.headers['x-idempotency-key'] || req.body?.idempotencyKey;
+
+    try {
+      const result = await codCashAccountabilityService.verifyRemittance({
+        remittanceId: req.params.remittanceId,
+        verifierUserId: req.auth!.userId,
+        verifiedAmount,
+        discrepancyNotes,
+        evidenceReference,
+        idempotencyKey: rawIdemp ? String(rawIdemp).trim() : undefined,
+      });
+      res.status(200).json({
+        success: true,
+        remittance: result,
+      });
+    } catch (err: any) {
+      sendCodErrorResponse(res, err, 'COD_REMITTANCE_VERIFY_FAILED', 'Failed to verify COD remittance.');
+    }
+  }
+);
+
+/**
+ * POST /api/v1/settlements/cod/remittances/:remittanceId/reject
+ * Finance/Operations rejects an unverified COD remittance and releases reserved collections.
+ */
+settlementRouter.post(
+  '/cod/remittances/:remittanceId/reject',
+  authenticate,
+  requireRole(['OPERATIONS', 'FINANCE_ADMIN', 'SUPER_ADMIN']),
+  adminSensitiveRateLimiter,
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const result = await codCashAccountabilityService.rejectOrCancelRemittance({
+        remittanceId: req.params.remittanceId,
+        actorUserId: req.auth!.userId,
+        mode: 'REJECT',
+        reason: String(req.body?.reason || ''),
+      });
+      res.status(200).json({
+        success: true,
+        remittance: result,
+      });
+    } catch (err: any) {
+      sendCodErrorResponse(res, err, 'COD_REMITTANCE_REJECT_FAILED', 'Failed to reject COD remittance.');
+    }
+  }
+);
+
+/**
+ * POST /api/v1/settlements/cod/remittances/:remittanceId/cancel
+ * Rider cancels own DRAFT/SUBMITTED remittance prior to physical receipt.
+ */
+settlementRouter.post(
+  '/cod/remittances/:remittanceId/cancel',
+  authenticate,
+  codRemittanceRateLimiter,
+  async (req: Request, res: Response): Promise<void> => {
+    const isAdmin = isGlobalOpsOrFinanceAdmin(req);
+    if (!isAdmin && !req.auth?.riderId) {
+      res.status(403).json({
+        success: false,
+        error: 'RIDER_ACCESS_DENIED',
+        message: 'Only the owning rider or an authorized admin can cancel this COD remittance.',
+      });
+      return;
+    }
+
+    try {
+      const result = await codCashAccountabilityService.rejectOrCancelRemittance({
+        remittanceId: req.params.remittanceId,
+        actorUserId: req.auth!.userId,
+        mode: 'CANCEL',
+        reason: String(req.body?.reason || ''),
+        riderIdScope: isAdmin ? undefined : req.auth!.riderId,
+      });
+      res.status(200).json({
+        success: true,
+        remittance: result,
+      });
+    } catch (err: any) {
+      sendCodErrorResponse(res, err, 'COD_REMITTANCE_CANCEL_FAILED', 'Failed to cancel COD remittance.');
+    }
+  }
+);
+
+/**
+ * POST /api/v1/settlements/cod/remittances/:remittanceId/reverse
+ * Appends an offsetting GL reversal batch for a verified remittance (preserves full immutable history).
+ */
+settlementRouter.post(
+  '/cod/remittances/:remittanceId/reverse',
+  authenticate,
+  requireRole(['FINANCE_ADMIN', 'SUPER_ADMIN']),
+  adminSensitiveRateLimiter,
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const result = await codCashAccountabilityService.reverseVerifiedRemittance({
+        remittanceId: req.params.remittanceId,
+        actorUserId: req.auth!.userId,
+        reason: String(req.body?.reason || ''),
+      });
+      res.status(200).json({
+        success: true,
+        reversal: result,
+      });
+    } catch (err: any) {
+      sendCodErrorResponse(res, err, 'COD_REMITTANCE_REVERSAL_FAILED', 'Failed to reverse COD remittance.');
+    }
+  }
+);
+
+/**
+ * POST /api/v1/settlements/cod/disputes
+ * Opens a durable COD accountability dispute (shortage, missing collection, overdue liability, customer dispute).
+ */
+settlementRouter.post(
+  '/cod/disputes',
+  authenticate,
+  requireRole(['OPERATIONS', 'FINANCE_ADMIN', 'SUPER_ADMIN']),
+  adminSensitiveRateLimiter,
+  async (req: Request, res: Response): Promise<void> => {
+    const { riderId, remittanceId, collectionId, orderId, disputeType, disputedAmount, reason, evidence } = req.body || {};
+    if (!riderId || !disputeType || disputedAmount === undefined) {
+      res.status(400).json({
+        success: false,
+        error: 'MISSING_FIELDS',
+        message: 'riderId, disputeType, and disputedAmount are required.',
+      });
+      return;
+    }
+
+    try {
+      const dispute = await codCashAccountabilityService.openDispute({
+        riderId,
+        remittanceId,
+        collectionId,
+        orderId,
+        disputeType,
+        disputedAmount,
+        reason: String(reason || ''),
+        openedByUserId: req.auth!.userId,
+        evidence,
+      });
+      res.status(201).json({
+        success: true,
+        dispute,
+      });
+    } catch (err: any) {
+      sendCodErrorResponse(res, err, 'COD_DISPUTE_CREATE_FAILED', 'Failed to open COD dispute.');
+    }
+  }
+);
+
+/**
+ * POST /api/v1/settlements/cod/disputes/:disputeId/resolve
+ * Authorized Finance Admin resolution of COD shortage/excess disputes with immutable GL entries.
+ */
+settlementRouter.post(
+  '/cod/disputes/:disputeId/resolve',
+  authenticate,
+  requireRole(['FINANCE_ADMIN', 'SUPER_ADMIN']),
+  adminSensitiveRateLimiter,
+  async (req: Request, res: Response): Promise<void> => {
+    const { resolutionType, notes } = req.body || {};
+    if (!resolutionType) {
+      res.status(400).json({
+        success: false,
+        error: 'MISSING_RESOLUTION_TYPE',
+        message: 'resolutionType is required.',
+      });
+      return;
+    }
+
+    const rawIdemp = req.headers['idempotency-key'] || req.headers['x-idempotency-key'] || req.body?.idempotencyKey;
+    try {
+      const resolution = await codCashAccountabilityService.resolveDispute({
+        disputeId: req.params.disputeId,
+        resolverUserId: req.auth!.userId,
+        resolutionType,
+        notes: String(notes || ''),
+        idempotencyKey: rawIdemp ? String(rawIdemp).trim() : undefined,
+      });
+      res.status(200).json({
+        success: true,
+        resolution,
+      });
+    } catch (err: any) {
+      sendCodErrorResponse(res, err, 'COD_DISPUTE_RESOLVE_FAILED', 'Failed to resolve COD dispute.');
+    }
+  }
+);
+
+/**
+ * POST /api/v1/settlements/cod/riders/:riderId/ceiling-override
+ * Grants a time-bounded, audited COD cash ceiling override (never clears financial liability).
+ */
+settlementRouter.post(
+  '/cod/riders/:riderId/ceiling-override',
+  authenticate,
+  requireRole(['FINANCE_ADMIN', 'SUPER_ADMIN']),
+  adminSensitiveRateLimiter,
+  async (req: Request, res: Response): Promise<void> => {
+    const { overrideLimit, durationMinutes, reason } = req.body || {};
+    if (overrideLimit === undefined || durationMinutes === undefined) {
+      res.status(400).json({
+        success: false,
+        error: 'MISSING_FIELDS',
+        message: 'overrideLimit and durationMinutes are required.',
+      });
+      return;
+    }
+
+    try {
+      const override = await codCashAccountabilityService.grantTemporaryCeilingOverride({
+        riderId: req.params.riderId,
+        overrideLimit,
+        durationMinutes: Number(durationMinutes),
+        reason: String(reason || ''),
+        adminUserId: req.auth!.userId,
+      });
+      res.status(200).json({
+        success: true,
+        override,
+      });
+    } catch (err: any) {
+      sendCodErrorResponse(res, err, 'COD_CEILING_OVERRIDE_FAILED', 'Failed to grant COD ceiling override.');
+    }
+  }
+);
 
 /**
  * GET /api/v1/settlements/reconciliation/trial-balance

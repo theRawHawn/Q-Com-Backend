@@ -6,6 +6,9 @@ import { safeErrorMessage } from '../middleware/errorHandler.js';
 import { catalogSearchRateLimiter, adminSensitiveRateLimiter } from '../middleware/rateLimiter.js';
 import { recordAuditEvent } from '../modules/audit/auditService.js';
 import { realtimeGateway } from '../modules/realtime/websocketServer.js';
+import { toDecimal, roundCurrency, add } from '../modules/pricing/money.js';
+import { isCodPaymentMethod } from '../modules/ledger/ledgerService.js';
+import { codCashAccountabilityService } from '../modules/settlements/codCashAccountabilityService.js';
 
 export const adminCompatibilityRouter = Router();
 
@@ -132,6 +135,8 @@ adminCompatibilityRouter.get('/riders', authenticate, requireRole(OPS_ADMIN_ROLE
       SELECT r.id, r.user_id, r.status, r.vehicle_type, r.vehicle_plate,
              r.rating, r.tier, r.latitude, r.longitude, r.wallet_balance,
              r.floating_cash_balance, r.floating_cash_limit, r.kyc_status,
+             r.cod_restricted, r.cod_restriction_reason, r.active_cod_dispute_count,
+             r.cod_ceiling_override_limit, r.cod_ceiling_override_until,
              u.name, u.phone, u.email
       FROM riders r
       LEFT JOIN users u ON r.user_id = u.id
@@ -140,23 +145,30 @@ adminCompatibilityRouter.get('/riders', authenticate, requireRole(OPS_ADMIN_ROLE
 
     res.status(200).json({
       success: true,
-      riders: ridersRes.rows.map(r => ({
-        id: r.id,
-        name: r.name || 'Fleet Partner',
-        phone: r.phone || null,
-        vehicleType: r.vehicle_type,
-        vehiclePlate: r.vehicle_plate,
-        rating: parseFloat(r.rating || 5.0),
-        tier: r.tier || 'Silver',
-        status: r.status,
-        isOnline: r.status !== 'OFFLINE',
-        latitude: r.latitude ? parseFloat(r.latitude) : 12.9352,
-        longitude: r.longitude ? parseFloat(r.longitude) : 77.6245,
-        floatingCash: parseFloat(r.floating_cash_balance || 0),
-        floatingCashLimit: parseFloat(r.floating_cash_limit || 2500),
-        walletBalance: parseFloat(r.wallet_balance || 0),
-        kycStatus: r.kyc_status,
-      })),
+      riders: ridersRes.rows.map(r => {
+        const ceiling = codCashAccountabilityService.resolveEffectiveCashCeiling(r);
+        return {
+          id: r.id,
+          name: r.name || 'Fleet Partner',
+          phone: r.phone || null,
+          vehicleType: r.vehicle_type,
+          vehiclePlate: r.vehicle_plate,
+          rating: parseFloat(r.rating || 5.0),
+          tier: r.tier || 'Silver',
+          status: r.status,
+          isOnline: r.status !== 'OFFLINE',
+          latitude: r.latitude ? parseFloat(r.latitude) : 12.9352,
+          longitude: r.longitude ? parseFloat(r.longitude) : 77.6245,
+          floatingCash: parseFloat(r.floating_cash_balance || 0),
+          floatingCashLimit: ceiling.baseLimit,
+          effectiveCashCeiling: ceiling.effectiveLimit,
+          codRestricted: Boolean(r.cod_restricted),
+          codRestrictionReason: r.cod_restriction_reason || null,
+          activeCodDisputeCount: parseInt(String(r.active_cod_dispute_count || '0'), 10) || 0,
+          walletBalance: parseFloat(r.wallet_balance || 0),
+          kycStatus: r.kyc_status,
+        };
+      }),
     });
   } catch (err: any) {
     res.status(500).json({
@@ -368,9 +380,12 @@ adminCompatibilityRouter.post('/orders/:orderId/assign-rider', authenticate, adm
     return;
   }
 
-  // 2. Validate target rider exists and is active
+  // 2. Validate target rider exists and is active & COD-eligible
   const riderCheck = await pool.query(
-    `SELECT id, name, status FROM riders WHERE id = $1`,
+    `SELECT id, name, status, floating_cash_balance, floating_cash_limit,
+            cod_restricted, cod_restriction_reason, active_cod_dispute_count,
+            cod_ceiling_override_limit, cod_ceiling_override_until
+     FROM riders WHERE id = $1`,
     [riderId]
   );
   if (riderCheck.rows.length === 0) {
@@ -378,6 +393,30 @@ adminCompatibilityRouter.post('/orders/:orderId/assign-rider', authenticate, adm
     return;
   }
   const targetRider = riderCheck.rows[0];
+  const orderCheck = await pool.query(
+    `SELECT id, payment_method, total_amount FROM orders WHERE id = $1 LIMIT 1`,
+    [orderId]
+  );
+  if (orderCheck.rows.length > 0 && isCodPaymentMethod(orderCheck.rows[0].payment_method)) {
+    const activeDisputes = parseInt(String(targetRider.active_cod_dispute_count || '0'), 10) || 0;
+    const { effectiveLimit } = codCashAccountabilityService.resolveEffectiveCashCeiling(targetRider);
+    const currentLiability = toDecimal(roundCurrency(targetRider.floating_cash_balance || 0));
+    const orderCodAmt = toDecimal(roundCurrency(orderCheck.rows[0].total_amount || 0));
+    if (
+      targetRider.cod_restricted === true ||
+      activeDisputes > 0 ||
+      currentLiability.gte(effectiveLimit) ||
+      add(currentLiability, orderCodAmt).gt(effectiveLimit)
+    ) {
+      res.status(409).json({
+        success: false,
+        error: 'RIDER_COD_RESTRICTED',
+        message: `Target rider is blocked from receiving COD assignments (reason: ${targetRider.cod_restriction_reason || 'CASH_CEILING_OR_DISPUTE'}).`,
+      });
+      return;
+    }
+  }
+
   if (targetRider.status === 'SUSPENDED') {
     res.status(400).json({ success: false, error: 'RIDER_SUSPENDED', message: 'Cannot assign a suspended delivery partner.' });
     return;

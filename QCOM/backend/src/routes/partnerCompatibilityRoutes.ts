@@ -387,7 +387,7 @@ tasksCompatibilityRouter.post('/:taskId/pickup-confirm', authenticate, riderTele
  */
 tasksCompatibilityRouter.post('/:taskId/verify-otp', authenticate, riderTelemetryRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const { taskId } = req.params;
-  const { otp, cashCollected } = req.body;
+  const { otp, cashCollected, allowPartial, partialCollection } = req.body;
   const pool = getPool();
 
   if (!otp || typeof otp !== 'string') {
@@ -408,6 +408,7 @@ tasksCompatibilityRouter.post('/:taskId/verify-otp', authenticate, riderTelemetr
       taskId,
       otp,
       cashCollected,
+      allowPartial: Boolean(allowPartial ?? partialCollection),
       actor: {
         riderId: rider?.id,
         isDispatchAdmin: adminOverride,

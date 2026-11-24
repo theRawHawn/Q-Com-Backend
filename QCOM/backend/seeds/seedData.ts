@@ -70,6 +70,11 @@ export async function runSeeds(poolOverride?: pg.Pool): Promise<void> {
       { key: 'audit.view', module: 'audit', name: 'View Audit Logs', desc: 'Inspect immutable audit logs' },
       { key: 'rbac.view', module: 'rbac', name: 'View Roles & Permissions', desc: 'Inspect RBAC structure' },
       { key: 'rbac.manage', module: 'rbac', name: 'Manage Roles & Permissions', desc: 'Modify roles and grants' },
+      { key: 'cod.remit.submit', module: 'settlements', name: 'Submit COD Remittance', desc: 'Submit physical COD cash handover remittance' },
+      { key: 'cod.remit.receive', module: 'settlements', name: 'Receive COD Remittance', desc: 'Acknowledge physical COD cash receipt from rider' },
+      { key: 'cod.remit.verify', module: 'settlements', name: 'Verify COD Remittance', desc: 'Independently verify COD remittance and clear liability' },
+      { key: 'cod.disputes.resolve', module: 'settlements', name: 'Resolve COD Disputes', desc: 'Resolve COD cash shortages, excesses, and disputes' },
+      { key: 'cod.ceiling.override', module: 'settlements', name: 'Override Rider COD Ceiling', desc: 'Authorize temporary rider COD cash ceiling overrides' },
     ];
 
     for (const p of permissions) {
@@ -93,13 +98,13 @@ export async function runSeeds(poolOverride?: pg.Pool): Promise<void> {
 
     const rolePermissionGrants: Record<string, string[]> = {
       SUPER_ADMIN: Array.from(permMap.keys()),
-      OPERATIONS: ['dashboard.view', 'orders.view', 'orders.update_status', 'orders.assign_rider', 'customers.view', 'sellers.view', 'riders.view', 'riders.broadcast', 'service_areas.view'],
+      OPERATIONS: ['dashboard.view', 'orders.view', 'orders.update_status', 'orders.assign_rider', 'customers.view', 'sellers.view', 'riders.view', 'riders.broadcast', 'service_areas.view', 'cod.remit.receive'],
       DISPATCHER: ['dashboard.view', 'orders.view', 'orders.update_status', 'orders.assign_rider', 'riders.view', 'riders.broadcast', 'service_areas.view'],
-      FINANCE_ADMIN: ['dashboard.view', 'settlements.view', 'settlements.process', 'refunds.view', 'refunds.approve', 'audit.view'],
+      FINANCE_ADMIN: ['dashboard.view', 'settlements.view', 'settlements.process', 'refunds.view', 'refunds.approve', 'audit.view', 'cod.remit.verify', 'cod.disputes.resolve', 'cod.ceiling.override'],
       STORE_OWNER: ['orders.view', 'orders.update_status', 'inventory.view', 'inventory.edit_stock', 'settlements.view'],
       STORE_MANAGER: ['orders.view', 'orders.update_status', 'inventory.view', 'inventory.edit_stock'],
       STAFF_PACKER: ['orders.view', 'orders.update_status'],
-      RIDER: ['orders.view', 'riders.view'],
+      RIDER: ['orders.view', 'riders.view', 'cod.remit.submit'],
       CUSTOMER: ['orders.view', 'orders.create'],
     };
 
@@ -126,6 +131,7 @@ export async function runSeeds(poolOverride?: pg.Pool): Promise<void> {
       { code: '1020', name: 'Bank Operating Account', category: 'ASSET', normal: 'DEBIT', desc: 'Primary platform corporate disbursement account' },
       { code: '1030', name: 'Floating Cash in Hands of Riders (COD)', category: 'ASSET', normal: 'DEBIT', desc: 'Cash collected by riders on physical deliveries' },
       { code: '1040', name: 'Merchant Receivable (Clawbacks & Returns)', category: 'ASSET', normal: 'DEBIT', desc: 'Unrecovered balances owed by merchants due to post-payout returns' },
+      { code: '1050', name: 'Rider Cash Shortage Receivable', category: 'ASSET', normal: 'DEBIT', desc: 'Recognized COD cash shortages owed by delivery partners pending recovery or authorized settlement' },
       { code: '2010', name: 'Customer Funds Held in Escrow', category: 'LIABILITY', normal: 'CREDIT', desc: 'Liability to deliver goods or refund customer' },
       { code: '2020', name: 'Merchant Accounts Payable', category: 'LIABILITY', normal: 'CREDIT', desc: 'Net balance owed to merchant stores' },
       { code: '2030', name: 'Delivery Partner Wallet Payable', category: 'LIABILITY', normal: 'CREDIT', desc: 'Cleared delivery fares and tips payable to riders' },
@@ -133,11 +139,13 @@ export async function runSeeds(poolOverride?: pg.Pool): Promise<void> {
       { code: '2050', name: 'Income-Tax Withholding Payable', category: 'LIABILITY', normal: 'CREDIT', desc: 'E-commerce TDS withheld payable via Form 26Q' },
       { code: '2060', name: 'Logistics Withholding Payable', category: 'LIABILITY', normal: 'CREDIT', desc: 'Contractor TDS withheld payable via Form 26Q' },
       { code: '2070', name: 'Output GST Liability on Platform Fees', category: 'LIABILITY', normal: 'CREDIT', desc: 'GST collected on commission, delivery & handling' },
+      { code: '2080', name: 'Unidentified / Excess COD Cash Suspense', category: 'LIABILITY', normal: 'CREDIT', desc: 'Excess cash remitted by riders above expected COD liability pending reconciliation or return' },
       { code: '4010', name: 'Marketplace Commission Revenue', category: 'REVENUE', normal: 'CREDIT', desc: 'Earned merchant fee under SAC 9983' },
       { code: '4020', name: 'Customer Delivery Fee Revenue', category: 'REVENUE', normal: 'CREDIT', desc: 'Earned logistics revenue under SAC 9968' },
       { code: '4030', name: 'Convenience & Handling Fee Revenue', category: 'REVENUE', normal: 'CREDIT', desc: 'Platform handling fee under SAC 9985' },
       { code: '5010', name: 'Delivery Rider Logistics Expense', category: 'EXPENSE', normal: 'DEBIT', desc: 'Delivery fare paid to delivery partners' },
       { code: '5020', name: 'Payment Gateway Interchange Fees', category: 'EXPENSE', normal: 'DEBIT', desc: 'Gateway processing costs' },
+      { code: '5030', name: 'COD Cash Variance & Authorized Write-Off Expense', category: 'EXPENSE', normal: 'DEBIT', desc: 'Formally authorized finance write-offs for unrecoverable COD cash shortages' },
     ];
     for (const a of accounts) {
       await client.query(

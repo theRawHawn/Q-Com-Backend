@@ -36,9 +36,11 @@ export async function runSprint7SettlementsTests(): Promise<void> {
   const baseUrl = `http://127.0.0.1:${port}`;
 
   try {
-    // 1. Setup Super Admin
+    // 1. Setup Super Admin & Operations Receiver
     const adminAuth = await authService.adminLogin('EMP-001', process.env.SEED_ADMIN_PASSWORD || 'QcomSeedAdmin#2026', '127.0.0.1', 'AdminPortal', pool);
     const adminToken = adminAuth.accessToken;
+    const opsAuth = await authService.adminLogin('OPS', process.env.SEED_ADMIN_PASSWORD || 'QcomSeedAdmin#2026', '127.0.0.1', 'AdminPortal', pool);
+    const opsToken = opsAuth.accessToken;
 
     // 2. Setup Customer 1 (Buyer)
     const phone1 = '+91-9123456780';
@@ -457,9 +459,9 @@ export async function runSprint7SettlementsTests(): Promise<void> {
     console.log('✓ Test 14 passed: Floating cash ₹2,500 hard ceiling triggers dispatch suspension');
 
     // -------------------------------------------------------------
-    // Test 15: Authoritative Floating Cash (COD) Remittance API
+    // Test 15: Authoritative Floating Cash (COD) 3-Step Remittance API
     // -------------------------------------------------------------
-    console.log('[Test 15] Testing Floating Cash Remittance (/api/v1/settlements/cod/remit)...');
+    console.log('[Test 15] Testing Floating Cash Remittance (/api/v1/settlements/cod/remit -> receive -> verify)...');
     await pool.query(`UPDATE riders SET status = 'SUSPENDED' WHERE id = $1`, [riderAId]);
 
     const remitRes = await fetch(`${baseUrl}/api/v1/settlements/cod/remit`, {
@@ -475,20 +477,51 @@ export async function runSprint7SettlementsTests(): Promise<void> {
       }),
     });
     const remitBody = await remitRes.json();
-    assert.strictEqual(remitRes.status, 200, `Remittance failed: ${JSON.stringify(remitBody)}`);
+    assert.strictEqual(remitRes.status, 200, `Remittance submit failed: ${JSON.stringify(remitBody)}`);
     assert.strictEqual(remitBody.success, true);
+    assert.strictEqual(remitBody.status, 'SUBMITTED');
     assert.strictEqual(remitBody.remittedAmount, 1000.00);
-    assert.strictEqual(remitBody.remainingCash, 1550.00);
-    assert.strictEqual(remitBody.unblocked, true);
+    assert.strictEqual(remitBody.liabilityCleared, false, 'Submission alone must NOT clear COD liability');
+    assert.strictEqual(remitBody.remainingCash, 2550.00, 'Submission alone must NOT reduce floating_cash_balance');
+    assert.strictEqual(remitBody.unblocked, false, 'Submission alone must NOT unblock rider');
+
+    // Step 2: Operations receives handover
+    const receiveRes = await fetch(`${baseUrl}/api/v1/settlements/cod/remittances/${remitBody.remittanceId}/receive`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${opsToken}`,
+      },
+      body: JSON.stringify({ receivedAmount: 1000.00, collectionLocation: 'BLR-HUB-01' }),
+    });
+    const receiveBody = await receiveRes.json();
+    assert.strictEqual(receiveRes.status, 200, `Receive failed: ${JSON.stringify(receiveBody)}`);
+    assert.strictEqual(receiveBody.remittance.status, 'RECEIVED');
+
+    // Step 3: Independent Finance/Super Admin verifies deposited cash -> clears ₹1,000 liability & unblocks rider
+    const verifyRes = await fetch(`${baseUrl}/api/v1/settlements/cod/remittances/${remitBody.remittanceId}/verify`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${adminToken}`,
+      },
+      body: JSON.stringify({ verifiedAmount: 1000.00 }),
+    });
+    const verifyBody = await verifyRes.json();
+    assert.strictEqual(verifyRes.status, 200, `Verify failed: ${JSON.stringify(verifyBody)}`);
+    assert.strictEqual(verifyBody.remittance.status, 'LIABILITY_CLEARED');
+    assert.strictEqual(verifyBody.remittance.clearedAmount, 1000.00);
+    assert.strictEqual(verifyBody.remittance.remainingCash, 1550.00);
+    assert.strictEqual(verifyBody.remittance.unblocked, true);
 
     const remitGl = await pool.query(`
       SELECT account_code, entry_side, amount FROM general_ledger_entries
-      WHERE rider_id = $1 AND transaction_type = 'COD_COLLECTION' AND account_code = '1020'
+      WHERE rider_id = $1 AND transaction_type = 'COD_REMITTANCE' AND account_code = '1020'
       ORDER BY created_at DESC LIMIT 1
     `, [riderAId]);
     assert.ok(remitGl.rows.length > 0);
     assert.strictEqual(parseFloat(remitGl.rows[0].amount), 1000.00);
-    console.log('✓ Test 15 passed: COD cash remittance of ₹1,000 cleared liability and unblocked rider');
+    console.log('✓ Test 15 passed: COD cash 3-step remittance (submit -> receive -> verify) cleared ₹1,000 liability and unblocked rider');
 
     // -------------------------------------------------------------
     // Test 16: Invalid COD Remittance Amount Rejection

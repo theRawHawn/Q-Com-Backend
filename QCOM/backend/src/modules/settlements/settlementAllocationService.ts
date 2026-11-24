@@ -6,6 +6,7 @@ import { taxEngine } from '../pricing/taxEngine.js';
 import { OrderSettlementAllocation } from './settlementTypes.js';
 import { settlementEventPublisher, SettlementDomainEvent } from './settlementEvents.js';
 import { toDecimal, roundCurrency, add, subtract, multiply, divide } from '../pricing/money.js';
+import { codCashAccountabilityService } from './codCashAccountabilityService.js';
 
 export class SettlementAllocationService {
   /**
@@ -325,6 +326,13 @@ export class SettlementAllocationService {
           `Logistics fare and tip credit for completed delivery of order ${order.order_number || orderId}`,
         ]);
 
+        // Lock rider row first under canonical lock order before wallet & COD updates
+        const lockedRiderRes = await client.query(
+          `SELECT id, user_id, floating_cash_balance FROM riders WHERE id = $1 FOR UPDATE`,
+          [riderId]
+        );
+        const lockedRider = lockedRiderRes.rows[0];
+
         // Update rider's wallet balance
         const grossPlusTip = Number(roundCurrency(add(grossRiderFare, customerTip)));
         await client.query(`
@@ -335,33 +343,27 @@ export class SettlementAllocationService {
           WHERE id = $1
         `, [riderId, netRiderPayable, grossPlusTip]);
 
-        // Handle Cash on Delivery floating cash liability
+        // Handle Cash on Delivery floating cash liability authoritatively
         if (isCodOrder) {
           const codAmount = orderTotal;
-          await client.query(`
-            UPDATE riders
-            SET floating_cash_balance = floating_cash_balance + $2,
-                status = CASE WHEN (floating_cash_balance + $2) >= floating_cash_limit THEN 'SUSPENDED' ELSE status END,
-                updated_at = NOW()
-            WHERE id = $1
-          `, [riderId, codAmount]);
-
-          await client.query(`
-            UPDATE delivery_trips
-            SET cod_due_amount = $2,
-                cod_collected_amount = $2,
-                cod_reconciled = TRUE
-            WHERE id = $1
-          `, [trip.id, codAmount]);
-
-          // Record COD collection in ledger
-          await ledgerService.recordCodCollection({
+          await codCashAccountabilityService.recordCodCollection({
             orderId,
-            merchantId: order.merchant_id,
+            tripId: trip.id,
             riderId,
-            amount: codAmount,
+            collectedByUserId: lockedRider?.user_id || null,
+            collectorSource: 'DELIVERY_COMPLETION_SETTLEMENT',
             client,
           });
+
+          const newFloatingCash = roundCurrency(add(lockedRider?.floating_cash_balance || '0.00', codAmount));
+          await client.query(`
+            UPDATE riders
+            SET floating_cash_balance = $2,
+                updated_at = NOW()
+            WHERE id = $1
+          `, [riderId, newFloatingCash]);
+
+          await codCashAccountabilityService.syncRiderCodRestrictionInTx(client, riderId);
         }
       }
 

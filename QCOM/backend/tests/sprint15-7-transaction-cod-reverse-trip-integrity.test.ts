@@ -9,6 +9,7 @@ import { AuthService } from '../src/modules/auth/authService.js';
 import { dispatchService } from '../src/modules/dispatch/dispatchService.js';
 import { candidateGenerator } from '../src/modules/dispatch/candidateGenerator.js';
 import { riderPayoutService } from '../src/modules/settlements/riderPayoutService.js';
+import { codCashAccountabilityService } from '../src/modules/settlements/codCashAccountabilityService.js';
 import { settlementAllocationService } from '../src/modules/settlements/settlementAllocationService.js';
 import { cancellationService } from '../src/modules/orders/cancellationService.js';
 import { returnService } from '../src/modules/orders/returnService.js';
@@ -661,7 +662,7 @@ export async function runSprint15_7TransactionCodReverseTripIntegrityTests(): Pr
     assert.strictEqual(suspDone.status, 200);
     assert.strictEqual(suspDone.data.riderStatus, 'SUSPENDED', 'Rider crossing COD limit must remain SUSPENDED (not reset to IDLE_AT_HUB)');
 
-    // Remit full cash -> unblocks rider back to IDLE_AT_HUB
+    // Remit full cash -> submits awaiting independent receipt & finance verification before unblocking
     const curFloat = Number(
       (await pool.query(`SELECT floating_cash_balance FROM riders WHERE id = $1`, [rider1Id])).rows[0].floating_cash_balance
     );
@@ -671,9 +672,25 @@ export async function runSprint15_7TransactionCodReverseTripIntegrityTests(): Pr
       method: 'UPI',
       reference: `REM_157_${Date.now()}`,
     });
-    assert.strictEqual(remRes.unblocked, true);
-    assert.strictEqual(remRes.remainingCash, 0);
-    console.log('  ✓ Multi-trip guard, offline interlock, COD ceiling suspension preserved & remitted passed');
+    assert.strictEqual(remRes.liabilityCleared, false);
+    assert.strictEqual(remRes.unblocked, false);
+    assert.strictEqual(remRes.remainingCash, curFloat);
+
+    const ops157 = (await pool.query(`SELECT id FROM users WHERE email = 'ops@qcom.local' LIMIT 1`)).rows[0].id as string;
+    const fin157 = (await pool.query(`SELECT id FROM users WHERE email = 'emp-001@qcom.local' LIMIT 1`)).rows[0].id as string;
+    await codCashAccountabilityService.acknowledgeReceipt({
+      remittanceId: remRes.remittanceId,
+      receiverUserId: ops157,
+      receivedAmount: curFloat,
+    });
+    const ver157 = await codCashAccountabilityService.verifyRemittance({
+      remittanceId: remRes.remittanceId,
+      verifierUserId: fin157,
+      verifiedAmount: curFloat,
+    });
+    assert.strictEqual(ver157.unblocked, true);
+    assert.strictEqual(ver157.remainingCash, 0);
+    console.log('  ✓ Multi-trip guard, offline interlock, COD ceiling suspension preserved & 3-step verified passed');
     passed++;
 
     // =========================================================================

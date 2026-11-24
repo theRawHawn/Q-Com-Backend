@@ -1,7 +1,7 @@
 # QCOM Automated Testing Architecture & Suite Guide (TESTING)
 
 **Test Framework:** Node.js Native Test Runner / `tsx` Execution  
-**Current Test Coverage:** 56 Comprehensive Test Suites  
+**Current Test Coverage:** 59 Comprehensive Test Suites  
 **Required Real Services:** PostgreSQL 16 (`16.x`) & Redis **7.0.15** (`redis:7.0.15-alpine`)  
 
 ---
@@ -38,7 +38,7 @@ Before running `tests/run-all-tests.ts`, a mandatory preflight check (`verifyRed
 
 ---
 
-## 3. Test Battery Organization & Suite Matrix (56 Suites)
+## 3. Test Battery Organization & Suite Matrix (59 Suites)
 
 | Milestone / Sprint | Suite File | Scope Covered |
 | :--- | :--- | :--- |
@@ -59,13 +59,16 @@ Before running `tests/run-all-tests.ts`, a mandatory preflight check (`verifyRed
 | **PG 16 & Redis 7.0.15 Closure** | `sprint15-2-3-real-pg16-redis7-infrastructure.test.ts`, `sprint15-2-4-inventory-lifecycle-and-financial-integrity.test.ts`, `sprint15-2-5-git-sync-and-financial-integrity-closure.test.ts` | Exact Redis `7.0.15` & PG 16 verification, full inventory & ledger lifecycle |
 | **Security & Access-Control Hardening** | `sprint15-4-security-and-access-control-hardening.test.ts` | Header spoofing, passwordless/auto-create login defense, salted OTP race, `token_version` HTTP/WS enforcement, IDOR across all 4 apps, RBAC escalation, suspension & CORS |
 | **Financial Ledger & Settlement Integrity** | `sprint15-5-financial-ledger-settlement-integrity.test.ts` | PG 16 immutability triggers (`LEDGER_IMMUTABLE`), money validation, concurrent payout race, FIFO partial allocation settlement, post-payout partial/full clawbacks & `1040->2020` offset, post-`PAID` bank reversals, idempotent COD remittance, server-derived COD OTP verification, refund rollback & global trial balance |
+| **Transaction, COD & Reverse-Trip Integrity** | `sprint15-7-transaction-cod-reverse-trip-integrity.test.ts` | Reverse logistics trip uniqueness, concurrent OTP completion & rollback recovery, lock-free external refund boundary, strict GPS candidate filtering |
+| **Gateway-Agnostic Payment Infrastructure** | `sprint15-8-gateway-agnostic-payment-infrastructure.test.ts` | PaymentProvider boundary (`DisabledPaymentProvider`), CAS state machine, PG-backed idempotency keys, multi-partial refund ceilings, reconciliation discrepancies & recovery escalation |
+| **COD Cash Accountability & Reconciliation** | `sprint15-9-cod-cash-accountability.test.ts` | Server-derived `cod_collections`, COD return refund GL (`1020`), decimal metrics A–H, ceiling blocking/overrides, 3-stage remittance SoD (`submitted <> received <> verified`), shortage/excess disputes, reversals, COD reconciliation checks 13–13F, Redis fail-closed rate limiting |
 
 ---
 
 ## 4. Test Isolation & Database Fixtures
 
 - Test suites execute against real PostgreSQL 16 (`qcom_test` or isolated schemas/databases) and real Redis **7.0.15**.
-- Migrations `001`–`027` are applied in order using PostgreSQL advisory locks (`pg_advisory_lock`).
+- Migrations `001`–`030` are applied in order using PostgreSQL advisory locks (`pg_advisory_lock`).
 - Fixtures and initial seeds (`runSeeds()`) establish baseline roles, permissions, chart of accounts, statutory tax rules, and test merchants (including `EMP-001` with non-production Scrypt seed password `SEED_ADMIN_PASSWORD`).
-- GitHub Actions CI (`.github/workflows/ci.yml`) provisions PostgreSQL 16 and `redis:7.0.15-alpine`, runs `verify-redis-version.ts`, applies migrations `001`–`027`, runs `seed.ts`, executes all 56 backend test suites (`run-all-tests.ts`), executes `npm --prefix QCOM/backend run test:integration:real-services` against isolated containers (`postgres:16.6-alpine` & `redis:7.0.15-alpine`), and validates `tsc --noEmit`, `npm run lint`, and builds.
+- GitHub Actions CI (`.github/workflows/ci.yml`) provisions PostgreSQL 16 and `redis:7.0.15-alpine`, runs `verify-redis-version.ts`, applies migrations `001`–`030`, runs `seed.ts`, executes all 59 backend test suites (`run-all-tests.ts`), executes `npm --prefix QCOM/backend run test:integration:real-services` against isolated containers (`postgres:16.6-alpine` & `redis:7.0.15-alpine`), and validates `tsc --noEmit`, `npm run lint`, and builds.
 

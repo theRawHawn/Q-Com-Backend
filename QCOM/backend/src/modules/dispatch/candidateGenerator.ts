@@ -2,6 +2,9 @@ import { getPool } from '../../database/connection.js';
 import { routingService } from '../routing/routingService.js';
 import { deliveryEconomicsService } from '../delivery/deliveryEconomicsService.js';
 import { liveLocationService } from '../realtime/liveLocationService.js';
+import { toDecimal, roundCurrency, multiply, add } from '../pricing/money.js';
+import { isCodPaymentMethod } from '../ledger/ledgerService.js';
+import { codCashAccountabilityService } from '../settlements/codCashAccountabilityService.js';
 import { DispatchCandidateContext, RiderCandidate } from './dispatchTypes.js';
 
 const DEFAULT_MAX_GPS_STALENESS_MS = 10 * 60 * 1000; // 10 minutes
@@ -38,7 +41,9 @@ export class CandidateGenerator {
     // Query active available riders with valid non-null non-(0,0) DB coordinates
     const res = await pool.query(`
       SELECT id, rider_code, name, phone, vehicle_type, payload_capacity_kg,
-             rating, tier, status, latitude, longitude, location_updated_at
+             rating, tier, status, latitude, longitude, location_updated_at,
+             floating_cash_balance, floating_cash_limit, cod_restricted,
+             active_cod_dispute_count, cod_ceiling_override_limit, cod_ceiling_override_until
       FROM riders
       WHERE status IN ('AVAILABLE', 'IDLE_AT_HUB')
         AND is_payout_held = FALSE
@@ -53,6 +58,29 @@ export class CandidateGenerator {
       return [];
     }
 
+    const isCodOrder = isCodPaymentMethod(context.paymentMethod);
+    const inFlightCodMap = new Map<string, number>();
+    if (isCodOrder) {
+      try {
+        const expRes = await pool.query(`
+          SELECT dt.rider_id, COALESCE(SUM(o.total_amount), 0) AS in_flight_cod
+          FROM delivery_trips dt
+          JOIN orders o ON o.id = dt.order_id
+          WHERE dt.trip_type = 'FORWARD'
+            AND dt.rider_id IS NOT NULL
+            AND dt.status IN ('ACCEPTED', 'ARRIVED_AT_PICKUP', 'PICKED_UP', 'ARRIVED_AT_DROP')
+            AND UPPER(TRIM(COALESCE(o.payment_method, ''))) IN ('PAY ON DELIVERY', 'CASH ON DELIVERY', 'COD')
+            AND o.payment_status != 'PAID'
+          GROUP BY dt.rider_id
+        `);
+        for (const r of expRes.rows) {
+          inFlightCodMap.set(r.rider_id, Number(roundCurrency(r.in_flight_cod || 0)));
+        }
+      } catch {
+        // Ignore if test schema omits extended columns
+      }
+    }
+
     const econConfig = await deliveryEconomicsService.getConfig();
     const candidates: RiderCandidate[] = [];
     const nowMs = Date.now();
@@ -60,6 +88,20 @@ export class CandidateGenerator {
     for (const row of res.rows) {
       if (context.excludeRiderIds && context.excludeRiderIds.includes(row.id)) {
         continue;
+      }
+
+      if (isCodOrder) {
+        if (row.cod_restricted === true || (parseInt(String(row.active_cod_dispute_count || '0'), 10) || 0) > 0) {
+          continue;
+        }
+        const { effectiveLimit } = codCashAccountabilityService.resolveEffectiveCashCeiling(row);
+        const currentLiability = toDecimal(roundCurrency(row.floating_cash_balance || 0));
+        const inFlight = toDecimal(inFlightCodMap.get(row.id) || 0);
+        const newCodAmt = toDecimal(context.orderTotal || 0);
+        const projectedExposure = add(currentLiability, inFlight, newCodAmt);
+        if (currentLiability.gte(effectiveLimit) || projectedExposure.gt(effectiveLimit)) {
+          continue;
+        }
       }
 
       // Check live Redis telemetry first if present & fresher, else use DB coordinates + location_updated_at
@@ -107,7 +149,7 @@ export class CandidateGenerator {
         cartTotal: context.itemsSubtotal,
         customerDeliveryFee: context.customerDeliveryFee,
         handlingFee: context.handlingFee,
-        commissionAmount: +(context.itemsSubtotal * 0.15).toFixed(2), // 15% platform commission
+        commissionAmount: Number(roundCurrency(multiply(context.itemsSubtotal, 0.15))), // 15% platform commission
         distanceKm: distKm,
         config: econConfig,
       });

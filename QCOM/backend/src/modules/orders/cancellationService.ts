@@ -5,6 +5,7 @@ import { dispatchService } from '../dispatch/dispatchService.js';
 import { refundService, PreparedRefundIntent, RefundRecord } from '../payments/refundService.js';
 import { outboxService } from '../outbox/outboxService.js';
 import { transitionPaymentIntentState, transitionPaymentAttemptState } from '../payments/paymentStateMachine.js';
+import { isCodPaymentMethod } from '../ledger/ledgerService.js';
 
 export interface CancellationResult {
   order: any;
@@ -126,7 +127,7 @@ export class CancellationService {
 
       let preparedRefund: PreparedRefundIntent | undefined;
       const reasonCode = `ORDER_CANCELLED_${cancelledBy}`;
-      if (o.payment_status === 'PAID') {
+      if (o.payment_status === 'PAID' && !isCodPaymentMethod(o.payment_method)) {
         preparedRefund = await refundService.prepareRefundIntent(
           {
             orderId,
@@ -467,7 +468,7 @@ export class CancellationService {
     await this.restoreOrderInventory(o, client);
 
     let refundRecord: RefundRecord | undefined;
-    if (o.payment_status === 'PAID') {
+    if (o.payment_status === 'PAID' && !isCodPaymentMethod(o.payment_method)) {
       const refundRes = await refundService.createRefund({
         orderId,
         amount: totalAmount,

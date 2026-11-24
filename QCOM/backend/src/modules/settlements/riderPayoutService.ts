@@ -8,6 +8,7 @@ import { RiderEarningsStatement, PayoutResult } from './settlementTypes.js';
 import { settlementEventPublisher, SettlementDomainEvent } from './settlementEvents.js';
 import { isTransientFailure } from '../resilience/retryPolicy.js';
 import { add, toDecimal, roundCurrency } from '../pricing/money.js';
+import { codCashAccountabilityService } from './codCashAccountabilityService.js';
 
 export class AsyncKeyedMutex {
   private queues = new Map<string, Promise<void>>();
@@ -49,6 +50,8 @@ export class RiderPayoutService {
     const riderRes = await pool.query(`
       SELECT id, name, phone, pan_number, pan_status, kyc_status,
              wallet_balance, floating_cash_balance, floating_cash_limit,
+             cod_restricted, cod_restriction_reason, active_cod_dispute_count,
+             cod_ceiling_override_limit, cod_ceiling_override_until,
              status, is_payout_held, payout_hold_reason,
              upi_vpa, bank_account_number, bank_ifsc
       FROM riders
@@ -112,8 +115,10 @@ export class RiderPayoutService {
 
     const totalPaidOut = Number(roundCurrency(toDecimal(payoutRes.rows[0].total_paid_out)));
     const floatingCashBn = toDecimal(r.floating_cash_balance || '0.00');
-    const floatingLimitBn = toDecimal(r.floating_cash_limit || '2500.00');
-    const isDispatchBlocked = floatingCashBn.gte(floatingLimitBn) || r.status === 'SUSPENDED';
+    const { effectiveLimit } = codCashAccountabilityService.resolveEffectiveCashCeiling(r);
+    const activeDisputes = parseInt(String(r.active_cod_dispute_count || '0'), 10) || 0;
+    const isDispatchBlocked =
+      floatingCashBn.gte(effectiveLimit) || Boolean(r.cod_restricted) || activeDisputes > 0 || r.status === 'SUSPENDED';
 
     return {
       riderId: r.id,
@@ -123,7 +128,7 @@ export class RiderPayoutService {
       kycStatus: r.kyc_status,
       walletBalance: Number(roundCurrency(toDecimal(r.wallet_balance || '0.00'))),
       floatingCashBalance: Number(roundCurrency(floatingCashBn)),
-      floatingCashLimit: Number(roundCurrency(floatingLimitBn)),
+      floatingCashLimit: effectiveLimit,
       isDispatchBlocked,
       upiVpa: r.upi_vpa || undefined,
       bankDetails: {
@@ -283,6 +288,12 @@ export class RiderPayoutService {
 
       if (rider.is_payout_held) {
         throw new Error(`PAYOUT_HELD: Payouts for rider '${riderId}' are held: ${rider.payout_hold_reason || 'Compliance review'}`);
+      }
+
+      if ((parseInt(String(rider.active_cod_dispute_count || '0'), 10) || 0) > 0) {
+        throw new Error(
+          `PAYOUT_HELD: Payouts for rider '${riderId}' are temporarily held while open COD cash shortage/accountability disputes exist.`
+        );
       }
 
       const currentWalletBn = toDecimal(rider.wallet_balance || '0.00');
@@ -792,140 +803,79 @@ export class RiderPayoutService {
   }
 
   /**
-   * Deducts floating cash liability, records general ledger transfer, and unblocks suspended rider
+   * Submits a rider COD cash remittance request for physical receipt & independent finance verification.
+   * Security invariant: Does NOT self-clear liability, post GL clearance, or unblock the rider.
+   * Liability clears strictly upon independent two-step receipt acknowledgment + verification.
    */
   public async remitCodCash(params: {
     riderId: string;
     amount: number;
-    method?: 'UPI' | 'HUB';
+    method?: string;
     reference?: string;
-  }): Promise<{ success: boolean; remittedAmount: number; remainingCash: number; unblocked: boolean }> {
-    const { riderId, amount, method = 'UPI', reference } = params;
-
-    let bn;
-    try {
-      bn = toDecimal(amount);
-    } catch {
-      throw new Error('INVALID_REMITTANCE_AMOUNT: Remittance amount must be a valid finite number.');
+    idempotencyKey?: string;
+    collectionLocation?: string;
+    evidenceReference?: string;
+    collectionIds?: string[];
+    orderIds?: string[];
+    submittedByUserId?: string;
+  }): Promise<{
+    success: boolean;
+    remittanceId: string;
+    remittanceReference: string;
+    status: string;
+    remittedAmount: number;
+    remainingCash: number;
+    liabilityCleared: boolean;
+    unblocked: boolean;
+    idempotentReplay: boolean;
+    allocatedCollections: Array<{ collectionId: string; orderId: string; allocatedAmount: number }>;
+  }> {
+    const pool = getPool();
+    let actorUserId: string = params.submittedByUserId || '';
+    if (!actorUserId) {
+      const rRow = await pool.query(`SELECT user_id FROM riders WHERE id = $1 LIMIT 1`, [params.riderId]);
+      if (rRow.rows.length === 0) {
+        throw new Error(`RIDER_NOT_FOUND: Rider '${params.riderId}' does not exist.`);
+      }
+      actorUserId = rRow.rows[0].user_id || params.riderId;
     }
-    if (bn.lte(0)) {
-      throw new Error(`INVALID_REMITTANCE_AMOUNT: Remittance amount must be greater than zero.`);
-    }
-    const remittedAmount = Number(roundCurrency(bn));
 
-    const stagedEvents: SettlementDomainEvent[] = [];
+    const methodMap: Record<string, string> = {
+      HUB: 'CASH_HUB',
+      CASH: 'CASH_HUB',
+      CASH_HUB: 'CASH_HUB',
+      UPI: 'UPI',
+      BANK: 'BANK',
+      KIOSK: 'KIOSK',
+      DEPOSIT_SLIP: 'DEPOSIT_SLIP',
+    };
+    const normalizedMethod = methodMap[String(params.method || 'UPI').toUpperCase()] || String(params.method || 'UPI').toUpperCase();
 
-    const result = await transaction(async (client) => {
-      // 1. Lock rider
-      const riderRes = await client.query(`
-        SELECT * FROM riders
-        WHERE id = $1
-        FOR UPDATE
-      `, [riderId]);
-
-      if (riderRes.rows.length === 0) {
-        throw new Error(`RIDER_NOT_FOUND: Rider '${riderId}' does not exist.`);
-      }
-
-      const rider = riderRes.rows[0];
-      const floatingCashBn = toDecimal(rider.floating_cash_balance || '0.00');
-      const floatingCash = Number(roundCurrency(floatingCashBn));
-
-      // Idempotent retry check when explicit reference is supplied
-      if (reference) {
-        const existingRemitRes = await client.query(
-          `SELECT rider_id, amount FROM general_ledger_entries WHERE transaction_reference = $1 LIMIT 1`,
-          [`TX_COD_REMIT_${reference}`]
-        );
-        if (existingRemitRes.rows.length > 0) {
-          const existingRow = existingRemitRes.rows[0];
-          if (existingRow.rider_id !== riderId) {
-            throw new Error(
-              `COD_REFERENCE_CONFLICT: COD remittance reference '${reference}' already belongs to a different rider.`
-            );
-          }
-          if (!toDecimal(existingRow.amount).eq(toDecimal(remittedAmount))) {
-            throw new Error(
-              `COD_REFERENCE_AMOUNT_MISMATCH: COD remittance reference '${reference}' was previously recorded for ₹${roundCurrency(existingRow.amount)}, cannot reuse for ₹${roundCurrency(remittedAmount)}.`
-            );
-          }
-          return {
-            success: true,
-            remittedAmount,
-            remainingCash: floatingCash,
-            unblocked: rider.status !== 'SUSPENDED',
-          };
-        }
-      }
-
-      const remittedAmountBn = toDecimal(remittedAmount);
-      if (remittedAmountBn.gt(floatingCashBn)) {
-        throw new Error(`INVALID_REMITTANCE_AMOUNT: Remittance amount ₹${remittedAmount} exceeds current floating cash ₹${floatingCash}.`);
-      }
-
-      const remainingCashBn = floatingCashBn.minus(remittedAmountBn);
-      const remainingCash = Number(roundCurrency(remainingCashBn));
-      const remitRef = reference || `REMIT_COD_${Date.now()}_${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
-
-      // 2. Post double-entry general ledger batch (Dr 1020 Bank Account, Cr 1030 Floating Cash)
-      await ledgerService.recordRiderCodRemittance({
-        riderId,
-        amount: remittedAmount,
-        reference: remitRef,
-        client,
-      });
-
-      // 3. Post Subledger entry in rider_ledgers
-      const currentWallet = Number(roundCurrency(toDecimal(rider.wallet_balance || '0.00')));
-      await client.query(`
-        INSERT INTO rider_ledgers (
-          rider_id, entry_type, category, amount, running_balance, description
-        )
-        VALUES ($1, 'COD_DEDUCTION', 'DEBIT', $2, $3, $4)
-      `, [
-        riderId,
-        remittedAmount,
-        currentWallet,
-        `Remittance of physical COD cash via ${method} (Ref: ${remitRef})`,
-      ]);
-
-      // 4. Update rider floating cash and unblock if below ceiling
-      const floatingLimitBn = toDecimal(rider.floating_cash_limit || '2500.00');
-      const unblocked = remainingCashBn.lt(floatingLimitBn) && rider.status === 'SUSPENDED';
-
-      await client.query(`
-        UPDATE riders
-        SET floating_cash_balance = $2,
-            status = CASE WHEN $3 = TRUE THEN 'IDLE_AT_HUB' ELSE status END,
-            updated_at = NOW()
-        WHERE id = $1
-      `, [riderId, remainingCash, unblocked]);
-
-      // 5. Stage Post-Commit Event
-      stagedEvents.push(
-        settlementEventPublisher.createEvent('RiderCodRemitted', {
-          riderId,
-          remittedAmount,
-          remainingCash,
-          unblocked,
-          method,
-          reference: remitRef,
-        })
-      );
-
-      return {
-        success: true,
-        remittedAmount,
-        remainingCash,
-        unblocked,
-      };
+    const submitted = await codCashAccountabilityService.submitRemittance({
+      riderId: params.riderId,
+      amount: params.amount,
+      method: normalizedMethod,
+      reference: params.reference,
+      idempotencyKey: params.idempotencyKey,
+      collectionLocation: params.collectionLocation,
+      evidenceReference: params.evidenceReference,
+      collectionIds: params.collectionIds,
+      orderIds: params.orderIds,
+      submittedByUserId: actorUserId,
     });
 
-    if (stagedEvents.length > 0) {
-      settlementEventPublisher.publishAll(stagedEvents);
-    }
-
-    return result;
+    return {
+      success: true,
+      remittanceId: submitted.remittanceId,
+      remittanceReference: submitted.remittanceReference,
+      status: submitted.status,
+      remittedAmount: submitted.submittedAmount,
+      remainingCash: submitted.remainingCash,
+      liabilityCleared: submitted.liabilityCleared,
+      unblocked: submitted.unblocked,
+      idempotentReplay: submitted.idempotentReplay,
+      allocatedCollections: submitted.allocatedCollections,
+    };
   }
 }
 

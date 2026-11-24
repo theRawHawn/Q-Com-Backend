@@ -36,6 +36,7 @@ import { ledgerService } from '../src/modules/ledger/ledgerService.js';
 import { settlementAllocationService } from '../src/modules/settlements/settlementAllocationService.js';
 import { SellerSettlementService, sellerSettlementService } from '../src/modules/settlements/sellerSettlementService.js';
 import { RiderPayoutService, riderPayoutService } from '../src/modules/settlements/riderPayoutService.js';
+import { codCashAccountabilityService } from '../src/modules/settlements/codCashAccountabilityService.js';
 import { roundCurrency } from '../src/modules/pricing/money.js';
 import { RefundService, refundService } from '../src/modules/payments/refundService.js';
 import { cancellationService } from '../src/modules/orders/cancellationService.js';
@@ -607,14 +608,34 @@ export async function runSprint15_5FinancialLedgerSettlementIntegrityTests(): Pr
 
     const remitRef = `REMIT_IDEM_${Date.now()}`;
     const rem1 = await riderPayoutService.remitCodCash({ riderId, amount: 2600, method: 'UPI', reference: remitRef });
-    assert.strictEqual(rem1.unblocked, true);
-    assert.strictEqual(rem1.remainingCash, 0);
+    assert.strictEqual(rem1.status, 'SUBMITTED');
+    assert.strictEqual(rem1.liabilityCleared, false, 'Submission alone must NOT clear COD liability');
+    assert.strictEqual(rem1.unblocked, false);
+    assert.strictEqual(rem1.remainingCash, 2600);
 
-    // Retry exact same reference -> must return idempotent success without throwing or deducting negative cash!
+    // Retry exact same reference -> must return idempotent success without duplicating remittance!
     const rem2 = await riderPayoutService.remitCodCash({ riderId, amount: 2600, method: 'UPI', reference: remitRef });
     assert.strictEqual(rem2.success, true);
-    assert.strictEqual(rem2.remainingCash, 0);
-    console.log('  ✓ COD ceiling suspension, unblocking, and idempotent remittance retry verified');
+    assert.strictEqual(rem2.idempotentReplay, true);
+    assert.strictEqual(rem2.remainingCash, 2600);
+
+    // Independent Operations receipt + Finance verification clears liability & unblocks rider
+    const opsUser155 = (await realPool.query(`SELECT id FROM users WHERE email = 'ops@qcom.local' LIMIT 1`)).rows[0].id as string;
+    const finUser155 = (await realPool.query(`SELECT id FROM users WHERE email = 'emp-001@qcom.local' LIMIT 1`)).rows[0].id as string;
+    await codCashAccountabilityService.acknowledgeReceipt({
+      remittanceId: rem1.remittanceId,
+      receiverUserId: opsUser155,
+      receivedAmount: 2600,
+    });
+    const ver155 = await codCashAccountabilityService.verifyRemittance({
+      remittanceId: rem1.remittanceId,
+      verifierUserId: finUser155,
+      verifiedAmount: 2600,
+    });
+    assert.strictEqual(ver155.status, 'LIABILITY_CLEARED');
+    assert.strictEqual(ver155.unblocked, true);
+    assert.strictEqual(ver155.remainingCash, 0);
+    console.log('  ✓ COD ceiling suspension, 3-step verification unblocking, and idempotent remittance retry verified');
     totalPassed++;
 
     // -------------------------------------------------------------------------

@@ -139,6 +139,13 @@ export interface PaymentObservabilityCounters {
   refundUnknown: number;
   reconciliationDiscrepancies: number;
   recoveryEscalations: number;
+  codCollectionsRecorded: number;
+  codRemittancesSubmitted: number;
+  codRemittancesVerified: number;
+  codShortagesDetected: number;
+  codExcessDetected: number;
+  codDisputesOpened: number;
+  codDisputesResolved: number;
 }
 
 class PaymentObservabilityLogger {
@@ -154,6 +161,13 @@ class PaymentObservabilityLogger {
     refundUnknown: 0,
     reconciliationDiscrepancies: 0,
     recoveryEscalations: 0,
+    codCollectionsRecorded: 0,
+    codRemittancesSubmitted: 0,
+    codRemittancesVerified: 0,
+    codShortagesDetected: 0,
+    codExcessDetected: 0,
+    codDisputesOpened: 0,
+    codDisputesResolved: 0,
   };
 
   private recentExceptions: PaymentExceptionRecord[] = [];
@@ -230,6 +244,11 @@ class PaymentObservabilityLogger {
       requiresReviewRefunds: number;
       openReconciliationDiscrepancies: number;
       requiresReviewDiscrepancies: number;
+      codPendingRemittances: number;
+      codStuckRemittances: number;
+      codOpenDisputes: number;
+      codRestrictedRiders: number;
+      codDiscrepancies: number;
     };
     recentExceptions: PaymentExceptionRecord[];
   }> {
@@ -253,6 +272,11 @@ class PaymentObservabilityLogger {
       requiresReviewRefunds,
       openReconciliationDiscrepancies,
       requiresReviewDiscrepancies,
+      codPendingRemittances,
+      codStuckRemittances,
+      codOpenDisputes,
+      codRestrictedRiders,
+      codDiscrepancies,
     ] = await Promise.all([
       safeCount(`SELECT COUNT(*) AS cnt FROM payment_intents WHERE status IN ('CREATED', 'INITIATED', 'PENDING', 'PROCESSING', 'AUTHORIZED')`),
       safeCount(`SELECT COUNT(*) AS cnt FROM payment_intents WHERE status IN ('UNKNOWN', 'RECONCILIATION_REQUIRED')`),
@@ -262,6 +286,11 @@ class PaymentObservabilityLogger {
       safeCount(`SELECT COUNT(*) AS cnt FROM refunds WHERE status = 'REQUIRES_REVIEW' OR requires_manual_review = TRUE`),
       safeCount(`SELECT COUNT(*) AS cnt FROM reconciliation_discrepancies WHERE status = 'OPEN'`),
       safeCount(`SELECT COUNT(*) AS cnt FROM reconciliation_discrepancies WHERE status = 'REQUIRES_REVIEW'`),
+      safeCount(`SELECT COUNT(*) AS cnt FROM cod_remittances WHERE status IN ('SUBMITTED', 'RECEIVED', 'VERIFICATION_PENDING')`),
+      safeCount(`SELECT COUNT(*) AS cnt FROM cod_remittances WHERE status IN ('SUBMITTED', 'RECEIVED', 'VERIFICATION_PENDING') AND created_at < NOW() - INTERVAL '4 hours'`),
+      safeCount(`SELECT COUNT(*) AS cnt FROM cod_cash_disputes WHERE status IN ('OPEN', 'UNDER_INVESTIGATION', 'ESCALATED')`),
+      safeCount(`SELECT COUNT(*) AS cnt FROM riders WHERE cod_restricted = TRUE`),
+      safeCount(`SELECT COUNT(*) AS cnt FROM reconciliation_discrepancies WHERE status IN ('OPEN', 'REQUIRES_REVIEW') AND (category LIKE '%COD%' OR category LIKE 'RIDER_CASH%')`),
     ]);
 
     return {
@@ -275,6 +304,11 @@ class PaymentObservabilityLogger {
         requiresReviewRefunds,
         openReconciliationDiscrepancies,
         requiresReviewDiscrepancies,
+        codPendingRemittances,
+        codStuckRemittances,
+        codOpenDisputes,
+        codRestrictedRiders,
+        codDiscrepancies,
       },
       recentExceptions: this.getRecentExceptions(50),
     };

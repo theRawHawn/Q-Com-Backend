@@ -3,6 +3,7 @@ import { constantTimeCompare } from '../auth/crypto.js';
 import { recordAuditEvent } from '../audit/auditService.js';
 import { settlementAllocationService } from '../settlements/settlementAllocationService.js';
 import { liveLocationService } from '../realtime/liveLocationService.js';
+import { add, subtract, toDecimal, roundCurrency } from '../pricing/money.js';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const COD_PAYMENT_METHODS = new Set(['pay on delivery', 'cod', 'cash on delivery']);
@@ -336,8 +337,17 @@ export class DeliveryCompletionService {
     taskId: string;
     otp: string;
     cashCollected?: unknown;
+    allowPartial?: boolean;
     actor: TripTaskActor;
   }): Promise<DeliveryCompletionResult> {
+    if (params.allowPartial === true) {
+      throw new DeliveryTaskError(
+        400,
+        'PARTIAL_COD_NOT_SUPPORTED',
+        'Partial COD cash collection is not supported; full authoritative order total must be collected.'
+      );
+    }
+
     if (!params.otp || typeof params.otp !== 'string' || params.otp.trim().length === 0) {
       throw new DeliveryTaskError(400, 'MISSING_OTP', 'Delivery OTP is required.');
     }
@@ -458,22 +468,24 @@ export class DeliveryCompletionService {
           throw new DeliveryTaskError(400, 'INVALID_OTP', 'Invalid delivery OTP provided.');
         }
 
-        const authoritativeOrderTotal = +parseFloat(order.total_amount || '0').toFixed(2);
+        const authOrderTotalBn = toDecimal(roundCurrency(order.total_amount || '0'));
+        const authoritativeOrderTotal = Number(roundCurrency(authOrderTotalBn));
         const authoritativeCodAmount = isCodOrder ? authoritativeOrderTotal : 0;
 
         if (params.cashCollected !== undefined && params.cashCollected !== null) {
-          const clientCash = Number(params.cashCollected);
-          if (Math.abs(clientCash - authoritativeCodAmount) > 0.01) {
+          const clientCashBn = toDecimal(roundCurrency(params.cashCollected as any));
+          if (subtract(clientCashBn, authoritativeCodAmount).abs().gt(0.01)) {
             tamperedCodAudit = {
               tripId: trip.id,
               orderId: order.id,
-              clientAmount: clientCash,
+              clientAmount: Number(roundCurrency(clientCashBn)),
               authoritativeAmount: authoritativeCodAmount,
             };
           }
         }
 
-        // Complete trip & order atomically inside the SAME transaction as settlement allocation
+        // Complete trip & order atomically inside the SAME transaction as settlement allocation.
+        // Note: cod_reconciled remains FALSE upon doorstep collection; it flips to TRUE only upon verified COD remittance clearance.
         await client.query(
           `UPDATE delivery_trips
            SET status = 'DELIVERED',
@@ -481,7 +493,7 @@ export class DeliveryCompletionService {
                otp_verified = TRUE,
                cod_due_amount = $1,
                cod_collected_amount = $1,
-               cod_reconciled = TRUE,
+               cod_reconciled = FALSE,
                updated_at = NOW()
            WHERE id = $2`,
           [authoritativeCodAmount, trip.id]
@@ -534,8 +546,8 @@ export class DeliveryCompletionService {
 
           const riderRow = riderStateRes.rows[0];
           resultingRiderStatus = riderRow.status;
-          authoritativeWalletBalance = +parseFloat(riderRow.wallet_balance || '0').toFixed(2);
-          authoritativeFloatingCashBalance = +parseFloat(riderRow.floating_cash_balance || '0').toFixed(2);
+          authoritativeWalletBalance = Number(roundCurrency(riderRow.wallet_balance || '0'));
+          authoritativeFloatingCashBalance = Number(roundCurrency(riderRow.floating_cash_balance || '0'));
 
           if (riderRow.status !== 'SUSPENDED') {
             const otherActiveTripsRes = await client.query(
@@ -568,9 +580,9 @@ export class DeliveryCompletionService {
           completedDeliveriesToday = Math.max(1, parseInt(dCountRes.rows[0]?.cnt || '1', 10));
         }
 
-        const basePay = +parseFloat(String(trip.base_fare ?? '0')).toFixed(2);
-        const distPay = +parseFloat(String(trip.distance_fare ?? '0')).toFixed(2);
-        const surgePay = +(parseFloat(String(trip.surge_fare ?? '0')) + parseFloat(String(trip.wait_time_compensation ?? '0'))).toFixed(2);
+        const basePay = Number(roundCurrency(trip.base_fare ?? '0'));
+        const distPay = Number(roundCurrency(trip.distance_fare ?? '0'));
+        const surgePay = Number(roundCurrency(add(trip.surge_fare ?? '0', trip.wait_time_compensation ?? '0')));
         const tips = allocation.customerTip;
         const tds = allocation.riderTdsAmount;
         const totalCredited = allocation.netRiderPayable;

@@ -9,6 +9,7 @@ import { riderPayoutService } from '../settlements/riderPayoutService.js';
 import { transitionPaymentIntentState } from '../payments/paymentStateMachine.js';
 import { paymentLogger } from '../payments/paymentLogger.js';
 import { paymentReconciliationService } from '../reconciliation/paymentReconciliationService.js';
+import { codCashAccountabilityService } from '../settlements/codCashAccountabilityService.js';
 
 function computeWorkerBackoff(attempts: number): Date {
   const exp = Math.min(Math.max(attempts, 1), 8);
@@ -23,6 +24,7 @@ export interface RecoveryWorkerOptions {
   maxAttempts?: number;
   batchSize?: number;
   maxAgeHours?: number;
+  codRemittanceStaleSec?: number;
 }
 
 export interface RecoveryWorkerStats {
@@ -67,6 +69,7 @@ export class FinancialRecoveryWorker {
   private maxAttempts: number;
   private batchSize: number;
   private maxAgeHours: number;
+  private codRemittanceStaleSec: number;
 
   private stats: RecoveryWorkerStats = {
     runs: 0,
@@ -88,6 +91,7 @@ export class FinancialRecoveryWorker {
     this.maxAttempts = options?.maxAttempts ?? 10;
     this.batchSize = options?.batchSize ?? 10;
     this.maxAgeHours = options?.maxAgeHours ?? 24;
+    this.codRemittanceStaleSec = options?.codRemittanceStaleSec ?? 4 * 3600;
   }
 
   public getStats(): RecoveryWorkerStats {
@@ -115,6 +119,7 @@ export class FinancialRecoveryWorker {
       if (options.maxAttempts !== undefined) this.maxAttempts = options.maxAttempts;
       if (options.batchSize !== undefined) this.batchSize = options.batchSize;
       if (options.maxAgeHours !== undefined) this.maxAgeHours = options.maxAgeHours;
+      if (options.codRemittanceStaleSec !== undefined) this.codRemittanceStaleSec = options.codRemittanceStaleSec;
     }
 
     this.isRunning = true;
@@ -214,6 +219,15 @@ export class FinancialRecoveryWorker {
         this.stats.errors++;
         summary.errors.push(`Payment recovery error: ${err.message}`);
         console.error('[FinancialRecoveryWorker] Payment recovery cycle error:', err.message);
+      }
+
+      // 5. Monitor COD Remittance Staleness & Expired Ceiling Overrides (Sprint 15.9)
+      try {
+        await this.monitorCodRemittancesAndOverrides(summary);
+      } catch (err: any) {
+        this.stats.errors++;
+        summary.errors.push(`COD monitoring error: ${err.message}`);
+        console.error('[FinancialRecoveryWorker] COD monitoring cycle error:', err.message);
       }
 
       return summary;
@@ -797,6 +811,115 @@ export class FinancialRecoveryWorker {
         `, [payoutId, this.workerId]).catch(() => {});
       }
     }
+  }
+
+  /**
+   * Sprint 15.9: Monitors stale unverified COD remittances and expires lapsed ceiling overrides.
+   * Never auto-approves remittances or clears financial liability — escalates to reconciliation_discrepancies
+   * and re-enforces COD restrictions safely when temporary overrides expire.
+   */
+  public async monitorCodRemittancesAndOverrides(summary?: RecoveryCycleSummary): Promise<{
+    expiredOverridesSynced: number;
+    staleRemittancesEscalated: number;
+  }> {
+    const staleCutoff = new Date(Date.now() - this.codRemittanceStaleSec * 1000);
+    let expiredOverridesSynced = 0;
+    const staleRemittancesToEscalate: Array<{
+      id: string;
+      riderId: string;
+      remittanceReference: string;
+      status: string;
+      submittedAmount: number;
+      submittedAt: Date;
+    }> = [];
+
+    try {
+      await transaction(async (client) => {
+        // A. Clear expired COD ceiling overrides and re-sync restriction flags
+        const expiredRiders = await client.query(
+          `SELECT id
+           FROM riders
+           WHERE cod_ceiling_override_until IS NOT NULL
+             AND cod_ceiling_override_until <= NOW()
+           LIMIT $1
+           FOR UPDATE`,
+          [this.batchSize]
+        );
+        for (const r of expiredRiders.rows) {
+          await client.query(
+            `UPDATE riders
+             SET cod_ceiling_override_limit = NULL,
+                 cod_ceiling_override_by = NULL,
+                 cod_ceiling_override_reason = NULL,
+                 cod_ceiling_override_until = NULL,
+                 updated_at = NOW()
+             WHERE id = $1`,
+            [r.id]
+          );
+          await codCashAccountabilityService.syncRiderCodRestrictionInTx(client, r.id);
+          expiredOverridesSynced++;
+        }
+
+        // B. Scan bounded batch of stale unverified COD remittances for operator escalation
+        const staleRems = await client.query(
+          `SELECT id, rider_id, remittance_reference, status, submitted_amount, COALESCE(submitted_at, created_at) AS ref_time
+           FROM cod_remittances
+           WHERE status IN ('SUBMITTED', 'RECEIVED', 'VERIFICATION_PENDING')
+             AND COALESCE(submitted_at, created_at) < $1
+           ORDER BY COALESCE(submitted_at, created_at) ASC
+           LIMIT $2`,
+          [staleCutoff, this.batchSize]
+        );
+        for (const rem of staleRems.rows) {
+          staleRemittancesToEscalate.push({
+            id: rem.id,
+            riderId: rem.rider_id,
+            remittanceReference: rem.remittance_reference,
+            status: rem.status,
+            submittedAmount: parseFloat(rem.submitted_amount),
+            submittedAt: new Date(rem.ref_time),
+          });
+        }
+      });
+    } catch (err: any) {
+      const msg = (err.message || '').toLowerCase();
+      if (msg.includes('does not exist')) {
+        return { expiredOverridesSynced: 0, staleRemittancesEscalated: 0 };
+      }
+      throw err;
+    }
+
+    let staleRemittancesEscalated = 0;
+    for (const rem of staleRemittancesToEscalate) {
+      this.stats.escalations++;
+      if (summary) summary.reconciled.escalated++;
+      paymentLogger.increment('recoveryEscalations');
+      paymentLogger.log('warn', 'COD_STALE_UNVERIFIED_REMITTANCE_ESCALATED', {
+        internalReference: rem.remittanceReference,
+      }, {
+        remittanceId: rem.id,
+        riderId: rem.riderId,
+        status: rem.status,
+        submittedAmount: rem.submittedAmount,
+      });
+      await paymentReconciliationService.recordEscalationDiscrepancy({
+        discrepancyKey: `COD_STALE_UNVERIFIED_REMITTANCE:${rem.id}`,
+        category: 'STALE_UNVERIFIED_COD_REMITTANCE',
+        severity: 'MEDIUM',
+        riderId: rem.riderId,
+        remittanceId: rem.id,
+        expectedAmount: rem.submittedAmount,
+        details: {
+          remittanceReference: rem.remittanceReference,
+          status: rem.status,
+          submittedAt: rem.submittedAt.toISOString(),
+        },
+        triggeredBy: this.workerId,
+      });
+      staleRemittancesEscalated++;
+    }
+
+    return { expiredOverridesSynced, staleRemittancesEscalated };
   }
 }
 

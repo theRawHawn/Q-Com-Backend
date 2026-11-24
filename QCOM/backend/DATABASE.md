@@ -2,7 +2,7 @@
 
 **Engine Requirement:** PostgreSQL 16+  
 **Migration Tool:** Custom Idempotent Advisory-Locked Migrator (`scripts/migrate.ts`)  
-**Migrations Applied:** 001 through 027 (Verified & Tested)  
+**Migrations Applied:** 001 through 030 (Verified & Tested)  
 
 ---
 
@@ -37,6 +37,9 @@
 | **025** | `025_add_outbox_worker_leases.sql` | Durable outbox relay leases across workers |
 | **026** | `026_sprint15_2_capacity_indexes_and_concurrency.sql` | Hot-path indexes and capacity concurrency optimizations |
 | **027** | `027_sprint15_5_financial_ledger_settlement_integrity.sql` | `ledger_journal_batches` atomic claim registry, FIFO `settled_amount` & `refunded_amount` on `order_settlement_allocations`, `seq_no` triggers on `seller_ledgers`/`rider_ledgers`, `REVERSED` status on `seller_payouts`, append-only `UPDATE`/`DELETE`/`TRUNCATE` triggers (`LEDGER_IMMUTABLE`), and `PUBLIC` mutation revocations |
+| **028** | `028_sprint15_7_transaction_cod_reverse_trip_integrity.sql` | Partial unique trip indexes (`uq_delivery_trips_forward_order`, `uq_delivery_trips_reverse_return`, `uq_delivery_trips_active_reverse_order`), GPS candidate index `idx_riders_dispatch_candidates` |
+| **029** | `029_sprint15_8_gateway_agnostic_payment_integrity.sql` | Normalized payment integrity indexes (`uq_payment_intents_single_active_per_order`, `uq_payment_intents_single_captured_per_order`, `uq_payment_attempts_single_active_per_order`, `uq_payment_attempts_single_succeeded_per_order`, `uq_payment_tx_single_capture_per_order`, `uq_payment_receipts_order_success`), `reconciliation_runs`, `reconciliation_discrepancies` |
+| **030** | `030_sprint15_9_cod_cash_accountability.sql` | `cod_collections` (1:1 per COD order), `cod_remittances` with DB `CHECK` separation of duties (`submitted_by <> received_by <> verified_by`), `cod_remittance_allocations`, `cod_cash_disputes`, `riders.cod_restricted` & ceiling override columns, and COA accounts `1050`, `2080`, `5030` |
 
 ---
 
@@ -57,4 +60,6 @@
    User suspension state is stored authoritatively on `users.is_suspended` / `users.suspension_reason`, session versioning on `auth_sessions.token_version`, return requests on `order_returns`, and refund records on `refunds`.
 6. **Append-Only Ledger Immutability & Deterministic Ordering:**  
    PostgreSQL triggers (`fn_prevent_gl_mutation` on `general_ledger_entries`/`ledger_journal_batches`, `fn_prevent_subledger_mutation` on `seller_ledgers`/`rider_ledgers`, and `fn_prevent_ledger_truncate` on all four tables) block historical `UPDATE`, `DELETE`, and `TRUNCATE` mutations with `LEDGER_IMMUTABLE`, reinforced by `REVOKE UPDATE, DELETE, TRUNCATE ... FROM PUBLIC`. Monotonic `seq_no` triggers guarantee deterministic balance snapshot reads even under identical millisecond timestamps. *(Security boundary: while triggers fire for normal SQL sessions, PostgreSQL database owners and superusers technically retain DDL/trigger-disable privileges, so production deployments must connect using a dedicated `NOSUPERUSER` non-owner application role.)*
+7. **COD Cash Custody & Separation-of-Duties Constraints (Migration 030):**  
+   `cod_collections` enforces `UNIQUE (order_id)` and `allocated_amount + cleared_amount <= collected_amount`. `cod_remittances` enforces `chk_cod_remit_receiver_not_submitter`, `chk_cod_remit_verifier_not_submitter`, and `chk_cod_remit_verifier_not_receiver` at the database layer alongside partial idempotency uniqueness `uq_cod_remittances_idempotency`. `cod_cash_disputes` enforces single open shortage/excess dispute per remittance (`uq_cod_disputes_remit_type_open`).
 

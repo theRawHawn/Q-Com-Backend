@@ -12,6 +12,8 @@ import {
   transitionPaymentAttemptState,
 } from '../payments/paymentStateMachine.js';
 import { paymentLogger } from '../payments/paymentLogger.js';
+import { toDecimal, roundCurrency, subtract } from '../pricing/money.js';
+import { codCashAccountabilityService } from '../settlements/codCashAccountabilityService.js';
 
 export type ReconciliationRunType = 'SCHEDULED' | 'MANUAL' | 'ORDER_SCOPED' | 'TEST';
 export type DiscrepancySeverity = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
@@ -35,6 +37,9 @@ export interface DetectedDiscrepancy {
   paymentIntentId?: string | null;
   paymentAttemptId?: string | null;
   refundId?: string | null;
+  riderId?: string | null;
+  remittanceId?: string | null;
+  collectionId?: string | null;
   expectedAmount?: number | null;
   actualAmount?: number | null;
   currency?: string;
@@ -65,13 +70,15 @@ export class PaymentReconciliationService {
       `INSERT INTO reconciliation_discrepancies (
          discrepancy_key, run_id, category, severity, status,
          order_id, payment_intent_id, payment_attempt_id, refund_id,
+         rider_id, remittance_id, collection_id,
          expected_amount, actual_amount, currency, repair_action, details,
          occurrence_count, detected_at, last_seen_at
        )
        VALUES (
          $1, $2, $3, $4, $5,
          $6, $7, $8, $9,
-         $10, $11, $12, $13, $14,
+         $10, $11, $12,
+         $13, $14, $15, $16, $17,
          1, NOW(), NOW()
        )
        ON CONFLICT (discrepancy_key) DO UPDATE SET
@@ -82,6 +89,9 @@ export class PaymentReconciliationService {
            WHEN reconciliation_discrepancies.status = 'RESOLVED' THEN EXCLUDED.status
            ELSE reconciliation_discrepancies.status
          END,
+         rider_id = COALESCE(EXCLUDED.rider_id, reconciliation_discrepancies.rider_id),
+         remittance_id = COALESCE(EXCLUDED.remittance_id, reconciliation_discrepancies.remittance_id),
+         collection_id = COALESCE(EXCLUDED.collection_id, reconciliation_discrepancies.collection_id),
          repair_action = COALESCE(EXCLUDED.repair_action, reconciliation_discrepancies.repair_action),
          expected_amount = COALESCE(EXCLUDED.expected_amount, reconciliation_discrepancies.expected_amount),
          actual_amount = COALESCE(EXCLUDED.actual_amount, reconciliation_discrepancies.actual_amount),
@@ -101,6 +111,9 @@ export class PaymentReconciliationService {
         d.paymentIntentId || null,
         d.paymentAttemptId || null,
         d.refundId || null,
+        d.riderId || null,
+        d.remittanceId || null,
+        d.collectionId || null,
         d.expectedAmount ?? null,
         d.actualAmount ?? null,
         d.currency || 'INR',
@@ -112,7 +125,7 @@ export class PaymentReconciliationService {
   }
 
   /**
-   * Records a standalone operational escalation (e.g., exhausted recovery retries)
+   * Records a standalone operational escalation (e.g., exhausted recovery retries or stale COD remittances)
    * into reconciliation_discrepancies so operators have unified exception tracking.
    */
   public async recordEscalationDiscrepancy(params: {
@@ -122,6 +135,11 @@ export class PaymentReconciliationService {
     orderId?: string | null;
     paymentIntentId?: string | null;
     refundId?: string | null;
+    riderId?: string | null;
+    remittanceId?: string | null;
+    collectionId?: string | null;
+    expectedAmount?: number | null;
+    actualAmount?: number | null;
     details: Record<string, unknown>;
     triggeredBy?: string;
   }): Promise<string | null> {
@@ -142,6 +160,11 @@ export class PaymentReconciliationService {
           orderId: params.orderId || null,
           paymentIntentId: params.paymentIntentId || null,
           refundId: params.refundId || null,
+          riderId: params.riderId || null,
+          remittanceId: params.remittanceId || null,
+          collectionId: params.collectionId || null,
+          expectedAmount: params.expectedAmount ?? null,
+          actualAmount: params.actualAmount ?? null,
           details: params.details,
         });
       });
@@ -469,32 +492,419 @@ export class PaymentReconciliationService {
           });
         }
 
-        // Check 13: Delivered Pay on Delivery orders without COD reconciliation
+        const isMissingCodSchemaError = (err: any): boolean => {
+          const code = String(err?.code || '');
+          const msg = String(err?.message || '').toLowerCase();
+          return (
+            code === '42P01' ||
+            code === '42703' ||
+            msg.includes('cod_collections') && msg.includes('does not exist') ||
+            msg.includes('cod_remittances') && msg.includes('does not exist') ||
+            msg.includes('cod_cash_disputes') && msg.includes('does not exist') ||
+            msg.includes('does not exist') && msg.includes('relation')
+          );
+        };
+
+        // Check 13: Delivered COD orders missing collection records, GL COD_COLLECTION entries, or trip collection amounts
         try {
           const codUnreconciledRes = await client.query(
-            `SELECT o.id AS order_id, o.total_amount, o.payment_status, dt.cod_collected_amount
+            `SELECT o.id AS order_id, o.total_amount, o.payment_status, o.payment_method,
+                    dt.rider_id, dt.cod_collected_amount,
+                    cc.id AS collection_id, cc.collected_amount AS cod_collection_amount
              FROM orders o
-             JOIN delivery_trips dt ON dt.order_id = o.id
-             WHERE o.payment_method = 'Pay on Delivery'
+             LEFT JOIN delivery_trips dt ON dt.order_id = o.id AND dt.trip_type = 'FORWARD'
+             LEFT JOIN cod_collections cc ON cc.order_id = o.id AND cc.status <> 'REVERSED'
+             WHERE LOWER(COALESCE(o.payment_method, '')) IN ('pay on delivery', 'cod', 'cash', 'cash on delivery')
                AND o.status = 'delivered'
-               AND (o.payment_status = 'PENDING' OR COALESCE(dt.cod_collected_amount, 0) < o.total_amount - 0.01)
                ${options.orderId ? 'AND o.id = $1' : ''}`,
             orderFilterParams
           );
+
+          const codGlRes = await client.query(
+            `SELECT order_id, COUNT(*) AS cnt
+             FROM general_ledger_entries
+             WHERE transaction_type = 'COD_COLLECTION'
+               AND order_id IS NOT NULL
+               ${options.orderId ? 'AND order_id = $1' : ''}
+             GROUP BY order_id`,
+            orderFilterParams
+          );
+          const codGlMap = new Map<string, number>();
+          for (const g of codGlRes.rows) {
+            codGlMap.set(String(g.order_id), parseInt(String(g.cnt || '0'), 10) || 0);
+          }
+
           for (const r of codUnreconciledRes.rows) {
+            const totalNum = Number(roundCurrency(r.total_amount || 0));
+            const tripCollectedNum = Number(roundCurrency(r.cod_collected_amount || 0));
+            const glCnt = codGlMap.get(String(r.order_id)) || 0;
+
+            if (!r.collection_id || glCnt === 0 || r.payment_status === 'PENDING' || tripCollectedNum < totalNum - 0.01) {
+              detected.push({
+                discrepancyKey: `UNRECONCILED_COD_COLLECTION:${r.order_id}`,
+                category: 'UNRECONCILED_COD_COLLECTION',
+                severity: !r.collection_id || glCnt === 0 ? 'CRITICAL' : 'HIGH',
+                status: 'REQUIRES_REVIEW',
+                orderId: r.order_id,
+                riderId: r.rider_id || null,
+                collectionId: r.collection_id || null,
+                expectedAmount: totalNum,
+                actualAmount: r.cod_collection_amount ? Number(roundCurrency(r.cod_collection_amount)) : tripCollectedNum,
+                currency: 'INR',
+                details: {
+                  orderPaymentStatus: r.payment_status,
+                  hasCodCollectionRow: Boolean(r.collection_id),
+                  codCollectionGlEntries: glCnt,
+                  tripCollectedAmount: tripCollectedNum,
+                },
+              });
+            }
+          }
+        } catch (err: any) {
+          if (!isMissingCodSchemaError(err)) throw err;
+        }
+
+        // Check 13B: Non-COD orders must NEVER carry non-reversed cod_collections
+        try {
+          const nonCodColsRes = await client.query(
+            `SELECT cc.id AS collection_id, cc.order_id, cc.rider_id, cc.collected_amount, o.payment_method
+             FROM cod_collections cc
+             JOIN orders o ON o.id = cc.order_id
+             WHERE cc.status <> 'REVERSED'
+               AND LOWER(COALESCE(o.payment_method, '')) NOT IN ('pay on delivery', 'cod', 'cash', 'cash on delivery')
+               ${options.orderId ? 'AND cc.order_id = $1' : ''}`,
+            orderFilterParams
+          );
+          for (const r of nonCodColsRes.rows) {
             detected.push({
-              discrepancyKey: `UNRECONCILED_COD_COLLECTION:${r.order_id}`,
-              category: 'UNRECONCILED_COD_COLLECTION',
-              severity: 'HIGH',
+              discrepancyKey: `NON_COD_ORDER_WITH_COD_COLLECTION:${r.order_id}`,
+              category: 'NON_COD_ORDER_WITH_COD_COLLECTION',
+              severity: 'CRITICAL',
               status: 'REQUIRES_REVIEW',
               orderId: r.order_id,
-              expectedAmount: parseFloat(r.total_amount),
-              actualAmount: parseFloat(r.cod_collected_amount || '0'),
+              riderId: r.rider_id || null,
+              collectionId: r.collection_id,
+              expectedAmount: 0,
+              actualAmount: Number(roundCurrency(r.collected_amount || 0)),
               currency: 'INR',
-              details: { orderPaymentStatus: r.payment_status },
+              details: { paymentMethod: r.payment_method },
             });
           }
-        } catch {}
+        } catch (err: any) {
+          if (!isMissingCodSchemaError(err)) throw err;
+        }
+
+        // Check 13C: Cleared COD collections whose forward trip still shows cod_reconciled = FALSE
+        try {
+          const tripSyncRes = await client.query(
+            `SELECT cc.id AS collection_id, cc.order_id, cc.rider_id, cc.cleared_amount, dt.id AS trip_id
+             FROM cod_collections cc
+             JOIN delivery_trips dt ON dt.order_id = cc.order_id AND dt.trip_type = 'FORWARD'
+             WHERE cc.status = 'CLEARED'
+               AND dt.cod_reconciled = FALSE
+               ${options.orderId ? 'AND cc.order_id = $1' : ''}`,
+            orderFilterParams
+          );
+          for (const r of tripSyncRes.rows) {
+            const verRemRes = await client.query(
+              `SELECT cr.id
+               FROM cod_remittance_allocations cra
+               JOIN cod_remittances cr ON cr.id = cra.remittance_id
+               WHERE cra.collection_id = $1
+                 AND cr.status IN ('VERIFIED', 'LIABILITY_CLEARED', 'EXCESS')
+                 AND cr.journal_batch_id IS NOT NULL
+               LIMIT 1`,
+              [r.collection_id]
+            );
+            const verifiedRemitId = verRemRes.rows[0]?.id || null;
+
+            if (autoRepair && verifiedRemitId) {
+              await client.query(`SELECT id FROM delivery_trips WHERE id = $1 FOR UPDATE`, [r.trip_id]);
+              await client.query(
+                `UPDATE delivery_trips SET cod_reconciled = TRUE, updated_at = NOW() WHERE id = $1`,
+                [r.trip_id]
+              );
+              detected.push({
+                discrepancyKey: `COD_TRIP_RECONCILED_FLAG_DRIFT:${r.order_id}`,
+                category: 'COD_TRIP_RECONCILED_FLAG_DRIFT',
+                severity: 'LOW',
+                status: 'AUTO_REPAIRED',
+                orderId: r.order_id,
+                riderId: r.rider_id || null,
+                collectionId: r.collection_id,
+                remittanceId: verifiedRemitId,
+                repairAction: 'SYNCED_DELIVERY_TRIP_COD_RECONCILED_TRUE',
+                details: { tripId: r.trip_id, verifiedRemittanceId: verifiedRemitId },
+              });
+            } else {
+              detected.push({
+                discrepancyKey: `COD_TRIP_RECONCILED_FLAG_DRIFT:${r.order_id}`,
+                category: 'COD_TRIP_RECONCILED_FLAG_DRIFT',
+                severity: 'HIGH',
+                status: 'REQUIRES_REVIEW',
+                orderId: r.order_id,
+                riderId: r.rider_id || null,
+                collectionId: r.collection_id,
+                expectedAmount: Number(roundCurrency(r.cleared_amount || 0)),
+                details: { tripId: r.trip_id, hasVerifiedRemittance: Boolean(verifiedRemitId) },
+              });
+            }
+          }
+        } catch (err: any) {
+          if (!isMissingCodSchemaError(err)) throw err;
+        }
+
+        // Check 13D..13F (Portfolio COD checks when not narrowly single-order scoped)
+        if (!options.orderId) {
+          // 13D: Negative rider floating_cash_balance OR GL 1030 / collection liability drift
+          try {
+            const riderAuditRes = await client.query(
+              `SELECT id AS rider_id, floating_cash_balance, floating_cash_limit,
+                      cod_restricted, active_cod_dispute_count,
+                      cod_ceiling_override_limit, cod_ceiling_override_until
+               FROM riders`
+            );
+
+            const gl1030Res = await client.query(
+              `SELECT rider_id,
+                      SUM(CASE WHEN entry_side = 'DEBIT' THEN amount ELSE 0 END) AS debits,
+                      SUM(CASE WHEN entry_side = 'CREDIT' THEN amount ELSE 0 END) AS credits,
+                      COUNT(*) AS cnt
+               FROM general_ledger_entries
+               WHERE account_code = '1030' AND rider_id IS NOT NULL
+               GROUP BY rider_id`
+            );
+            const gl1030Map = new Map<string, { net: BigNumber; cnt: number }>();
+            for (const g of gl1030Res.rows) {
+              gl1030Map.set(String(g.rider_id), {
+                net: subtract(toDecimal(g.debits || 0), toDecimal(g.credits || 0)),
+                cnt: parseInt(String(g.cnt || '0'), 10) || 0,
+              });
+            }
+
+            const colCntRes = await client.query(
+              `SELECT rider_id, COUNT(*) AS cnt
+               FROM cod_collections
+               WHERE status <> 'REVERSED'
+               GROUP BY rider_id`
+            );
+            const colCntMap = new Map<string, number>();
+            for (const c of colCntRes.rows) {
+              colCntMap.set(String(c.rider_id), parseInt(String(c.cnt || '0'), 10) || 0);
+            }
+
+            for (const rr of riderAuditRes.rows) {
+              const floatBn = toDecimal(roundCurrency(rr.floating_cash_balance || 0));
+              const glInfo = gl1030Map.get(String(rr.rider_id));
+              const glNetBn = glInfo ? toDecimal(roundCurrency(glInfo.net)) : toDecimal(0);
+              const glCnt = glInfo ? glInfo.cnt : 0;
+              const colCnt = colCntMap.get(String(rr.rider_id)) || 0;
+
+              if (floatBn.lt(0)) {
+                detected.push({
+                  discrepancyKey: `NEGATIVE_RIDER_CASH_LIABILITY:${rr.rider_id}`,
+                  category: 'NEGATIVE_RIDER_CASH_LIABILITY',
+                  severity: 'CRITICAL',
+                  status: 'REQUIRES_REVIEW',
+                  riderId: rr.rider_id,
+                  expectedAmount: 0,
+                  actualAmount: Number(roundCurrency(floatBn)),
+                  currency: 'INR',
+                  details: { floatingCashBalance: Number(roundCurrency(floatBn)) },
+                });
+              }
+
+              if ((glCnt > 0 || colCnt > 0) && subtract(floatBn, glNetBn).abs().gt(0.01)) {
+                detected.push({
+                  discrepancyKey: `RIDER_CASH_LIABILITY_DRIFT:${rr.rider_id}`,
+                  category: 'RIDER_CASH_LIABILITY_DRIFT',
+                  severity: 'CRITICAL',
+                  status: 'REQUIRES_REVIEW',
+                  riderId: rr.rider_id,
+                  expectedAmount: Number(roundCurrency(glNetBn)),
+                  actualAmount: Number(roundCurrency(floatBn)),
+                  currency: 'INR',
+                  details: {
+                    materializedFloatingCash: Number(roundCurrency(floatBn)),
+                    glAccount1030Net: Number(roundCurrency(glNetBn)),
+                    drift: Number(roundCurrency(subtract(floatBn, glNetBn))),
+                  },
+                });
+              }
+
+              // 13E: Restriction flag sync if over effective ceiling or open dispute exists without restriction flag
+              const { effectiveLimit } = codCashAccountabilityService.resolveEffectiveCashCeiling(rr);
+              const openDisputes = parseInt(String(rr.active_cod_dispute_count || '0'), 10) || 0;
+              const shouldRestrict = floatBn.gte(effectiveLimit) || openDisputes > 0;
+              if (shouldRestrict && !rr.cod_restricted) {
+                if (autoRepair) {
+                  await codCashAccountabilityService.syncRiderCodRestrictionInTx(client, rr.rider_id);
+                  detected.push({
+                    discrepancyKey: `COD_RESTRICTION_FLAG_DESYNC:${rr.rider_id}`,
+                    category: 'COD_RESTRICTION_FLAG_DESYNC',
+                    severity: 'MEDIUM',
+                    status: 'AUTO_REPAIRED',
+                    riderId: rr.rider_id,
+                    repairAction: 'SYNCED_RIDER_COD_RESTRICTED_FLAG',
+                    details: {
+                      floatingCashBalance: Number(roundCurrency(floatBn)),
+                      effectiveCeiling: effectiveLimit,
+                      openDisputes,
+                    },
+                  });
+                } else {
+                  detected.push({
+                    discrepancyKey: `COD_RESTRICTION_FLAG_DESYNC:${rr.rider_id}`,
+                    category: 'COD_RESTRICTION_FLAG_DESYNC',
+                    severity: 'HIGH',
+                    status: 'REQUIRES_REVIEW',
+                    riderId: rr.rider_id,
+                    details: {
+                      floatingCashBalance: Number(roundCurrency(floatBn)),
+                      effectiveCeiling: effectiveLimit,
+                      openDisputes,
+                    },
+                  });
+                }
+              }
+            }
+          } catch (err: any) {
+            if (!isMissingCodSchemaError(err)) throw err;
+          }
+
+          // 13F: Remittance custody/two-person/GL/shortage-excess integrity audit
+          try {
+            const remAuditRes = await client.query(
+              `SELECT id AS remittance_id, remittance_reference, rider_id, status,
+                      submitted_by, received_by, verified_by,
+                      submitted_amount, verified_amount, shortage_amount, excess_amount,
+                      journal_batch_id, created_at, submitted_at
+               FROM cod_remittances`
+            );
+
+            const dispCntRes = await client.query(
+              `SELECT remittance_id, COUNT(*) AS cnt
+               FROM cod_cash_disputes
+               WHERE remittance_id IS NOT NULL
+                 AND dispute_type IN ('SHORTAGE', 'EXCESS')
+               GROUP BY remittance_id`
+            );
+            const dispCntMap = new Map<string, number>();
+            for (const d of dispCntRes.rows) {
+              dispCntMap.set(String(d.remittance_id), parseInt(String(d.cnt || '0'), 10) || 0);
+            }
+
+            const gl2080Res = await client.query(
+              `SELECT rider_id, COUNT(*) AS cnt
+               FROM general_ledger_entries
+               WHERE account_code = '2080' AND rider_id IS NOT NULL
+               GROUP BY rider_id`
+            );
+            const gl2080Map = new Map<string, number>();
+            for (const g of gl2080Res.rows) {
+              gl2080Map.set(String(g.rider_id), parseInt(String(g.cnt || '0'), 10) || 0);
+            }
+
+            const staleCutoffMs = Date.now() - staleMinutes * 60 * 1000;
+            for (const rem of remAuditRes.rows) {
+              const isVerifiedState = ['VERIFIED', 'LIABILITY_CLEARED', 'SHORTAGE', 'EXCESS'].includes(rem.status);
+              if (isVerifiedState) {
+                const sodBroken =
+                  !rem.received_by ||
+                  !rem.verified_by ||
+                  (rem.submitted_by && rem.received_by === rem.submitted_by) ||
+                  (rem.submitted_by && rem.verified_by === rem.submitted_by) ||
+                  rem.received_by === rem.verified_by;
+
+                if (sodBroken) {
+                  detected.push({
+                    discrepancyKey: `COD_SOD_INTEGRITY_VIOLATION:${rem.remittance_id}`,
+                    category: 'COD_SOD_INTEGRITY_VIOLATION',
+                    severity: 'CRITICAL',
+                    status: 'REQUIRES_REVIEW',
+                    riderId: rem.rider_id,
+                    remittanceId: rem.remittance_id,
+                    details: {
+                      remittanceReference: rem.remittance_reference,
+                      submittedBy: rem.submitted_by,
+                      receivedBy: rem.received_by,
+                      verifiedBy: rem.verified_by,
+                    },
+                  });
+                }
+
+                const verNum = Number(roundCurrency(rem.verified_amount || 0));
+                if (verNum > 0 && !rem.journal_batch_id) {
+                  detected.push({
+                    discrepancyKey: `COD_VERIFIED_REMITTANCE_MISSING_GL:${rem.remittance_id}`,
+                    category: 'COD_VERIFIED_REMITTANCE_MISSING_GL',
+                    severity: 'CRITICAL',
+                    status: 'REQUIRES_REVIEW',
+                    riderId: rem.rider_id,
+                    remittanceId: rem.remittance_id,
+                    expectedAmount: verNum,
+                    actualAmount: 0,
+                    details: { remittanceReference: rem.remittance_reference, status: rem.status },
+                  });
+                }
+
+                const shortNum = Number(roundCurrency(rem.shortage_amount || 0));
+                const excessNum = Number(roundCurrency(rem.excess_amount || 0));
+                const dispCnt = dispCntMap.get(String(rem.remittance_id)) || 0;
+                const gl2080Cnt = gl2080Map.get(String(rem.rider_id)) || 0;
+
+                if ((shortNum > 0 || excessNum > 0) && dispCnt === 0) {
+                  detected.push({
+                    discrepancyKey: `COD_VARIANCE_MISSING_DISPUTE:${rem.remittance_id}`,
+                    category: 'COD_VARIANCE_MISSING_DISPUTE',
+                    severity: 'HIGH',
+                    status: 'REQUIRES_REVIEW',
+                    riderId: rem.rider_id,
+                    remittanceId: rem.remittance_id,
+                    expectedAmount: shortNum > 0 ? shortNum : excessNum,
+                    details: { remittanceReference: rem.remittance_reference, shortageAmount: shortNum, excessAmount: excessNum },
+                  });
+                }
+
+                if (excessNum > 0 && gl2080Cnt === 0) {
+                  detected.push({
+                    discrepancyKey: `COD_EXCESS_MISSING_SUSPENSE_GL:${rem.remittance_id}`,
+                    category: 'COD_EXCESS_MISSING_SUSPENSE_GL',
+                    severity: 'HIGH',
+                    status: 'REQUIRES_REVIEW',
+                    riderId: rem.rider_id,
+                    remittanceId: rem.remittance_id,
+                    expectedAmount: excessNum,
+                    details: { remittanceReference: rem.remittance_reference, excessAmount: excessNum },
+                  });
+                }
+              }
+
+              // Stale unverified remittance check
+              if (['SUBMITTED', 'RECEIVED', 'VERIFICATION_PENDING'].includes(rem.status)) {
+                const refTs = new Date(rem.submitted_at || rem.created_at).getTime();
+                if (refTs < staleCutoffMs) {
+                  detected.push({
+                    discrepancyKey: `STALE_UNVERIFIED_COD_REMITTANCE:${rem.remittance_id}`,
+                    category: 'STALE_UNVERIFIED_COD_REMITTANCE',
+                    severity: 'MEDIUM',
+                    status: 'REQUIRES_REVIEW',
+                    riderId: rem.rider_id,
+                    remittanceId: rem.remittance_id,
+                    expectedAmount: Number(roundCurrency(rem.submitted_amount || 0)),
+                    details: {
+                      remittanceReference: rem.remittance_reference,
+                      status: rem.status,
+                      submittedAt: rem.submitted_at || rem.created_at,
+                    },
+                  });
+                }
+              }
+            }
+          } catch (err: any) {
+            if (!isMissingCodSchemaError(err)) throw err;
+          }
+        }
 
         // Check 14 & 15: Expired uncaptured intents (safe auto-repair) & stuck ambiguous/processing intents (flag review)
         const staleCutoff = new Date(Date.now() - staleMinutes * 60 * 1000);
@@ -666,6 +1076,7 @@ export class PaymentReconciliationService {
     status?: string;
     severity?: string;
     orderId?: string;
+    riderId?: string;
     limit?: number;
   } = {}): Promise<any[]> {
     const pool = getPool();
@@ -684,6 +1095,10 @@ export class PaymentReconciliationService {
     if (filters.orderId) {
       clauses.push(`order_id = $${idx++}`);
       params.push(filters.orderId);
+    }
+    if (filters.riderId) {
+      clauses.push(`rider_id = $${idx++}`);
+      params.push(filters.riderId);
     }
 
     const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';

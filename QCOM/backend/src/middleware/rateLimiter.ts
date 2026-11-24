@@ -283,6 +283,20 @@ export const adminSensitiveRateLimiter = createSlidingWindowRateLimiter({
   skipInTest: true,
 });
 
+// Rider COD Remittance: Prevent burst duplicate remittance spam while allowing normal hub/UPI retries
+export const codRemittanceRateLimiter = createSlidingWindowRateLimiter({
+  limit: 15,
+  windowSec: 60,
+  keyGenerator: (req: Request) => [
+    ...(req.auth?.riderId ? [{ key: `rider:${req.auth.riderId}` }] : req.auth?.userId ? [{ key: `user:${req.auth.userId}` }] : []),
+    { key: `ip:${req.ip || req.socket.remoteAddress || '127.0.0.1'}`, limit: 60 },
+  ],
+  scope: 'cod:remittance',
+  errorMessage: 'Too many COD remittance requests. Please wait before retrying.',
+  failureMode: 'closed',
+  skipInTest: true,
+});
+
 function createHash(value: string): string {
   return hash('sha256').update(value).digest('hex');
 }

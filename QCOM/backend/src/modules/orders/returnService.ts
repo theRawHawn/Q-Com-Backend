@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import pg from 'pg';
+import BigNumber from 'bignumber.js';
 import { getPool, transaction } from '../../database/connection.js';
 import { inventoryService } from '../inventory/inventoryService.js';
 import { dispatchService } from '../dispatch/dispatchService.js';
@@ -7,6 +8,7 @@ import { refundService, PreparedRefundIntent, RefundRecord } from '../payments/r
 import { sellerSettlementService } from '../settlements/sellerSettlementService.js';
 import { outboxService } from '../outbox/outboxService.js';
 import { bloomFilterService } from '../resilience/bloomFilterService.js';
+import { toDecimal, roundCurrency, add, multiply } from '../pricing/money.js';
 
 export interface RequestReturnItemInput {
   orderItemId: string;
@@ -434,7 +436,7 @@ export class ReturnService {
       }
 
       let totalPassedUnits = 0;
-      let totalRefundAmount = 0;
+      let totalRefundAmountBn = new BigNumber(0);
 
       for (const d of params.itemDecisions) {
         const itemRes = await client.query(`
@@ -451,8 +453,7 @@ export class ReturnService {
 
         if (d.qcPassed) {
           totalPassedUnits += qty;
-          const unitPrice = parseFloat(it.unit_price);
-          totalRefundAmount += unitPrice * qty;
+          totalRefundAmountBn = add(totalRefundAmountBn, multiply(it.unit_price, qty));
 
           await inventoryService.restockItem(ret.merchant_id, it.product_id, qty, client);
 
@@ -482,7 +483,7 @@ export class ReturnService {
         }
       }
 
-      totalRefundAmount = +totalRefundAmount.toFixed(2);
+      const totalRefundAmount = Number(roundCurrency(totalRefundAmountBn));
       let refundRecord: RefundRecord | undefined;
       let clawbackResult: any;
 
@@ -596,7 +597,7 @@ export class ReturnService {
       }
 
       let totalPassedUnits = 0;
-      let totalRefundAmount = 0;
+      let totalRefundAmountBn = new BigNumber(0);
       const passedItemIds: { id: string; productId: string; qty: number }[] = [];
       const failedItemIds: string[] = [];
 
@@ -615,14 +616,14 @@ export class ReturnService {
 
         if (d.qcPassed) {
           totalPassedUnits += qty;
-          totalRefundAmount += parseFloat(it.unit_price) * qty;
+          totalRefundAmountBn = add(totalRefundAmountBn, multiply(toDecimal(it.unit_price), qty));
           passedItemIds.push({ id: it.id, productId: it.product_id, qty });
         } else {
           failedItemIds.push(it.id);
         }
       }
 
-      totalRefundAmount = +totalRefundAmount.toFixed(2);
+      const totalRefundAmount = Number(roundCurrency(totalRefundAmountBn));
 
       if (totalPassedUnits <= 0 || totalRefundAmount <= 0) {
         for (const fid of failedItemIds) {

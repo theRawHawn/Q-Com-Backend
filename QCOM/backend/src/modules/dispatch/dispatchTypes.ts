@@ -57,6 +57,8 @@ export interface DispatchCandidateContext {
   itemsSubtotal: number;
   customerDeliveryFee: number;
   handlingFee: number;
+  paymentMethod?: string;
+  orderTotal?: number;
   excludeRiderIds?: string[];
 }
 

@@ -64,6 +64,17 @@ function assertNonNegativeMoney(value: number | string, fieldName: string): numb
   return Number(roundCurrency(bn));
 }
 
+export function isCodPaymentMethod(method?: string | null): boolean {
+  if (!method) return false;
+  const normalized = String(method).trim().toLowerCase();
+  return (
+    normalized === 'pay on delivery' ||
+    normalized === 'cod' ||
+    normalized === 'cash on delivery' ||
+    normalized === 'cash_on_delivery'
+  );
+}
+
 function computeCanonicalPayloadHash(
   transactionType: string,
   lines: { account: string; side: string; amountStr: string }[]
@@ -676,36 +687,234 @@ export class LedgerService {
   }
 
   /**
-   * Batch N: Rider Floating Cash (COD) Remittance
-   * Dr 1020 Bank Operating Account, Cr 1030 Floating Cash in Hands of Riders
+   * Batch N: Verified Rider COD Remittance Clearance (with optional Excess Suspense Split)
+   * Standard exact/shortage clearance:
+   *   Dr 1020 Bank Operating Account (verifiedCashAmount)
+   *   Cr 1030 Floating Cash in Hands of Riders (clearedLiabilityAmount)
+   * When excess cash is physically received above rider liability/submitted target:
+   *   Dr 1020 Bank Operating Account (verifiedCashAmount)
+   *   Cr 1030 Floating Cash in Hands of Riders (clearedLiabilityAmount)
+   *   Cr 2080 Unidentified / Excess COD Cash Suspense (excessAmount)
    */
   public async recordRiderCodRemittance(params: {
     riderId: string;
     amount: number;
+    clearedLiabilityAmount?: number;
+    excessAmount?: number;
     reference: string;
+    orderId?: string | null;
     client?: pg.PoolClient;
   }): Promise<string> {
     const txRef = `TX_COD_REMIT_${params.reference}`;
-    const amount = assertPositiveMoney(params.amount, 'remittanceAmount');
+    const verifiedCashAmount = assertPositiveMoney(params.amount, 'remittanceAmount');
+    const excessAmount = assertNonNegativeMoney(params.excessAmount ?? 0, 'excessAmount');
+    const clearedLiabilityAmount =
+      params.clearedLiabilityAmount !== undefined
+        ? assertNonNegativeMoney(params.clearedLiabilityAmount, 'clearedLiabilityAmount')
+        : Number(roundCurrency(subtract(verifiedCashAmount, excessAmount)));
+
+    const sumCreditsBn = add(clearedLiabilityAmount, excessAmount);
+    if (!toDecimal(verifiedCashAmount).eq(sumCreditsBn)) {
+      throw new Error(
+        `LEDGER_UNBALANCED: Remittance debit ${verifiedCashAmount} != credits ${roundCurrency(sumCreditsBn)}`
+      );
+    }
+
+    const lines: {
+      account: string;
+      side: 'DEBIT' | 'CREDIT';
+      amount: number;
+      narration: string;
+      orderId?: string | null;
+      riderId?: string | null;
+    }[] = [
+      {
+        account: '1020',
+        side: 'DEBIT',
+        amount: verifiedCashAmount,
+        riderId: params.riderId,
+        orderId: params.orderId || null,
+        narration: `Bank/Vault operating receipt for verified COD remittance (Ref: ${params.reference})`,
+      },
+    ];
+
+    if (clearedLiabilityAmount > 0) {
+      lines.push({
+        account: '1030',
+        side: 'CREDIT',
+        amount: clearedLiabilityAmount,
+        riderId: params.riderId,
+        orderId: params.orderId || null,
+        narration: `Clearance of verified rider COD floating cash liability (Ref: ${params.reference}, Rider: ${params.riderId})`,
+      });
+    }
+
+    if (excessAmount > 0) {
+      lines.push({
+        account: '2080',
+        side: 'CREDIT',
+        amount: excessAmount,
+        riderId: params.riderId,
+        orderId: params.orderId || null,
+        narration: `Excess COD cash held in suspense awaiting investigation (Ref: ${params.reference}, Rider: ${params.riderId})`,
+      });
+    }
 
     return this.postJournalBatch({
       txRef,
-      transactionType: 'COD_COLLECTION',
+      transactionType: 'COD_REMITTANCE',
+      client: params.client,
+      lines,
+    });
+  }
+
+  /**
+   * Batch N-REV: Reversal of Verified COD Remittance (preserves original batch, posts offsetting entries)
+   */
+  public async recordCodRemittanceReversal(params: {
+    riderId: string;
+    verifiedAmount: number;
+    clearedLiabilityAmount: number;
+    excessAmount?: number;
+    reference: string;
+    reason: string;
+    client?: pg.PoolClient;
+  }): Promise<string> {
+    const txRef = `TX_COD_REV_${params.reference}`;
+    const verifiedAmount = assertPositiveMoney(params.verifiedAmount, 'verifiedAmount');
+    const excessAmount = assertNonNegativeMoney(params.excessAmount ?? 0, 'excessAmount');
+    const clearedLiabilityAmount = assertNonNegativeMoney(params.clearedLiabilityAmount, 'clearedLiabilityAmount');
+
+    if (!toDecimal(verifiedAmount).eq(add(clearedLiabilityAmount, excessAmount))) {
+      throw new Error('LEDGER_UNBALANCED: Remittance reversal amounts do not balance.');
+    }
+
+    const lines: {
+      account: string;
+      side: 'DEBIT' | 'CREDIT';
+      amount: number;
+      narration: string;
+      riderId?: string | null;
+    }[] = [];
+
+    if (clearedLiabilityAmount > 0) {
+      lines.push({
+        account: '1030',
+        side: 'DEBIT',
+        amount: clearedLiabilityAmount,
+        riderId: params.riderId,
+        narration: `Reversal of verified COD remittance restoring rider cash liability (Ref: ${params.reference}, Reason: ${params.reason})`,
+      });
+    }
+    if (excessAmount > 0) {
+      lines.push({
+        account: '2080',
+        side: 'DEBIT',
+        amount: excessAmount,
+        riderId: params.riderId,
+        narration: `Reversal of excess COD suspense credit on remittance reversal (Ref: ${params.reference})`,
+      });
+    }
+    lines.push({
+      account: '1020',
+      side: 'CREDIT',
+      amount: verifiedAmount,
+      riderId: params.riderId,
+      narration: `Bank/Vault reversal for COD remittance ${params.reference} (${params.reason})`,
+    });
+
+    return this.postJournalBatch({
+      txRef,
+      transactionType: 'COD_REVERSAL',
+      client: params.client,
+      lines,
+    });
+  }
+
+  /**
+   * Batch N-DISP: COD Shortage / Excess Dispute Accounting Resolution
+   */
+  public async recordCodDisputeResolution(params: {
+    riderId: string;
+    disputeNumber: string;
+    resolutionType:
+      | 'RECOVERED_CASH'
+      | 'RECOVERED_FROM_WALLET'
+      | 'ESCALATED_TO_RECEIVABLE'
+      | 'RECEIVABLE_COLLECTED'
+      | 'WRITTEN_OFF'
+      | 'EXCESS_RETURNED'
+      | 'EXCESS_ALLOCATED_TO_COLLECTION';
+    amount: number;
+    fromReceivable?: boolean;
+    orderId?: string | null;
+    reason: string;
+    client?: pg.PoolClient;
+  }): Promise<string> {
+    const txRef = `TX_COD_DISP_${params.disputeNumber}_${params.resolutionType}`;
+    const amount = assertPositiveMoney(params.amount, 'disputeResolutionAmount');
+    const sourceAssetAccount = params.fromReceivable ? '1050' : '1030';
+
+    let debitAccount: string;
+    let creditAccount: string;
+    let transactionType = 'COD_ADJUSTMENT';
+
+    switch (params.resolutionType) {
+      case 'RECOVERED_CASH':
+      case 'RECEIVABLE_COLLECTED':
+        debitAccount = '1020';
+        creditAccount = params.resolutionType === 'RECEIVABLE_COLLECTED' ? '1050' : sourceAssetAccount;
+        transactionType = 'COD_REMITTANCE';
+        break;
+      case 'RECOVERED_FROM_WALLET':
+        debitAccount = '2030';
+        creditAccount = sourceAssetAccount;
+        transactionType = 'COD_SHORTAGE';
+        break;
+      case 'ESCALATED_TO_RECEIVABLE':
+        debitAccount = '1050';
+        creditAccount = '1030';
+        transactionType = 'COD_SHORTAGE';
+        break;
+      case 'WRITTEN_OFF':
+        debitAccount = '5030';
+        creditAccount = sourceAssetAccount;
+        transactionType = 'COD_SHORTAGE';
+        break;
+      case 'EXCESS_RETURNED':
+        debitAccount = '2080';
+        creditAccount = '1020';
+        transactionType = 'COD_EXCESS';
+        break;
+      case 'EXCESS_ALLOCATED_TO_COLLECTION':
+        debitAccount = '2080';
+        creditAccount = '1030';
+        transactionType = 'COD_EXCESS';
+        break;
+      default:
+        throw new Error(`UNSUPPORTED_DISPUTE_RESOLUTION: ${params.resolutionType}`);
+    }
+
+    return this.postJournalBatch({
+      txRef,
+      transactionType,
       client: params.client,
       lines: [
         {
-          account: '1020',
+          account: debitAccount,
           side: 'DEBIT',
           amount,
           riderId: params.riderId,
-          narration: `Bank operating account receipt for COD remittance (Ref: ${params.reference})`,
+          orderId: params.orderId || null,
+          narration: `COD dispute ${params.disputeNumber} (${params.resolutionType}): ${params.reason}`,
         },
         {
-          account: '1030',
+          account: creditAccount,
           side: 'CREDIT',
           amount,
           riderId: params.riderId,
-          narration: `Clearance of rider floating cash liability (Rider: ${params.riderId})`,
+          orderId: params.orderId || null,
+          narration: `COD dispute ${params.disputeNumber} settlement leg (${params.resolutionType}): ${params.reason}`,
         },
       ],
     });
@@ -854,10 +1063,12 @@ export class LedgerService {
     returnId?: string;
     refundId?: string;
     refundNumber?: string;
+    creditAccountCode?: '1010' | '1020';
     client?: pg.PoolClient;
   }): Promise<string> {
     const key = params.returnId || params.refundId || params.refundNumber || params.orderId;
     const txRef = `TX_RETURN_REFUND_${key}`;
+    const refundOutAccount = params.creditAccountCode || '1010';
 
     const refundTotal = assertPositiveMoney(params.refundAmount, 'refundAmount');
     const targetAccount = params.isPostPayout ? '1040' : '2020';
@@ -969,12 +1180,15 @@ export class LedgerService {
       });
     }
 
-    // 3. Credit Cash at Gateway / Escrow Account 1010 (Total Refund Amount)
+    // 3. Credit Cash at Gateway (1010) for prepaid orders or Bank Operating Account (1020) for COD return refunds
     entries.push({
-      account: '1010',
+      account: refundOutAccount,
       side: 'CREDIT',
       amount: refundTotal,
-      narration: `Gateway refund disbursed to customer for order ${params.orderId}`,
+      narration:
+        refundOutAccount === '1020'
+          ? `COD bank transfer refund disbursed to customer for order ${params.orderId}`
+          : `Gateway refund disbursed to customer for order ${params.orderId}`,
       orderId: params.orderId,
     });
 

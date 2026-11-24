@@ -86,6 +86,7 @@ $$\begin{aligned}
 | `1020` | Bank Operating Account | Current Asset | Debit |
 | `1030` | Floating Cash in Hands of Riders (COD) | Current Asset | Debit |
 | `1040` | Seller Clawback Receivable | Current Asset | Debit |
+| `1050` | Rider Cash Shortage Receivable | Current Asset | Debit |
 | `2010` | Customer Funds Held in Escrow | Current Liability | Credit |
 | `2020` | Merchant Accounts Payable (Seller Ledger) | Current Liability | Credit |
 | `2030` | Delivery Partner Wallet Payable (Rider Ledger) | Current Liability | Credit |
@@ -93,11 +94,13 @@ $$\begin{aligned}
 | `2050` | Income-Tax Withholding Payable (Sec 393 / 194-O)| Current Liability | Credit |
 | `2060` | Logistics Withholding Payable (Sec 393 / 194-C) | Current Liability | Credit |
 | `2070` | Output GST Liability on Commission/Fees | Current Liability | Credit |
+| `2080` | Unidentified / Excess COD Cash Suspense | Current Liability | Credit |
 | `4010` | Marketplace Commission Revenue (SAC 9983) | Platform Revenue | Credit |
 | `4020` | Customer Delivery Fee Revenue (SAC 9968) | Platform Revenue | Credit |
 | `4030` | Convenience & Handling Fee Revenue (SAC 9985) | Platform Revenue | Credit |
 | `5010` | Delivery Rider Logistics Expense | Operating Expense | Debit |
 | `5020` | Payment Gateway Interchange Fees | Operating Expense | Debit |
+| `5030` | COD Cash Variance & Authorized Write-Off Expense | Operating Expense | Debit |
 
 ### 3.3 Reversal & Adjustment Accounting Pattern
 When an order refund or return is approved post-settlement:
@@ -119,5 +122,18 @@ Credit: 1010 Cash at Gateway / Escrow                      ₹972.82
 - **FIFO Partial Allocation Settlement & Reversal:** `order_settlement_allocations` retains `status = 'ALLOCATED'` while tracking cumulative `settled_amount` and `refunded_amount`, transitioning to `'SETTLED'` when `settled_amount + refunded_amount >= net_seller_payable - 0.01`, or `'REVERSED'` only upon full reversal.
 - **Partial & Post-Payout Clawback Offset (`2020` / `1040 -> 2020`):** Return clawbacks debit `2020` (`RETURN_DEBIT`) up to the remaining unsettled portion of an allocation and debit `1040` (`Seller Clawback Receivable`, `CLAWBACK_DEBIT`) for the settled portion alongside proportional fee/delay-penalty reversals (`4010`, `2070`, `2040`, `2050`, `4030`), automatically offsetting subsequent eligible seller allocations (`Dr 2020 / Cr 1040`).
 - **Post-`PAID` Bank Reversal & Replay Guard:** Webhook failure/reversal transitions `PAID -> REVERSED` (terminal), restores seller/rider balances via compensating ledger credits and FIFO allocation reversion, and ignores duplicate or out-of-order webhooks against terminal payouts.
-- **Idempotent COD Remittance:** `remitCodCash` validates positive currency inputs, locks `riders FOR UPDATE`, enforces same-rider and same-amount ownership on duplicate `reference` retries, and unblocks COD-suspended riders when `floating_cash_balance` drops below threshold.
+- **Idempotent COD Remittance:** `remitCodCash` delegates into `codCashAccountabilityService.submitRemittance`, enforcing server-derived collection custody, two-person receipt & verification workflows, and balanced GL postings.
+
+### 3.5 Sprint 15.9 COD Cash Accountability, Multi-Stage Remittance & Separation of Duties
+- **Authoritative Collection Custody (`cod_collections`):** `completeDeliveryWithOtp` rejects `allowPartial: true` (`400 PARTIAL_COD_NOT_SUPPORTED`), ignores client-supplied cash amounts, derives the authoritative `orders.total_amount` under row locks (`orders -> delivery_trips -> riders`), creates a 1:1 `cod_collections` record, posts balanced `COD_COLLECTION` (`Dr 1030 / Cr 2010`), increments `riders.floating_cash_balance`, and keeps `delivery_trips.cod_reconciled = FALSE` until verification clears the underlying order collection.
+- **COD Refunds Without Gateway Abuse:** `refundService.createRefund` rejects uncollected COD orders (`ORDER_NOT_REFUNDABLE` / `COD_REFUND_NO_COLLECTION`). Completed COD return refunds settle without invoking an external payment gateway, recording `provider_id = 'COD_BANK_TRANSFER'` and crediting `1020` (Bank Operating Account) rather than `1010` (Gateway Escrow).
+- **Three-Stage Remittance Lifecycle & Separation of Duties:**
+  1. **Submit (`DRAFT -> SUBMITTED`):** Rider or authorized admin submits a remittance (`POST /api/v1/settlements/cod/remittances` or `/cod/remit`), reserving open `cod_collections` via explicit `orderIds`/`collectionIds` or deterministic FIFO (`cod_remittance_allocations`). Liability is **not** reduced at submission. Protected by `codRemittanceRateLimiter` (15 req/min fail-closed) and PostgreSQL idempotency (`uq_cod_remittances_idempotency`).
+  2. **Physical Receipt (`SUBMITTED -> RECEIVED | VERIFICATION_PENDING`):** Hub/Operations/Finance staff (`POST /cod/remittances/:id/receive`) acknowledges physical handover; blocked if caller matches `submitted_by` or rider user (`403 SELF_RECEIPT_FORBIDDEN`).
+  3. **Independent Finance Verification (`RECEIVED -> LIABILITY_CLEARED | SHORTAGE | EXCESS`):** Finance Admin/Super Admin (`POST /cod/remittances/:id/verify`) must be distinct from both submitter (`403 SELF_VERIFICATION_FORBIDDEN`) and receiver (`403 RECEIVER_VERIFICATION_CONFLICT`), also enforced by DB `CHECK` constraints. Exact verification posts `COD_REMITTANCE` (`Dr 1020 / Cr 1030`), clears allocations, marks fully cleared trips `cod_reconciled = TRUE`, and clears `cod_restricted` when under ceiling with zero active disputes.
+- **Shortage, Excess, Dispute Resolution & Reversal:**
+  - Shortages (`verifiedAmount < submittedAmount`) clear only the verified amount, keep the residual unpaid balance on rider liability, and open a `SHORTAGE` row in `cod_cash_disputes` (restricting COD dispatch via `active_cod_dispute_count`). Resolutions include `RECOVERED_CASH` (`Dr 1020 / Cr 1030`), `RECOVERED_FROM_WALLET` (withholding-safe deduction via `rider_ledgers`), `ESCALATED_TO_RECEIVABLE` (`Dr 1050 / Cr 1030`), and finance-only `WRITTEN_OFF` (`Dr 5030 / Cr 1030` or `Cr 1050`).
+  - Excesses (`verifiedAmount > submittedAmount`) credit suspense `2080` (`Dr 1020 / Cr 1030 + Cr 2080`) and open an `EXCESS` dispute (`EXCESS_RETURNED` or `EXCESS_ALLOCATED_TO_COLLECTION`).
+  - Verified remittances can be reversed (`POST /cod/remittances/:id/reverse`) by posting an offsetting `COD_REVERSAL` journal batch, restoring `1030` liability and reopening `cod_collections` and `delivery_trips.cod_reconciled`.
+- **Dispatch Blocking, Ceiling Overrides & Reconciliation Checks (13–13F):** `cod_restricted` and expired overrides block COD dispatch cleanly (`409 RIDER_COD_RESTRICTED` on manual admin COD assignment and exclusion in `candidateGenerator`). `paymentReconciliationService` (Checks `13–13F`) detects delivered COD orders lacking collections, GL drift vs materialized `floating_cash_balance`, overdue unverified remittances, and safely auto-repairs only missing `delivery_trips.cod_reconciled` flags once collections are fully cleared; `financialRecoveryWorker.monitorCodRemittancesAndOverrides()` escalates stale unverified remittances and enforces expired overrides.
 

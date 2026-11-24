@@ -51,7 +51,19 @@
 | `/returns/:returnId/review` / `receive` / `qc-inspect` | POST | Bearer (Return merchant / Admin) | Processes merchant return workflow (forged `body.merchantId` rejected) |
 | `/settlements/allocate` | POST | Bearer (`SUPER_ADMIN`, `FINANCE_ADMIN`, `OPERATIONS`) | Computes and stores post-delivery settlement allocation |
 | `/settlements/order/:orderId/allocation` | GET | Bearer (Merchant / Rider / Admin) | Reads order settlement breakdown |
-| `/settlements/cod/remit` | POST | Bearer (`requireRiderOwnership`) | Records rider COD deposit (`{ riderId, amount, method, reference }`, `RIDER` own ID or Finance/Ops/Super Admin) |
+| `/settlements/cod/remit` | POST | Bearer (`requireRiderOwnership`, `codRemittanceRateLimiter`) | Submits rider COD remittance (`SUBMITTED`; does not clear liability until receipt + verification) |
+| `/settlements/rider/:riderId/cod-summary` | GET | Bearer (`requireRiderOwnership`) | Authoritative PostgreSQL rider COD metrics (A–H), open collections, remittances & disputes |
+| `/settlements/cod/observability` | GET | Bearer (`SUPER_ADMIN`, `FINANCE_ADMIN`, `OPERATIONS`) | Portfolio-wide COD collection, unverified remittance & dispute monitoring metrics |
+| `/settlements/cod/remittances` | POST | Bearer (`requireRiderOwnership`, `codRemittanceRateLimiter`) | Initiates `DRAFT` or `SUBMITTED` remittance with explicit order/collection IDs or FIFO reservation |
+| `/settlements/cod/remittances/:remittanceId/submit` | POST | Bearer (Owning Rider / Admin, `codRemittanceRateLimiter`) | Finalizes `DRAFT` remittance to `SUBMITTED` |
+| `/settlements/cod/remittances/:remittanceId/receive` | POST | Bearer (`OPERATIONS`, `DISPATCHER`, `FINANCE_ADMIN`, `SUPER_ADMIN`) | Acknowledges physical handover (`received_by <> submitted_by`) |
+| `/settlements/cod/remittances/:remittanceId/verify` | POST | Bearer (`FINANCE_ADMIN`, `SUPER_ADMIN`) | Independent finance count & GL clearance (`verified_by <> received_by`, `verified_by <> submitted_by`) |
+| `/settlements/cod/remittances/:remittanceId/reject` | POST | Bearer (`OPERATIONS`, `FINANCE_ADMIN`, `SUPER_ADMIN`) | Rejects unverified remittance and releases reserved collections |
+| `/settlements/cod/remittances/:remittanceId/cancel` | POST | Bearer (Owning Rider / Admin) | Cancels `DRAFT`/`SUBMITTED` remittance prior to physical receipt |
+| `/settlements/cod/remittances/:remittanceId/reverse` | POST | Bearer (`FINANCE_ADMIN`, `SUPER_ADMIN`) | Posts offsetting `COD_REVERSAL` GL batch and restores rider liability |
+| `/settlements/cod/disputes` | POST | Bearer (`OPERATIONS`, `FINANCE_ADMIN`, `SUPER_ADMIN`) | Opens durable COD shortage/excess/missing-collection dispute |
+| `/settlements/cod/disputes/:disputeId/resolve` | POST | Bearer (`FINANCE_ADMIN`, `SUPER_ADMIN`) | Resolves dispute with immutable GL recovery, wallet deduction, receivable, or write-off |
+| `/settlements/cod/riders/:riderId/ceiling-override` | POST | Bearer (`FINANCE_ADMIN`, `SUPER_ADMIN`) | Grants time-bounded audited COD dispatch ceiling override (never clears liability) |
 
 ---
 

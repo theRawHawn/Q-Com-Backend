@@ -1,12 +1,13 @@
 import crypto from 'crypto';
 import pg from 'pg';
+import BigNumber from 'bignumber.js';
 import { getPool, transaction } from '../../database/connection.js';
 import { env } from '../../config/env.js';
 import { getPaymentProvider, PaymentProvider, paymentProviderRegistry } from './paymentProvider.js';
 import { transitionPaymentIntentState, PaymentState } from './paymentStateMachine.js';
 import { paymentLogger } from './paymentLogger.js';
 import { outboxService } from '../outbox/outboxService.js';
-import { ledgerService } from '../ledger/ledgerService.js';
+import { ledgerService, isCodPaymentMethod } from '../ledger/ledgerService.js';
 import { bloomFilterService } from '../resilience/bloomFilterService.js';
 import { CircuitBreaker } from '../resilience/circuitBreaker.js';
 import { executeWithRetry, isTransientFailure } from '../resilience/retryPolicy.js';
@@ -71,6 +72,7 @@ export interface PreparedRefundIntent {
   paymentId: string;
   paymentIntentId?: string;
   providerId?: string;
+  isCod?: boolean;
   capturedCeiling: number;
   requestedAmount: number;
   durableIdempotencyKey: string;
@@ -308,43 +310,87 @@ export class RefundService {
     }
 
     const order = orderRes.rows[0];
+    const isCodOrder = isCodPaymentMethod(order.payment_method);
     if (!['PAID', 'PARTIALLY_REFUNDED', 'REFUND_PENDING'].includes(order.payment_status)) {
       throw new Error(`ORDER_NOT_REFUNDABLE: Order payment status '${order.payment_status}' cannot be refunded.`);
     }
 
     const orderTotalBn = toDecimal(order.total_amount);
 
-    // Inspect authoritative captured payment evidence
-    const receiptRes = await client.query(
-      `SELECT transaction_id, amount
-       FROM payment_receipts
-       WHERE order_id = $1 AND status = 'SUCCESS'
-       LIMIT 1`,
-      [params.orderId]
-    );
+    let capturedCeilingBn: BigNumber;
+    let paymentId: string;
+    let paymentIntentId: string | undefined;
+    let providerId: string | undefined;
 
-    const intentRes = await client.query(
-      `SELECT id, payment_order_id, provider_payment_id, active_provider, amount, status
-       FROM payment_intents
-       WHERE order_id = $1
-       ORDER BY created_at DESC
-       LIMIT 1`,
-      [params.orderId]
-    );
+    if (isCodOrder) {
+      // COD refunds require verified customer cash collection (never refund cancelled/uncollected COD orders or synthesize online gateway payments)
+      let collectedCodBn = new BigNumber(0);
+      try {
+        const codColRes = await client.query(
+          `SELECT collected_amount FROM cod_collections WHERE order_id = $1 AND status <> 'REVERSED' LIMIT 1`,
+          [params.orderId]
+        );
+        if (codColRes.rows.length > 0) {
+          collectedCodBn = toDecimal(codColRes.rows[0].collected_amount || 0);
+        }
+      } catch {
+        // Pre-030 schema fallback
+      }
+      if (collectedCodBn.lte(0)) {
+        const tripCodRes = await client.query(
+          `SELECT cod_collected_amount FROM delivery_trips WHERE order_id = $1 AND trip_type = 'FORWARD' AND COALESCE(cod_collected_amount, 0) > 0 LIMIT 1`,
+          [params.orderId]
+        );
+        if (tripCodRes.rows.length > 0) {
+          collectedCodBn = toDecimal(tripCodRes.rows[0].cod_collected_amount || 0);
+        }
+      }
+      if (collectedCodBn.lte(0) || order.status === 'cancelled') {
+        throw new Error('COD_REFUND_NO_COLLECTION: Cannot issue cash refund for an uncollected or pre-delivery cancelled COD order.');
+      }
+      capturedCeilingBn = BigNumber.min(orderTotalBn, collectedCodBn);
+      paymentId = `cod_coll_${params.orderId.slice(0, 16)}`;
+      providerId = 'COD_BANK_TRANSFER';
+    } else {
+      // Inspect authoritative captured online payment evidence
+      const receiptRes = await client.query(
+        `SELECT transaction_id, amount
+         FROM payment_receipts
+         WHERE order_id = $1 AND status = 'SUCCESS'
+         LIMIT 1`,
+        [params.orderId]
+      );
 
-    const capturedIntent = intentRes.rows.find((r: any) =>
-      ['CAPTURED', 'REFUND_PENDING', 'PARTIALLY_REFUNDED', 'REFUNDED'].includes(r.status)
-    ) || intentRes.rows[0];
+      const intentRes = await client.query(
+        `SELECT id, payment_order_id, provider_payment_id, active_provider, amount, status
+         FROM payment_intents
+         WHERE order_id = $1
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [params.orderId]
+      );
 
-    const isProduction = (process.env.NODE_ENV || env.NODE_ENV) === 'production';
-    if (isProduction && receiptRes.rows.length === 0 && !capturedIntent?.provider_payment_id) {
-      throw new Error('NO_CAPTURED_PAYMENT_FOUND: Cannot issue refund without verified payment capture proof.');
+      const capturedIntent = intentRes.rows.find((r: any) =>
+        ['CAPTURED', 'REFUND_PENDING', 'PARTIALLY_REFUNDED', 'REFUNDED'].includes(r.status)
+      ) || intentRes.rows[0];
+
+      const isProduction = (process.env.NODE_ENV || env.NODE_ENV) === 'production';
+      if (isProduction && receiptRes.rows.length === 0 && !capturedIntent?.provider_payment_id) {
+        throw new Error('NO_CAPTURED_PAYMENT_FOUND: Cannot issue refund without verified payment capture proof.');
+      }
+
+      const receiptAmount = receiptRes.rows.length > 0 ? parseFloat(receiptRes.rows[0].amount) : null;
+      const intentAmount = capturedIntent?.amount ? parseFloat(capturedIntent.amount) : null;
+      const capturedCeilingNum = receiptAmount ?? intentAmount ?? Number(roundCurrency(orderTotalBn));
+      capturedCeilingBn = toDecimal(Math.min(Number(roundCurrency(orderTotalBn)), capturedCeilingNum));
+      paymentId =
+        receiptRes.rows[0]?.transaction_id ||
+        capturedIntent?.provider_payment_id ||
+        capturedIntent?.payment_order_id ||
+        `pay_verified_${params.orderId.slice(0, 12)}`;
+      paymentIntentId = capturedIntent?.id;
+      providerId = capturedIntent?.active_provider;
     }
-
-    const receiptAmount = receiptRes.rows.length > 0 ? parseFloat(receiptRes.rows[0].amount) : null;
-    const intentAmount = capturedIntent?.amount ? parseFloat(capturedIntent.amount) : null;
-    const capturedCeilingNum = receiptAmount ?? intentAmount ?? Number(roundCurrency(orderTotalBn));
-    const capturedCeilingBn = toDecimal(Math.min(Number(roundCurrency(orderTotalBn)), capturedCeilingNum));
 
     // Reserve ceiling against all non-failed refunds (pending, processing, unknown, completed, review)
     const priorRefundsRes = await client.query(
@@ -373,12 +419,6 @@ export class RefundService {
 
     const isFull = add(priorRefundedBn, requestedAmountBn).gte(capturedCeilingBn.minus('0.01'));
     const refundType = params.refundType || (isFull ? 'FULL' : 'PARTIAL');
-
-    const paymentId =
-      receiptRes.rows[0]?.transaction_id ||
-      capturedIntent?.provider_payment_id ||
-      capturedIntent?.payment_order_id ||
-      `pay_verified_${params.orderId.slice(0, 12)}`;
 
     const refundNumber = `REF_${Date.now()}_${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
     const durableIdempotencyKey = params.idempotencyKey || `ref_op_${params.orderId}_${requestedAmount}_${refundNumber}`;
@@ -428,15 +468,16 @@ export class RefundService {
     paymentLogger.log('info', 'REFUND_PREPARED', {
       orderId: params.orderId,
       refundId: refundRow.id,
-      paymentIntentId: capturedIntent?.id,
-      providerId: capturedIntent?.active_provider,
-    }, { amount: requestedAmount, refundType });
+      paymentIntentId,
+      providerId,
+    }, { amount: requestedAmount, refundType, isCod: isCodOrder });
 
     return {
       refundRow,
       paymentId,
-      paymentIntentId: capturedIntent?.id,
-      providerId: capturedIntent?.active_provider,
+      paymentIntentId,
+      providerId,
+      isCod: isCodOrder,
       capturedCeiling: Number(roundCurrency(capturedCeilingBn)),
       requestedAmount,
       durableIdempotencyKey,
@@ -447,6 +488,7 @@ export class RefundService {
 
   /**
    * STEP B + STEP C: Executes external gateway call OUTSIDE DB transactions, then reconciles in a short DB TX.
+   * For COD orders, skips online payment gateways and settles via internal COD bank/UPI refund accounting.
    */
   public async executePreparedRefund(opts: {
     prepared: PreparedRefundIntent;
@@ -466,48 +508,54 @@ export class RefundService {
       };
     }
 
-    const provider = this.getProvider(prepared.providerId);
+    const provider = prepared.isCod ? null : this.getProvider(prepared.providerId);
+    const activeProviderId = prepared.isCod ? 'COD_BANK_TRANSFER' : provider!.providerId;
 
     let providerRefundId: string | undefined;
     let providerStatus: 'COMPLETED' | 'FAILED' | 'PROCESSING' = 'COMPLETED';
     let outcomeUnknown = false;
 
-    try {
-      const providerRes = await this.circuitBreaker.execute(async () => {
-        return await executeWithRetry(
-          async () => {
-            return await provider.createRefund({
-              paymentId: prepared.paymentId,
-              amount: prepared.requestedAmount,
-              currency: 'INR',
-              reason: reasonCode,
-              idempotencyKey: prepared.durableIdempotencyKey,
-            });
-          },
-          {
-            maxAttempts: 3,
-            baseDelayMs: 500,
-            maxDelayMs: 3000,
-            shouldRetry: (err) => isTransientFailure(err),
-          }
-        );
-      });
+    if (prepared.isCod) {
+      providerRefundId = `cod_bank_rfnd_${crypto.randomBytes(6).toString('hex')}`;
+      providerStatus = 'COMPLETED';
+    } else {
+      try {
+        const providerRes = await this.circuitBreaker.execute(async () => {
+          return await executeWithRetry(
+            async () => {
+              return await provider!.createRefund({
+                paymentId: prepared.paymentId,
+                amount: prepared.requestedAmount,
+                currency: 'INR',
+                reason: reasonCode,
+                idempotencyKey: prepared.durableIdempotencyKey,
+              });
+            },
+            {
+              maxAttempts: 3,
+              baseDelayMs: 500,
+              maxDelayMs: 3000,
+              shouldRetry: (err) => isTransientFailure(err),
+            }
+          );
+        });
 
-      providerRefundId = providerRes.providerRefundId;
-      if (providerRes.status === 'PROCESSED') {
-        providerStatus = 'COMPLETED';
-      } else if (providerRes.status === 'FAILED') {
-        providerStatus = 'FAILED';
-      } else {
-        providerStatus = 'PROCESSING';
-        outcomeUnknown = true;
-      }
-    } catch (provErr: any) {
-      if (isTransientFailure(provErr) || (provErr.message && provErr.message.toLowerCase().includes('timeout'))) {
-        providerStatus = 'PROCESSING';
-        outcomeUnknown = true;
-      } else {
-        providerStatus = 'FAILED';
+        providerRefundId = providerRes.providerRefundId;
+        if (providerRes.status === 'PROCESSED') {
+          providerStatus = 'COMPLETED';
+        } else if (providerRes.status === 'FAILED') {
+          providerStatus = 'FAILED';
+        } else {
+          providerStatus = 'PROCESSING';
+          outcomeUnknown = true;
+        }
+      } catch (provErr: any) {
+        if (isTransientFailure(provErr) || (provErr.message && provErr.message.toLowerCase().includes('timeout'))) {
+          providerStatus = 'PROCESSING';
+          outcomeUnknown = true;
+        } else {
+          providerStatus = 'FAILED';
+        }
       }
     }
 
@@ -558,7 +606,7 @@ export class RefundService {
           paymentIntentId: prepared.paymentIntentId,
           status: 'SUCCEEDED',
           amount: prepared.requestedAmount,
-          providerId: provider.providerId,
+          providerId: activeProviderId,
           externalReference: providerRefundId || null,
           idempotencyKey: prepared.durableIdempotencyKey,
         });
@@ -590,7 +638,7 @@ export class RefundService {
         paymentLogger.log('info', 'REFUND_COMPLETED', {
           orderId,
           refundId: prepared.refundRow.id,
-          providerId: provider.providerId,
+          providerId: activeProviderId,
         }, { amount: prepared.requestedAmount, isFullyRefunded });
       } else if (outcomeUnknown) {
         await this.recordRefundTransaction(client, {
@@ -599,7 +647,7 @@ export class RefundService {
           paymentIntentId: prepared.paymentIntentId,
           status: 'UNKNOWN',
           amount: prepared.requestedAmount,
-          providerId: provider.providerId,
+          providerId: activeProviderId,
           externalReference: providerRefundId || null,
           idempotencyKey: prepared.durableIdempotencyKey,
         });
@@ -620,7 +668,7 @@ export class RefundService {
         paymentLogger.log('warn', 'REFUND_OUTCOME_UNKNOWN', {
           orderId,
           refundId: prepared.refundRow.id,
-          providerId: provider.providerId,
+          providerId: activeProviderId,
         }, { amount: prepared.requestedAmount });
       } else {
         await this.recordRefundTransaction(client, {
@@ -629,7 +677,7 @@ export class RefundService {
           paymentIntentId: prepared.paymentIntentId,
           status: 'FAILED',
           amount: prepared.requestedAmount,
-          providerId: provider.providerId,
+          providerId: activeProviderId,
           externalReference: providerRefundId || null,
           idempotencyKey: prepared.durableIdempotencyKey,
         });

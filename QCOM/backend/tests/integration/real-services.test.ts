@@ -225,7 +225,54 @@ async function runRedisChecks(redisModule: typeof import('../../src/database/red
       env.TRUST_PROXY_CIDRS = previousTrustedProxyCidrs;
     }
 
-    console.log('Redis 7 atomic boundary, independent processes, source-IP trust, Retry-After, and fail-open/fail-closed behavior passed.');
+    const codRemitUserId = `it_rider_${randomUUID()}`;
+    const codRemitIp = '127.0.0.1';
+    createdRedisKeys.add(`ratelimit:cod:remittance:user:${codRemitUserId}`);
+    createdRedisKeys.add(`ratelimit:cod:remittance:ip:${codRemitIp}`);
+    const { codRemittanceRateLimiter } = await import('../../src/middleware/rateLimiter.js');
+    const codApp = express();
+    codApp.post(
+      '/cod-remit',
+      (req, _res, next) => {
+        (req as any).auth = { userId: codRemitUserId };
+        next();
+      },
+      codRemittanceRateLimiter,
+      (_req, res) => res.status(204).end()
+    );
+    const codServer = await new Promise<import('node:http').Server>((resolve) => {
+      const srv = codApp.listen(0, '127.0.0.1', () => resolve(srv));
+    });
+    const codAddr = codServer.address();
+    assert.ok(codAddr && typeof codAddr !== 'string');
+    try {
+      const codUrl = `http://127.0.0.1:${codAddr.port}/cod-remit`;
+      const codAdmissions = await Promise.all(
+        Array.from({ length: 18 }, () =>
+          fetch(codUrl, { method: 'POST', headers: { 'x-test-rate-limit': '1' } })
+        )
+      );
+      assert.equal(
+        codAdmissions.filter((r) => r.status === 204).length,
+        15,
+        'codRemittanceRateLimiter must admit strictly 15 requests per minute on real Redis 7.'
+      );
+      assert.equal(
+        codAdmissions.filter((r) => r.status === 429).length,
+        3,
+        'Requests 16-18 to codRemittanceRateLimiter must fail with HTTP 429.'
+      );
+
+      // Simulate Redis key-type fault -> fail closed 503
+      await client.del(`ratelimit:cod:remittance:user:${codRemitUserId}`);
+      await client.set(`ratelimit:cod:remittance:user:${codRemitUserId}`, 'corrupt-type');
+      const faultRes = await fetch(codUrl, { method: 'POST', headers: { 'x-test-rate-limit': '1' } });
+      assert.equal(faultRes.status, 503, 'codRemittanceRateLimiter must fail closed (503) on Redis error.');
+    } finally {
+      await new Promise<void>((resolve, reject) => codServer.close((err) => (err ? reject(err) : resolve())));
+    }
+
+    console.log('Redis 7 atomic boundary, independent processes, source-IP trust, Retry-After, COD remittance limiter, and fail-open/fail-closed behavior passed.');
   } finally {
     await client.del(...createdRedisKeys);
   }
@@ -294,9 +341,10 @@ async function runPostgresChecks(): Promise<void> {
         migrationFiles.length,
         `Fresh database must apply all ${migrationFiles.length} migrations (001–026+).`
       );
-      assert.ok(applied.length >= 29, `Expected at least 29 migrations, got ${applied.length}.`);
+      assert.ok(applied.length >= 30, `Expected at least 30 migrations, got ${applied.length}.`);
       assert.ok(applied.some((name) => name.startsWith('026_')), 'Fresh database must apply migration 026.');
       assert.ok(applied.some((name) => name.startsWith('029_')), 'Fresh database must apply migration 029.');
+      assert.ok(applied.some((name) => name.startsWith('030_')), 'Fresh database must apply migration 030.');
       assert.deepEqual(await runMigrations({ poolOverride: freshPool }), [], 'A migration rerun must apply no changes.');
 
       const previousFiles = migrationFiles.filter((migration) => Number(migration.version) < 25);
@@ -322,6 +370,7 @@ async function runPostgresChecks(): Promise<void> {
       assert.ok(upgradeApplied.some((name) => name.startsWith('027_')), 'Upgrade must apply migration 027.');
       assert.ok(upgradeApplied.some((name) => name.startsWith('028_')), 'Upgrade must apply migration 028.');
       assert.ok(upgradeApplied.some((name) => name.startsWith('029_')), 'Upgrade must apply migration 029.');
+      assert.ok(upgradeApplied.some((name) => name.startsWith('030_')), 'Upgrade must apply migration 030.');
       const upgradedTripIndexes = await upgradePool.query<{ indexname: string }>(
         `SELECT indexname FROM pg_indexes
          WHERE schemaname = current_schema()
@@ -472,8 +521,9 @@ async function runPostgresChecks(): Promise<void> {
 
       await runSprint15_7PostgresChecks(freshPool);
       await runSprint15_8PostgresChecks(freshPool);
+      await runSprint15_9PostgresChecks(freshPool);
 
-      console.log('PostgreSQL 16 fresh/upgrade migrations, Sprint 15.7 & 15.8 integrity/concurrency/pg_locks checks, outbox claims, fencing, and rollback checks passed.');
+      console.log('PostgreSQL 16 fresh/upgrade migrations, Sprint 15.7/15.8/15.9 integrity/concurrency/pg_locks checks, outbox claims, fencing, and rollback checks passed.');
     } finally {
       setPool(null);
       await Promise.all([freshPool.end(), upgradePool.end()]);
@@ -1138,6 +1188,222 @@ async function runSprint15_8PostgresChecks(freshPool: import('pg').Pool): Promis
   assert.equal(escRow.error_code, 'RECOVERY_RETRY_EXHAUSTED');
 
   console.log('PostgreSQL 16 Sprint 15.8 checks (Migration 029 23505 indexes, concurrent intents, PG idempotency race, concurrent refund ceiling, reconciliation & worker escalation) passed.');
+}
+
+async function runSprint15_9PostgresChecks(freshPool: import('pg').Pool): Promise<void> {
+  const crypto = await import('node:crypto');
+  const { orderService } = await import('../../src/modules/orders/orderService.js');
+  const { deliveryCompletionService } = await import('../../src/modules/delivery/deliveryCompletionService.js');
+  const { codCashAccountabilityService } = await import('../../src/modules/settlements/codCashAccountabilityService.js');
+
+  console.log('[PG16-15.9] Verifying Migration 030 tables, COA accounts, and append-only GL triggers...');
+  const m030Tables = await freshPool.query<{ table_name: string }>(
+    `SELECT table_name FROM information_schema.tables
+     WHERE table_schema = current_schema()
+       AND table_name IN ('cod_collections', 'cod_remittances', 'cod_remittance_allocations', 'cod_cash_disputes')`
+  );
+  assert.equal(m030Tables.rowCount, 4, 'All 4 Migration 030 COD accountability tables must exist on PG 16.');
+
+  const coaRes = await freshPool.query(
+    `SELECT account_code FROM general_ledger_accounts WHERE account_code IN ('1030', '1050', '2080', '5030')`
+  );
+  assert.equal(coaRes.rowCount, 4, 'Migration 030 COD Chart of Accounts (1030, 1050, 2080, 5030) must exist on PG 16.');
+
+  // Verify PL/pgSQL append-only triggers on real PostgreSQL 16
+  await assert.rejects(
+    () => freshPool.query(`UPDATE general_ledger_entries SET amount = 0.01`),
+    /LEDGER_IMMUTABLE/
+  );
+  await assert.rejects(
+    () => freshPool.query(`DELETE FROM general_ledger_entries WHERE transaction_reference NOT LIKE 'TX_%'`),
+    /LEDGER_IMMUTABLE/
+  );
+  await assert.rejects(
+    () => freshPool.query(`TRUNCATE general_ledger_entries`),
+    /LEDGER_IMMUTABLE/
+  );
+
+  // Create isolated staff actors for two-person separation-of-duties checks
+  const merchRow = (
+    await freshPool.query(`SELECT id, latitude, longitude FROM merchants WHERE merchant_code = 'MERCH-BLR-01' LIMIT 1`)
+  ).rows[0];
+  const merchantId = merchRow.id as string;
+  const storeLat = Number(merchRow.latitude);
+  const storeLng = Number(merchRow.longitude);
+  const prodRow = (
+    await freshPool.query(
+      `SELECT p.id FROM products p JOIN store_inventory si ON si.product_id = p.id
+       WHERE si.merchant_id = $1 AND si.stock_count >= 20 LIMIT 1`,
+      [merchantId]
+    )
+  ).rows[0];
+  const productId = prodRow.id as string;
+  const custUserId = (await freshPool.query(`SELECT id FROM users ORDER BY created_at ASC LIMIT 1`)).rows[0].id as string;
+
+  const submitterUserId = crypto.randomUUID();
+  const receiverUserId = crypto.randomUUID();
+  const verifier1UserId = crypto.randomUUID();
+  const verifier2UserId = crypto.randomUUID();
+  await freshPool.query(
+    `INSERT INTO users (id, phone, full_name, role, is_active, is_verified)
+     VALUES
+       ($1, $5, 'PG16 COD Rider', 'RIDER', TRUE, TRUE),
+       ($2, $6, 'PG16 COD Receiver', 'OPERATIONS', TRUE, TRUE),
+       ($3, $7, 'PG16 COD Verifier 1', 'FINANCE_ADMIN', TRUE, TRUE),
+       ($4, $8, 'PG16 COD Verifier 2', 'FINANCE_ADMIN', TRUE, TRUE)`,
+    [
+      submitterUserId,
+      receiverUserId,
+      verifier1UserId,
+      verifier2UserId,
+      `+919901${Math.floor(100000 + Math.random() * 899999)}`,
+      `+919902${Math.floor(100000 + Math.random() * 899999)}`,
+      `+919903${Math.floor(100000 + Math.random() * 899999)}`,
+      `+919904${Math.floor(100000 + Math.random() * 899999)}`,
+    ]
+  );
+
+  const riderId = crypto.randomUUID();
+  await freshPool.query(
+    `INSERT INTO riders (id, user_id, rider_code, name, phone, status, vehicle_type, payload_capacity_kg, floating_cash_balance, floating_cash_limit)
+     VALUES ($1, $2, $3, 'PG16 COD Rider', $4, 'IDLE_AT_HUB', 'ev_scooter', 25, 0.00, 5000.00)`,
+    [riderId, submitterUserId, `PG16-COD-${Date.now()}`, `+919905${Math.floor(100000 + Math.random() * 899999)}`]
+  );
+
+  // Verify database-level separation-of-duties CHECK constraints (23514) directly on cod_remittances
+  console.log('[PG16-15.9] Verifying DB CHECK constraints for two-person SoD and unique indexes...');
+  await assert.rejects(
+    () =>
+      freshPool.query(
+        `INSERT INTO cod_remittances (remittance_reference, rider_id, submitted_amount, status, submitted_by, received_by)
+         VALUES ($1, $2, 100.00, 'RECEIVED', $3, $3)`,
+        [`CHK_SOD_1_${Date.now()}`, riderId, submitterUserId]
+      ),
+    (err: any) => err?.code === '23514'
+  );
+  await assert.rejects(
+    () =>
+      freshPool.query(
+        `INSERT INTO cod_remittances (remittance_reference, rider_id, submitted_amount, status, submitted_by, received_by, verified_by)
+         VALUES ($1, $2, 100.00, 'VERIFIED', $3, $4, $4)`,
+        [`CHK_SOD_2_${Date.now()}`, riderId, submitterUserId, receiverUserId]
+      ),
+    (err: any) => err?.code === '23514'
+  );
+
+  // Create COD order & forward trip
+  const codOrd = await orderService.createOrder({
+    userId: custUserId,
+    merchantId,
+    items: [{ productId, quantity: 1 }],
+    jobSite: { address: 'PG16 COD Race Site', latitude: storeLat + 0.01, longitude: storeLng + 0.01 },
+    paymentMethod: 'Pay on Delivery',
+  });
+  const deliveryOtp = (
+    await freshPool.query(`SELECT delivery_otp FROM orders WHERE id = $1`, [codOrd.order.id])
+  ).rows[0].delivery_otp as string;
+  const tripId = crypto.randomUUID();
+  await freshPool.query(
+    `INSERT INTO delivery_trips (id, order_id, trip_type, rider_id, status, base_fare, distance_fare, surge_fare, total_rider_payout, cod_due_amount, accepted_at, picked_up_at)
+     VALUES ($1, $2, 'FORWARD', $3, 'PICKED_UP', 30, 15, 0, 45, $4, NOW(), NOW())`,
+    [tripId, codOrd.order.id, riderId, codOrd.order.totalAmount]
+  );
+
+  // Race 1: Concurrent COD delivery OTP completions -> strictly 1 succeeds & creates 1 cod_collections row
+  console.log('[PG16-15.9] Verifying concurrent COD OTP completion -> 1 collection & 23505 uniqueness...');
+  const otpRace = await Promise.allSettled([
+    deliveryCompletionService.completeDeliveryWithOtp({
+      taskId: tripId,
+      otp: deliveryOtp,
+      actor: { riderId, isDispatchAdmin: false, actorUserId: submitterUserId },
+    }),
+    deliveryCompletionService.completeDeliveryWithOtp({
+      taskId: tripId,
+      otp: deliveryOtp,
+      actor: { riderId, isDispatchAdmin: false, actorUserId: submitterUserId },
+    }),
+  ]);
+  assert.equal(otpRace.filter((r) => r.status === 'fulfilled').length, 1);
+  assert.equal(otpRace.filter((r) => r.status === 'rejected').length, 1);
+
+  const colRows = await freshPool.query(`SELECT id, collected_amount FROM cod_collections WHERE order_id = $1`, [codOrd.order.id]);
+  assert.equal(colRows.rowCount, 1);
+  const collectionId = colRows.rows[0].id as string;
+  const collectedAmount = Number(colRows.rows[0].collected_amount);
+
+  // Direct duplicate cod_collections INSERT must fail with 23505
+  await assert.rejects(
+    () =>
+      freshPool.query(
+        `INSERT INTO cod_collections (collection_reference, order_id, rider_id, expected_amount, collected_amount)
+         VALUES ($1, $2, $3, $4, $4)`,
+        [`COL_DUP_${Date.now()}`, codOrd.order.id, riderId, collectedAmount]
+      ),
+    (err: any) => err?.code === '23505'
+  );
+
+  // Race 2: Concurrent overlapping remittance submissions claiming the same COD order -> strictly 1 succeeds
+  console.log('[PG16-15.9] Verifying concurrent remittance reservation race on PG 16...');
+  const remRace = await Promise.allSettled([
+    codCashAccountabilityService.submitRemittance({
+      riderId,
+      amount: collectedAmount,
+      method: 'CASH_HUB',
+      orderIds: [codOrd.order.id],
+      idempotencyKey: `pg16_rem_race_a_${codOrd.order.id}`,
+      submittedByUserId: submitterUserId,
+    }),
+    codCashAccountabilityService.submitRemittance({
+      riderId,
+      amount: collectedAmount,
+      method: 'CASH_HUB',
+      orderIds: [codOrd.order.id],
+      idempotencyKey: `pg16_rem_race_b_${codOrd.order.id}`,
+      submittedByUserId: submitterUserId,
+    }),
+  ]);
+  const remOk = remRace.filter((r) => r.status === 'fulfilled') as Array<PromiseFulfilledResult<any>>;
+  const remFail = remRace.filter((r) => r.status === 'rejected');
+  assert.equal(remOk.length, 1, 'Strictly one concurrent remittance claiming the same COD collection may succeed.');
+  assert.equal(remFail.length, 1, 'Overlapping concurrent remittance must be rejected cleanly.');
+
+  const winningRemId = remOk[0].value.remittanceId as string;
+
+  // Receive remittance cleanly by independent receiver
+  await codCashAccountabilityService.acknowledgeReceipt({
+    remittanceId: winningRemId,
+    receiverUserId,
+    receivedAmount: collectedAmount,
+  });
+
+  // Race 3: Concurrent verifications by two distinct finance admins -> strictly 1 succeeds and clears cash once
+  console.log('[PG16-15.9] Verifying concurrent remittance verification race on PG 16...');
+  const verRace = await Promise.allSettled([
+    codCashAccountabilityService.verifyRemittance({
+      remittanceId: winningRemId,
+      verifierUserId: verifier1UserId,
+      verifiedAmount: collectedAmount,
+    }),
+    codCashAccountabilityService.verifyRemittance({
+      remittanceId: winningRemId,
+      verifierUserId: verifier2UserId,
+      verifiedAmount: collectedAmount,
+    }),
+  ]);
+  assert.equal(verRace.filter((r) => r.status === 'fulfilled').length, 1, 'Strictly one concurrent verification may clear liability.');
+  assert.equal(verRace.filter((r) => r.status === 'rejected').length, 1, 'Second concurrent verifier must hit REMITTANCE_ALREADY_VERIFIED.');
+
+  const postCol = (
+    await freshPool.query(`SELECT status, cleared_amount FROM cod_collections WHERE id = $1`, [collectionId])
+  ).rows[0];
+  assert.equal(postCol.status, 'CLEARED');
+  assert.equal(Number(postCol.cleared_amount), collectedAmount);
+  const postRiderCash = Number(
+    (await freshPool.query(`SELECT floating_cash_balance FROM riders WHERE id = $1`, [riderId])).rows[0].floating_cash_balance
+  );
+  assert.equal(postRiderCash, 0, 'Verified remittance must clear rider floating cash balance cleanly to 0.');
+
+  console.log('PostgreSQL 16 Sprint 15.9 checks (Migration 030 schema, GL triggers, 23514 SoD constraints, 23505 uniqueness, and concurrent collection/remittance/verification races) passed.');
 }
 
 async function runSuite(): Promise<void> {

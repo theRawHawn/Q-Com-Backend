@@ -1,5 +1,6 @@
 import pg from 'pg';
 import crypto from 'crypto';
+import BigNumber from 'bignumber.js';
 import { getPool, transaction } from '../../database/connection.js';
 import { candidateGenerator } from './candidateGenerator.js';
 import { defaultScoringStrategy } from './dispatchScoringStrategy.js';
@@ -7,6 +8,9 @@ import { dispatchEventPublisher } from './dispatchEvents.js';
 import { outboxService } from '../outbox/outboxService.js';
 import { deliveryEconomicsService } from '../delivery/deliveryEconomicsService.js';
 import { routingService } from '../routing/routingService.js';
+import { toDecimal, roundCurrency, add, subtract } from '../pricing/money.js';
+import { isCodPaymentMethod } from '../ledger/ledgerService.js';
+import { codCashAccountabilityService } from '../settlements/codCashAccountabilityService.js';
 import { DispatchAssignmentRecord, DispatchCandidateContext, DispatchOfferRecord, RiderCandidate } from './dispatchTypes.js';
 
 export class DispatchService {
@@ -31,6 +35,7 @@ export class DispatchService {
     // 1. Retrieve order and merchant details from PostgreSQL
     const orderRes = await pool.query(`
       SELECT o.id, o.merchant_id, o.items_subtotal, o.delivery_fee, o.handling_fee, o.jobsite_address, o.status,
+             o.payment_method, o.total_amount,
              m.latitude as merchant_lat, m.longitude as merchant_lng
       FROM orders o
       JOIN merchants m ON o.merchant_id = m.id
@@ -67,6 +72,8 @@ export class DispatchService {
       itemsSubtotal: parseFloat(orderRow.items_subtotal),
       customerDeliveryFee: parseFloat(orderRow.delivery_fee),
       handlingFee: parseFloat(orderRow.handling_fee),
+      paymentMethod: orderRow.payment_method,
+      orderTotal: parseFloat(orderRow.total_amount),
     };
 
     // 2. Candidate Generation & Scoring
@@ -95,7 +102,10 @@ export class DispatchService {
 
       // Lock rider row
       const riderLock = await client.query(`
-        SELECT id, status FROM riders
+        SELECT id, status, floating_cash_balance, floating_cash_limit,
+               cod_restricted, active_cod_dispute_count,
+               cod_ceiling_override_limit, cod_ceiling_override_until
+        FROM riders
         WHERE id = $1
         FOR UPDATE
       `, [topCandidate.riderId]);
@@ -104,9 +114,20 @@ export class DispatchService {
         throw new Error(`RIDER_NOT_FOUND: Rider '${topCandidate.riderId}' not found.`);
       }
 
-      const currentRiderStatus = riderLock.rows[0].status;
+      const riderRow = riderLock.rows[0];
+      const currentRiderStatus = riderRow.status;
       if (!['AVAILABLE', 'IDLE_AT_HUB'].includes(currentRiderStatus)) {
         throw new Error(`RIDER_UNAVAILABLE: Rider '${topCandidate.riderId}' status changed to '${currentRiderStatus}'.`);
+      }
+
+      if (isCodPaymentMethod(orderRow.payment_method)) {
+        const activeDisputes = parseInt(String(riderRow.active_cod_dispute_count || '0'), 10) || 0;
+        const { effectiveLimit } = codCashAccountabilityService.resolveEffectiveCashCeiling(riderRow);
+        const currentLiability = toDecimal(roundCurrency(riderRow.floating_cash_balance || 0));
+        const newCodAmt = toDecimal(roundCurrency(orderRow.total_amount || 0));
+        if (riderRow.cod_restricted === true || activeDisputes > 0 || currentLiability.gte(effectiveLimit) || add(currentLiability, newCodAmt).gt(effectiveLimit)) {
+          throw new Error(`RIDER_COD_RESTRICTED: Rider '${topCandidate.riderId}' cannot be dispatched COD orders due to cash ceiling or open COD dispute.`);
+        }
       }
 
       const assignmentId = crypto.randomUUID();
@@ -309,18 +330,26 @@ export class DispatchService {
       }
 
       // Lock rider row and verify eligibility (prevents accepting while OFFLINE or SUSPENDED)
-      const riderLock = await client.query(`SELECT id, status FROM riders WHERE id = $1 FOR UPDATE`, [riderId]);
+      const riderLock = await client.query(
+        `SELECT id, status, floating_cash_balance, floating_cash_limit,
+                cod_restricted, active_cod_dispute_count,
+                cod_ceiling_override_limit, cod_ceiling_override_until
+         FROM riders WHERE id = $1 FOR UPDATE`,
+        [riderId]
+      );
       if (riderLock.rows.length === 0) {
         throw new Error(`RIDER_NOT_FOUND: Rider '${riderId}' not found.`);
       }
-      if (['SUSPENDED', 'OFFLINE'].includes(riderLock.rows[0].status)) {
-        throw new Error(`RIDER_UNAVAILABLE: Rider '${riderId}' is in '${riderLock.rows[0].status}' status and cannot accept offers.`);
+      const lockedRider = riderLock.rows[0];
+      if (['SUSPENDED', 'OFFLINE'].includes(lockedRider.status)) {
+        throw new Error(`RIDER_UNAVAILABLE: Rider '${riderId}' is in '${lockedRider.status}' status and cannot accept offers.`);
       }
 
       // Compute dynamic fare components from delivery_economics_configs + order/store route geometry
       const econConfig = await deliveryEconomicsService.getConfig(client);
       const orderLocRes = await client.query(
-        `SELECT o.jobsite_address, m.latitude AS merchant_lat, m.longitude AS merchant_lng
+        `SELECT o.jobsite_address, o.payment_method, o.total_amount,
+                m.latitude AS merchant_lat, m.longitude AS merchant_lng
          FROM orders o
          JOIN merchants m ON o.merchant_id = m.id
          WHERE o.id = $1
@@ -331,6 +360,15 @@ export class DispatchService {
       let distanceKm = 0;
       if (orderLocRes.rows.length > 0) {
         const locRow = orderLocRes.rows[0];
+        if (isCodPaymentMethod(locRow.payment_method)) {
+          const activeDisputes = parseInt(String(lockedRider.active_cod_dispute_count || '0'), 10) || 0;
+          const { effectiveLimit } = codCashAccountabilityService.resolveEffectiveCashCeiling(lockedRider);
+          const currentLiability = toDecimal(roundCurrency(lockedRider.floating_cash_balance || 0));
+          const newCodAmt = toDecimal(roundCurrency(locRow.total_amount || 0));
+          if (lockedRider.cod_restricted === true || activeDisputes > 0 || currentLiability.gte(effectiveLimit) || add(currentLiability, newCodAmt).gt(effectiveLimit)) {
+            throw new Error(`RIDER_COD_RESTRICTED: Rider '${riderId}' is restricted from accepting COD offers.`);
+          }
+        }
         const jobsite = typeof locRow.jobsite_address === 'string'
           ? JSON.parse(locRow.jobsite_address)
           : (locRow.jobsite_address || {});
@@ -352,11 +390,11 @@ export class DispatchService {
         }
       }
 
-      const baseFare = Number(econConfig.riderBasePayout.toFixed(2));
+      const baseFare = Number(roundCurrency(econConfig.riderBasePayout));
       const dynamicTotalPayout = deliveryEconomicsService.calculateRiderPayout(distanceKm, econConfig);
-      const distanceFare = Number(Math.max(0, dynamicTotalPayout - baseFare).toFixed(2));
+      const distanceFare = Number(roundCurrency(BigNumber.max(0, subtract(dynamicTotalPayout, baseFare))));
       const surgeFare = 0.00;
-      const totalRiderPayout = Number((baseFare + distanceFare + surgeFare).toFixed(2));
+      const totalRiderPayout = Number(roundCurrency(add(baseFare, distanceFare, surgeFare)));
 
       // 3. Atomically update offer & assignment status to ACCEPTED
       await client.query(`UPDATE dispatch_offers SET status = 'ACCEPTED', updated_at = NOW() WHERE id = $1`, [offerId]);
@@ -899,9 +937,9 @@ export class DispatchService {
         distanceKm = routeRes.selectedRoute.distanceKm;
       }
 
-      const baseFare = Number(econConfig.riderBasePayout.toFixed(2));
+      const baseFare = Number(roundCurrency(econConfig.riderBasePayout));
       const dynamicTotalPayout = deliveryEconomicsService.calculateRiderPayout(distanceKm, econConfig);
-      const distanceFare = Number(Math.max(0, dynamicTotalPayout - baseFare).toFixed(2));
+      const distanceFare = Number(roundCurrency(BigNumber.max(0, subtract(dynamicTotalPayout, baseFare))));
 
       const candidateTripId = crypto.randomUUID();
       let tripId: string | undefined;
