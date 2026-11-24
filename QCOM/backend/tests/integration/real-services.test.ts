@@ -1215,7 +1215,7 @@ async function runSprint15_9PostgresChecks(freshPool: import('pg').Pool): Promis
     /LEDGER_IMMUTABLE/
   );
   await assert.rejects(
-    () => freshPool.query(`DELETE FROM general_ledger_entries WHERE transaction_reference NOT LIKE 'TX_%'`),
+    () => freshPool.query(`DELETE FROM general_ledger_entries WHERE transaction_reference NOT LIKE 'TX_DUP_TEST_%' AND transaction_reference NOT LIKE 'TX_GL_TEST_%'`),
     /LEDGER_IMMUTABLE/
   );
   await assert.rejects(

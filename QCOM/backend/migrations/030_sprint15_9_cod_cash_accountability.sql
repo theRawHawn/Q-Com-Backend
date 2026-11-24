@@ -6,12 +6,17 @@
 -- ============================================================================
 -- 1. Chart of Accounts (COA) & General Ledger Transaction Type Extensions
 -- ============================================================================
-INSERT INTO general_ledger_accounts (account_code, account_name, category, normal_balance, description)
-VALUES
-    ('1050', 'Rider Cash Shortage Receivable', 'ASSET', 'DEBIT', 'Recognized COD cash shortages owed by delivery partners pending recovery or authorized settlement'),
-    ('2080', 'Unidentified / Excess COD Cash Suspense', 'LIABILITY', 'CREDIT', 'Excess cash remitted by riders above expected COD liability pending reconciliation or return'),
-    ('5030', 'COD Cash Variance & Authorized Write-Off Expense', 'EXPENSE', 'DEBIT', 'Formally authorized finance write-offs for unrecoverable COD cash shortages')
-ON CONFLICT (account_code) DO NOTHING;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM general_ledger_accounts LIMIT 1) THEN
+        INSERT INTO general_ledger_accounts (account_code, account_name, category, normal_balance, description)
+        VALUES
+            ('1050', 'Rider Cash Shortage Receivable', 'ASSET', 'DEBIT', 'Recognized COD cash shortages owed by delivery partners pending recovery or authorized settlement'),
+            ('2080', 'Unidentified / Excess COD Cash Suspense', 'LIABILITY', 'CREDIT', 'Excess cash remitted by riders above expected COD liability pending reconciliation or return'),
+            ('5030', 'COD Cash Variance & Authorized Write-Off Expense', 'EXPENSE', 'DEBIT', 'Formally authorized finance write-offs for unrecoverable COD cash shortages')
+        ON CONFLICT (account_code) DO NOTHING;
+    END IF;
+END $$;
 
 ALTER TABLE general_ledger_entries DROP CONSTRAINT IF EXISTS general_ledger_entries_transaction_type_check;
 ALTER TABLE general_ledger_entries DROP CONSTRAINT IF EXISTS general_ledger_entries_constraint_1;
