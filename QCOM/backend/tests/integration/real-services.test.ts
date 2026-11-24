@@ -1245,12 +1245,12 @@ async function runSprint15_9PostgresChecks(freshPool: import('pg').Pool): Promis
   const verifier1UserId = crypto.randomUUID();
   const verifier2UserId = crypto.randomUUID();
   await freshPool.query(
-    `INSERT INTO users (id, phone, full_name, role, is_active, is_verified)
+    `INSERT INTO users (id, phone, name, is_phone_verified)
      VALUES
-       ($1, $5, 'PG16 COD Rider', 'RIDER', TRUE, TRUE),
-       ($2, $6, 'PG16 COD Receiver', 'OPERATIONS', TRUE, TRUE),
-       ($3, $7, 'PG16 COD Verifier 1', 'FINANCE_ADMIN', TRUE, TRUE),
-       ($4, $8, 'PG16 COD Verifier 2', 'FINANCE_ADMIN', TRUE, TRUE)`,
+       ($1, $5, 'PG16 COD Rider', TRUE),
+       ($2, $6, 'PG16 COD Receiver', TRUE),
+       ($3, $7, 'PG16 COD Verifier 1', TRUE),
+       ($4, $8, 'PG16 COD Verifier 2', TRUE)`,
     [
       submitterUserId,
       receiverUserId,

@@ -930,6 +930,7 @@ export class CodCashAccountabilityService {
       }
 
       // 5. Insert durable cod_remittances row
+      const submittedAtTs = initialStatus === 'SUBMITTED' ? new Date() : null;
       const insRemRes = await client.query(
         `INSERT INTO cod_remittances (
            remittance_reference, idempotency_key, rider_id, currency,
@@ -938,7 +939,7 @@ export class CodCashAccountabilityService {
          ) VALUES (
            $1, $2, $3, 'INR',
            $4, $5, $6, $7,
-           $8, $9, CASE WHEN $8 = 'SUBMITTED' THEN NOW() ELSE NULL END, $10
+           $8, $9, $10, $11
          )
          RETURNING id`,
         [
@@ -951,6 +952,7 @@ export class CodCashAccountabilityService {
           params.evidenceReference || null,
           initialStatus,
           params.submittedByUserId,
+          submittedAtTs,
           JSON.stringify({
             unbackedResidualAmount: Number(roundCurrency(remainingToAllocateBn)),
           }),
@@ -1177,24 +1179,26 @@ export class CodCashAccountabilityService {
       }
 
       const nextStatus: RemittanceStatus = params.moveToVerificationPending ? 'VERIFICATION_PENDING' : 'RECEIVED';
+      const verificationStartedAtTs = params.moveToVerificationPending ? new Date() : null;
       await client.query(
         `UPDATE cod_remittances
          SET status = $1,
              received_amount = $2,
              received_by = $3,
              received_at = NOW(),
-             verification_started_at = CASE WHEN $1 = 'VERIFICATION_PENDING' THEN NOW() ELSE verification_started_at END,
+             verification_started_at = COALESCE($6, verification_started_at),
              collection_location = COALESCE($4, collection_location),
              evidence_reference = COALESCE($5, evidence_reference),
              version = version + 1,
              updated_at = NOW()
-         WHERE id = $6`,
+         WHERE id = $7`,
         [
           nextStatus,
           expectedRecAmt.toFixed(2),
           params.receiverUserId,
           params.collectionLocation || null,
           params.evidenceReference || null,
+          verificationStartedAtTs,
           rem.id,
         ]
       );
@@ -1469,20 +1473,22 @@ export class CodCashAccountabilityService {
         }
 
         const extraDisputedBn = finalStatus === 'SHORTAGE' ? releaseUnusedBn : new BigNumber(0);
+        const colClearedAtTs = newColStatus === 'CLEARED' ? new Date() : null;
         await client.query(
           `UPDATE cod_collections
            SET allocated_amount = $1,
                cleared_amount = $2,
                disputed_amount = disputed_amount + $3,
                status = $4,
-               cleared_at = CASE WHEN $4 = 'CLEARED' THEN COALESCE(cleared_at, NOW()) ELSE cleared_at END,
+               cleared_at = COALESCE(cleared_at, $5),
                updated_at = NOW()
-           WHERE id = $5`,
+           WHERE id = $6`,
           [
             roundCurrency(newColAllocatedBn),
             roundCurrency(newColClearedBn),
             roundCurrency(extraDisputedBn),
             newColStatus,
+            colClearedAtTs,
             row.collection_id,
           ]
         );
@@ -1583,6 +1589,7 @@ export class CodCashAccountabilityService {
       }
 
       const prevMeta = (rem.metadata && typeof rem.metadata === 'object' ? rem.metadata : {}) as Record<string, unknown>;
+      const remClearedAtTs = ['LIABILITY_CLEARED', 'EXCESS'].includes(finalStatus) ? new Date() : null;
       await client.query(
         `UPDATE cod_remittances
          SET status = $1,
@@ -1592,7 +1599,7 @@ export class CodCashAccountabilityService {
              excess_amount = $5,
              verified_by = $6,
              verified_at = NOW(),
-             cleared_at = CASE WHEN $1 IN ('LIABILITY_CLEARED', 'EXCESS') THEN NOW() ELSE NULL END,
+             cleared_at = $12,
              journal_batch_id = $7,
              ledger_transaction_reference = $8,
              discrepancy_notes = COALESCE($9, discrepancy_notes),
@@ -1600,7 +1607,7 @@ export class CodCashAccountabilityService {
              metadata = $11,
              version = version + 1,
              updated_at = NOW()
-         WHERE id = $12`,
+         WHERE id = $13`,
         [
           finalStatus,
           verifiedAmtNum.toFixed(2),
@@ -1613,6 +1620,7 @@ export class CodCashAccountabilityService {
           params.discrepancyNotes || null,
           params.evidenceReference || null,
           JSON.stringify({ ...prevMeta, verifyIdempotencyKey: params.idempotencyKey || null }),
+          remClearedAtTs,
           rem.id,
         ]
       );
@@ -1784,17 +1792,20 @@ export class CodCashAccountabilityService {
         );
       }
 
+      const rejectedByVal = targetStatus === 'REJECTED' ? params.actorUserId : null;
+      const rejectedAtTs = targetStatus === 'REJECTED' ? new Date() : null;
+      const cancelledAtTs = targetStatus === 'CANCELLED' ? new Date() : null;
       await client.query(
         `UPDATE cod_remittances
          SET status = $1,
-             rejected_by = CASE WHEN $1 = 'REJECTED' THEN $2 ELSE rejected_by END,
-             rejected_at = CASE WHEN $1 = 'REJECTED' THEN NOW() ELSE rejected_at END,
-             cancelled_at = CASE WHEN $1 = 'CANCELLED' THEN NOW() ELSE cancelled_at END,
-             rejection_reason = $3,
+             rejected_by = COALESCE($2, rejected_by),
+             rejected_at = COALESCE($3, rejected_at),
+             cancelled_at = COALESCE($4, cancelled_at),
+             rejection_reason = $5,
              version = version + 1,
              updated_at = NOW()
-         WHERE id = $4`,
-        [targetStatus, params.actorUserId, params.reason.trim(), rem.id]
+         WHERE id = $6`,
+        [targetStatus, rejectedByVal, rejectedAtTs, cancelledAtTs, params.reason.trim(), rem.id]
       );
 
       return { remittanceId: rem.id as string, status: targetStatus };
@@ -2070,15 +2081,16 @@ export class CodCashAccountabilityService {
               ? 'CLEARED'
               : 'PARTIALLY_CLEARED';
 
+          const colClearedAtTs = finalColStatus === 'CLEARED' ? new Date() : null;
           await client.query(
             `UPDATE cod_collections
              SET disputed_amount = GREATEST(0, disputed_amount - $1),
                  cleared_amount = $2,
                  status = $3,
-                 cleared_at = CASE WHEN $3 = 'CLEARED' THEN COALESCE(cleared_at, NOW()) ELSE cleared_at END,
+                 cleared_at = COALESCE(cleared_at, $4),
                  updated_at = NOW()
-             WHERE id = $4`,
-            [roundCurrency(take), roundCurrency(newCleared), finalColStatus, col.collection_id]
+             WHERE id = $5`,
+            [roundCurrency(take), roundCurrency(newCleared), finalColStatus, colClearedAtTs, col.collection_id]
           );
 
           if (finalColStatus === 'CLEARED') {
@@ -2092,6 +2104,7 @@ export class CodCashAccountabilityService {
 
       // If ESCALATED_TO_RECEIVABLE keep status 'ESCALATED' until RECEIVABLE_COLLECTED, otherwise 'RESOLVED'
       const nextDisputeStatus = params.resolutionType === 'ESCALATED_TO_RECEIVABLE' ? 'ESCALATED' : 'RESOLVED';
+      const resolvedAtTs = nextDisputeStatus === 'RESOLVED' ? new Date() : null;
       await client.query(
         `UPDATE cod_cash_disputes
          SET status = $1,
@@ -2100,9 +2113,9 @@ export class CodCashAccountabilityService {
              resolution_notes = $4,
              journal_batch_id = COALESCE($5, journal_batch_id),
              ledger_transaction_reference = COALESCE($6, ledger_transaction_reference),
-             resolved_at = CASE WHEN $1 = 'RESOLVED' THEN NOW() ELSE resolved_at END,
+             resolved_at = COALESCE($7, resolved_at),
              updated_at = NOW()
-         WHERE id = $7`,
+         WHERE id = $8`,
         [
           nextDisputeStatus,
           params.resolutionType,
@@ -2110,6 +2123,7 @@ export class CodCashAccountabilityService {
           params.notes.trim(),
           journalBatchId,
           ledgerRef,
+          resolvedAtTs,
           dispute.id,
         ]
       );
