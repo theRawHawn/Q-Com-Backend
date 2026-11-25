@@ -1409,7 +1409,115 @@ async function runSprint15_9PostgresChecks(freshPool: import('pg').Pool): Promis
   );
   assert.equal(postRiderCash, 0, 'Verified remittance must clear rider floating cash balance cleanly to 0.');
 
-  console.log('PostgreSQL 16 Sprint 15.9 checks (Migration 030 schema, GL triggers, 23514 SoD constraints, 23505 uniqueness, and concurrent collection/remittance/verification races) passed.');
+  // Retry after commit: re-invoking verifyRemittance with same verifier must return idempotentReplay without posting duplicate GL
+  const verifyRetryRes = await codCashAccountabilityService.verifyRemittance({
+    remittanceId: winningRemId,
+    verifierUserId: verifier1UserId,
+    verifiedAmount: collectedAmount,
+  });
+  assert.equal(verifyRetryRes.idempotentReplay, true);
+
+  // Race 4 & 5: Two concurrent COD deliveries on DIFFERENT orders crossing ₹5,000 ceiling + concurrent remittance submission
+  console.log('[PG16-15.9] Verifying concurrent multi-order COD collections + ceiling enforcement + concurrent delivery/remittance lock hierarchy...');
+  const codOrdA = await orderService.createOrder({
+    userId: custUserId,
+    merchantId,
+    items: [{ productId, quantity: 1 }],
+    jobSite: { address: 'PG16 COD Race A', latitude: storeLat + 0.01, longitude: storeLng + 0.01 },
+    paymentMethod: 'Pay on Delivery',
+  });
+  const codOrdB = await orderService.createOrder({
+    userId: custUserId,
+    merchantId,
+    items: [{ productId, quantity: 1 }],
+    jobSite: { address: 'PG16 COD Race B', latitude: storeLat + 0.01, longitude: storeLng + 0.01 },
+    paymentMethod: 'Pay on Delivery',
+  });
+  // Bump order total on B so A + B crosses rider floating_cash_limit (5000) to test concurrent ceiling trigger
+  await freshPool.query(`UPDATE riders SET floating_cash_limit = $1 WHERE id = $2`, [collectedAmount * 1.5, riderId]);
+  const otpA = (await freshPool.query(`SELECT delivery_otp FROM orders WHERE id = $1`, [codOrdA.order.id])).rows[0].delivery_otp as string;
+  const otpB = (await freshPool.query(`SELECT delivery_otp FROM orders WHERE id = $1`, [codOrdB.order.id])).rows[0].delivery_otp as string;
+  const tripAId = crypto.randomUUID();
+  const tripBId = crypto.randomUUID();
+  await freshPool.query(
+    `INSERT INTO delivery_trips (id, order_id, trip_type, rider_id, status, base_fare, distance_fare, surge_fare, total_rider_payout, cod_due_amount, accepted_at, picked_up_at)
+     VALUES
+       ($1, $2, 'FORWARD', $4, 'PICKED_UP', 30, 15, 0, 45, $5, NOW(), NOW()),
+       ($3, $6, 'FORWARD', $4, 'PICKED_UP', 30, 15, 0, 45, $7, NOW(), NOW())`,
+    [tripAId, codOrdA.order.id, tripBId, riderId, codOrdA.order.totalAmount, codOrdB.order.id, codOrdB.order.totalAmount]
+  );
+
+  // Wrong OTP rollback verification before concurrent deliveries
+  await assert.rejects(
+    () =>
+      deliveryCompletionService.completeDeliveryWithOtp({
+        taskId: tripAId,
+        otp: '000000',
+        actor: { riderId, isDispatchAdmin: false, actorUserId: submitterUserId },
+      }),
+    /INVALID_OTP/
+  );
+  const rolledBackCols = await freshPool.query(`SELECT 1 FROM cod_collections WHERE order_id = $1`, [codOrdA.order.id]);
+  assert.equal(rolledBackCols.rowCount, 0, 'Rolled-back delivery OTP failure must leave 0 cod_collections rows');
+
+  // Deliver A cleanly first, then concurrently deliver B while submitting remittance for A (zero deadlock!)
+  await deliveryCompletionService.completeDeliveryWithOtp({
+    taskId: tripAId,
+    otp: otpA,
+    actor: { riderId, isDispatchAdmin: false, actorUserId: submitterUserId },
+  });
+
+  // Also test simultaneous completions using distinct orders when delivery B & new order C finish concurrently
+  const codOrdC = await orderService.createOrder({
+    userId: custUserId,
+    merchantId,
+    items: [{ productId, quantity: 1 }],
+    jobSite: { address: 'PG16 COD Race C', latitude: storeLat + 0.01, longitude: storeLng + 0.01 },
+    paymentMethod: 'Pay on Delivery',
+  });
+  const otpC = (await freshPool.query(`SELECT delivery_otp FROM orders WHERE id = $1`, [codOrdC.order.id])).rows[0].delivery_otp as string;
+  const tripCId = crypto.randomUUID();
+  await freshPool.query(
+    `INSERT INTO delivery_trips (id, order_id, trip_type, rider_id, status, base_fare, distance_fare, surge_fare, total_rider_payout, cod_due_amount, accepted_at, picked_up_at)
+     VALUES ($1, $2, 'FORWARD', $3, 'PICKED_UP', 30, 15, 0, 45, $4, NOW(), NOW())`,
+    [tripCId, codOrdC.order.id, riderId, codOrdC.order.totalAmount]
+  );
+
+  const [delBRes, delCRes, remARes] = await Promise.all([
+    deliveryCompletionService.completeDeliveryWithOtp({
+      taskId: tripBId,
+      otp: otpB,
+      actor: { riderId, isDispatchAdmin: false, actorUserId: submitterUserId },
+    }),
+    deliveryCompletionService.completeDeliveryWithOtp({
+      taskId: tripCId,
+      otp: otpC,
+      actor: { riderId, isDispatchAdmin: false, actorUserId: submitterUserId },
+    }),
+    codCashAccountabilityService.submitRemittance({
+      riderId,
+      amount: Number(codOrdA.order.totalAmount),
+      method: 'CASH_HUB',
+      orderIds: [codOrdA.order.id],
+      idempotencyKey: `pg16_concurrent_rem_${codOrdA.order.id}`,
+      submittedByUserId: submitterUserId,
+    }),
+  ]);
+  assert.equal(delBRes.orderStatus, 'DELIVERED');
+  assert.equal(delCRes.orderStatus, 'DELIVERED');
+  assert.equal(remARes.status, 'SUBMITTED');
+
+  const expectedMultiFloat = Number(
+    (Number(codOrdA.order.totalAmount) + Number(codOrdB.order.totalAmount) + Number(codOrdC.order.totalAmount)).toFixed(2)
+  );
+  const multiRiderRow = (
+    await freshPool.query(`SELECT floating_cash_balance, cod_restricted, status FROM riders WHERE id = $1`, [riderId])
+  ).rows[0];
+  assert.equal(Number(multiRiderRow.floating_cash_balance), expectedMultiFloat, 'Concurrent COD collections must never lose float increments');
+  assert.equal(multiRiderRow.cod_restricted, true, 'Crossing floating_cash_limit concurrently must set cod_restricted = TRUE');
+  assert.equal(multiRiderRow.status, 'SUSPENDED', 'Crossing floating_cash_limit concurrently must trigger SUSPENDED');
+
+  console.log('PostgreSQL 16 Sprint 15.9 checks (Migration 030 schema, GL triggers, 23514 SoD constraints, 23505 uniqueness, post-commit retry, rollback, concurrent multi-order COD collections, ceiling enforcement & concurrent remittance lock hierarchy) passed.');
 }
 
 async function runSuite(): Promise<void> {

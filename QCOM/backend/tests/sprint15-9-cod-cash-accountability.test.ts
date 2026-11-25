@@ -908,7 +908,425 @@ export async function runSprint15_9CodCashAccountabilityTests(): Promise<void> {
     console.log('✓ Group G Passed: Auth/RBAC/IDOR, COA accounts, and observability verified');
     passedGroups++;
 
-    console.log(`\n✓ Sprint 15.9 COD Cash Accountability Test Suite PASSED (${passedGroups}/7 Groups Verified)!`);
+    // =========================================================================
+    // GROUP H: Sprint 15.9.1 Independent Audit Scenarios (Examples A-E & Repaired Edge Cases)
+    // =========================================================================
+    console.log('\n[Group H] Testing Sprint 15.9.1 Examples A-E, Escalated Receivable Lifecycle, Excess Allocation & Reconciliation Idempotency...');
+    // Isolated Rider H with clean ₹0 float and high ceiling for exact ₹5,000 / ₹8,000 math checks
+    const riderHUserId = crypto.randomUUID();
+    const riderHPhone = `+91-98123${Math.floor(10000 + Math.random() * 89999)}`;
+    await pool.query(
+      `INSERT INTO users (id, phone, name, is_phone_verified) VALUES ($1, $2, 'Rider H 1591', TRUE)`,
+      [riderHUserId, riderHPhone]
+    );
+    const riderHId = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO riders (id, user_id, rider_code, name, phone, status, vehicle_type, payload_capacity_kg, floating_cash_balance, floating_cash_limit, wallet_balance)
+       VALUES ($1, $2, $3, 'Rider H 1591', $4, 'AVAILABLE', 'ev_scooter', 25, 0.00, 15000.00, 500.00)`,
+      [riderHId, riderHUserId, `RDR-1591-${Date.now()}`, riderHPhone]
+    );
+
+    // Example A: Rider liability ₹5,000, Submitted ₹5,000, Received ₹5,000, Verified ₹4,800 -> ₹200 remains unresolved & traceable
+    const exAOrd = await seedOrderWithTrip({ paymentMethod: 'Pay on Delivery', riderId: riderHId, totalAmount: 5000.0 });
+    await deliveryCompletionService.completeDeliveryWithOtp({
+      taskId: exAOrd.tripId,
+      otp: exAOrd.otp,
+      actor: { riderId: riderHId, isDispatchAdmin: false, actorUserId: riderHUserId },
+    });
+    const exASub = await codCashAccountabilityService.submitRemittance({
+      riderId: riderHId,
+      amount: 5000.0,
+      submittedByUserId: riderHUserId,
+    });
+    await codCashAccountabilityService.acknowledgeReceipt({
+      remittanceId: exASub.remittanceId,
+      receiverUserId: opsUserId,
+      receivedAmount: 5000.0,
+    });
+    const exAVer = await codCashAccountabilityService.verifyRemittance({
+      remittanceId: exASub.remittanceId,
+      verifierUserId: finUserId,
+      verifiedAmount: 4800.0,
+      idempotencyKey: 'idem_verify_ex_a',
+    });
+    assert.strictEqual(exAVer.status, 'SHORTAGE');
+    assert.strictEqual(exAVer.clearedAmount, 4800.0);
+    assert.strictEqual(exAVer.shortageAmount, 200.0);
+    assert.strictEqual(exAVer.remainingCash, 200.0);
+    assert.ok(exAVer.disputeId);
+
+    // Example D & E on Example A: concurrent/duplicate different verifier blocked; retry by same verifier after lost response is idempotent
+    await assert.rejects(
+      () => codCashAccountabilityService.verifyRemittance({
+        remittanceId: exASub.remittanceId,
+        verifierUserId: adminUserId,
+        verifiedAmount: 4800.0,
+      }),
+      (e: any) => e instanceof CodAccountabilityError && e.errorCode === 'REMITTANCE_ALREADY_VERIFIED'
+    );
+    const exARetry = await codCashAccountabilityService.verifyRemittance({
+      remittanceId: exASub.remittanceId,
+      verifierUserId: finUserId,
+      verifiedAmount: 4800.0,
+      idempotencyKey: 'idem_verify_ex_a',
+    });
+    assert.strictEqual(exARetry.idempotentReplay, true);
+    assert.strictEqual(exARetry.journalBatchId, exAVer.journalBatchId);
+
+    // RECEIVABLE_COLLECTED MUST be blocked before ESCALATED_TO_RECEIVABLE
+    await assert.rejects(
+      () => codCashAccountabilityService.resolveDispute({
+        disputeId: exAVer.disputeId!,
+        resolverUserId: finUserId,
+        resolutionType: 'RECEIVABLE_COLLECTED',
+        notes: 'Premature receivable collection without escalation',
+      }),
+      (e: any) => e instanceof CodAccountabilityError && e.errorCode === 'RECEIVABLE_NOT_ESCALATED'
+    );
+
+    // Escalate ₹200 shortage to 1050 Receivable -> then collect via RECEIVABLE_COLLECTED
+    const exAEsc = await codCashAccountabilityService.resolveDispute({
+      disputeId: exAVer.disputeId!,
+      resolverUserId: finUserId,
+      resolutionType: 'ESCALATED_TO_RECEIVABLE',
+      notes: 'Escalate ₹200 shortage to payroll receivable',
+      idempotencyKey: 'idem_esc_a',
+    });
+    assert.strictEqual(exAEsc.status, 'ESCALATED');
+    assert.strictEqual(exAEsc.remainingCash, 0);
+
+    // Retrying escalation with same key is idempotent
+    const exAEscRetry = await codCashAccountabilityService.resolveDispute({
+      disputeId: exAVer.disputeId!,
+      resolverUserId: finUserId,
+      resolutionType: 'ESCALATED_TO_RECEIVABLE',
+      notes: 'Escalate ₹200 shortage to payroll receivable',
+      idempotencyKey: 'idem_esc_a',
+    });
+    assert.strictEqual(exAEscRetry.idempotentReplay, true);
+
+    const exACollect = await codCashAccountabilityService.resolveDispute({
+      disputeId: exAVer.disputeId!,
+      resolverUserId: finUserId,
+      resolutionType: 'RECEIVABLE_COLLECTED',
+      notes: 'Collected ₹200 receivable from rider',
+    });
+    assert.strictEqual(exACollect.status, 'RESOLVED');
+
+    // Also verify ESCALATED -> WRITTEN_OFF settles 1050 (fromReceivable=true) even when rider float is 0!
+    const escWoOrd = await seedOrderWithTrip({ paymentMethod: 'Pay on Delivery', riderId: riderHId, totalAmount: 300.0 });
+    await deliveryCompletionService.completeDeliveryWithOtp({
+      taskId: escWoOrd.tripId,
+      otp: escWoOrd.otp,
+      actor: { riderId: riderHId, isDispatchAdmin: false, actorUserId: riderHUserId },
+    });
+    const escWoSub = await codCashAccountabilityService.submitRemittance({
+      riderId: riderHId,
+      amount: 300.0,
+      submittedByUserId: riderHUserId,
+    });
+    await codCashAccountabilityService.acknowledgeReceipt({
+      remittanceId: escWoSub.remittanceId,
+      receiverUserId: opsUserId,
+      receivedAmount: 300.0,
+    });
+    const escWoVer = await codCashAccountabilityService.verifyRemittance({
+      remittanceId: escWoSub.remittanceId,
+      verifierUserId: finUserId,
+      verifiedAmount: 200.0,
+    });
+    assert.strictEqual(escWoVer.shortageAmount, 100.0);
+    await codCashAccountabilityService.resolveDispute({
+      disputeId: escWoVer.disputeId!,
+      resolverUserId: finUserId,
+      resolutionType: 'ESCALATED_TO_RECEIVABLE',
+      notes: 'Escalate ₹100 shortage to 1050 receivable',
+    });
+    const escWoDone = await codCashAccountabilityService.resolveDispute({
+      disputeId: escWoVer.disputeId!,
+      resolverUserId: adminUserId,
+      resolutionType: 'WRITTEN_OFF',
+      notes: 'Approved finance write-off of unrecoverable 1050 receivable',
+    });
+    assert.strictEqual(escWoDone.status, 'RESOLVED');
+    const rH1050 = (
+      await pool.query(
+        `SELECT COALESCE(SUM(CASE WHEN entry_side = 'DEBIT' THEN amount ELSE -amount END), 0) AS net1050
+         FROM general_ledger_entries WHERE rider_id = $1 AND account_code = '1050'`,
+        [riderHId]
+      )
+    ).rows[0];
+    assert.strictEqual(Number(roundCurrency(rH1050.net1050)), 0, 'Account 1050 receivable must net to 0 after collection and write-off');
+
+    // Example B: Rider liability ₹5,000, Submitted ₹5,000, Received ₹5,100 -> ₹100 excess separately in 2080
+    const exBOrd = await seedOrderWithTrip({ paymentMethod: 'Pay on Delivery', riderId: riderHId, totalAmount: 5000.0 });
+    await deliveryCompletionService.completeDeliveryWithOtp({
+      taskId: exBOrd.tripId,
+      otp: exBOrd.otp,
+      actor: { riderId: riderHId, isDispatchAdmin: false, actorUserId: riderHUserId },
+    });
+    const exBSub = await codCashAccountabilityService.submitRemittance({
+      riderId: riderHId,
+      amount: 5000.0,
+      submittedByUserId: riderHUserId,
+    });
+    await codCashAccountabilityService.acknowledgeReceipt({
+      remittanceId: exBSub.remittanceId,
+      receiverUserId: opsUserId,
+      receivedAmount: 5100.0,
+    });
+    const exBVer = await codCashAccountabilityService.verifyRemittance({
+      remittanceId: exBSub.remittanceId,
+      verifierUserId: finUserId,
+      verifiedAmount: 5100.0,
+    });
+    assert.strictEqual(exBVer.status, 'EXCESS');
+    assert.strictEqual(exBVer.clearedAmount, 5000.0);
+    assert.strictEqual(exBVer.excessAmount, 100.0);
+    assert.strictEqual(exBVer.remainingCash, 0);
+
+    // Attempting reverse after EXCESS resolution fails, and EXCESS_ALLOCATED_TO_COLLECTION without open float fails cleanly
+    await assert.rejects(
+      () => codCashAccountabilityService.resolveDispute({
+        disputeId: exBVer.disputeId!,
+        resolverUserId: adminUserId,
+        resolutionType: 'EXCESS_ALLOCATED_TO_COLLECTION',
+        notes: 'No open collections yet',
+      }),
+      (e: any) => e instanceof CodAccountabilityError && e.errorCode === 'INSUFFICIENT_FLOAT_FOR_EXCESS_ALLOCATION'
+    );
+
+    // Seed a ₹250 open COD order, then allocate ₹100 excess -> float, GL 1030, and collection cleared_amount stay 100% synced!
+    const exBOpenOrd = await seedOrderWithTrip({ paymentMethod: 'Pay on Delivery', riderId: riderHId, totalAmount: 250.0 });
+    await deliveryCompletionService.completeDeliveryWithOtp({
+      taskId: exBOpenOrd.tripId,
+      otp: exBOpenOrd.otp,
+      actor: { riderId: riderHId, isDispatchAdmin: false, actorUserId: riderHUserId },
+    });
+    const allocExcessRes = await codCashAccountabilityService.resolveDispute({
+      disputeId: exBVer.disputeId!,
+      resolverUserId: adminUserId,
+      resolutionType: 'EXCESS_ALLOCATED_TO_COLLECTION',
+      notes: 'Apply ₹100 excess toward next COD order liability',
+    });
+    assert.strictEqual(allocExcessRes.status, 'RESOLVED');
+    assert.strictEqual(allocExcessRes.remainingCash, 150.0);
+
+    const exHSummary = await codCashAccountabilityService.getRiderCashSummary(riderHId);
+    assert.strictEqual(exHSummary.ledgerDriftAmount, 0, 'EXCESS_ALLOCATED_TO_COLLECTION must maintain zero GL 1030 drift');
+    assert.strictEqual(exHSummary.materializedFloatingCashBalance, 150.0);
+
+    // Clear remaining ₹150 cleanly so Example C starts at 0
+    const clr150Sub = await codCashAccountabilityService.submitRemittance({
+      riderId: riderHId,
+      amount: 150.0,
+      submittedByUserId: riderHUserId,
+    });
+    await codCashAccountabilityService.acknowledgeReceipt({
+      remittanceId: clr150Sub.remittanceId,
+      receiverUserId: opsUserId,
+      receivedAmount: 150.0,
+    });
+    await codCashAccountabilityService.verifyRemittance({
+      remittanceId: clr150Sub.remittanceId,
+      verifierUserId: finUserId,
+      verifiedAmount: 150.0,
+    });
+
+    // Attempting reverseVerifiedRemittance on exBSub whose excess dispute is already RESOLVED must fail (409)
+    await assert.rejects(
+      () => codCashAccountabilityService.reverseVerifiedRemittance({
+        remittanceId: exBSub.remittanceId,
+        actorUserId: adminUserId,
+        reason: 'Attempt reversal after excess already allocated',
+      }),
+      (e: any) => e instanceof CodAccountabilityError && e.errorCode === 'REMITTANCE_DISPUTE_ALREADY_PROCESSED'
+    );
+
+    // Example C: Rider liability ₹8,000, verified partial remittance ₹3,000 -> ₹5,000 outstanding
+    const exCOrd = await seedOrderWithTrip({ paymentMethod: 'Pay on Delivery', riderId: riderHId, totalAmount: 8000.0 });
+    await deliveryCompletionService.completeDeliveryWithOtp({
+      taskId: exCOrd.tripId,
+      otp: exCOrd.otp,
+      actor: { riderId: riderHId, isDispatchAdmin: false, actorUserId: riderHUserId },
+    });
+    const exCSub = await codCashAccountabilityService.submitRemittance({
+      riderId: riderHId,
+      amount: 3000.0,
+      submittedByUserId: riderHUserId,
+    });
+    await codCashAccountabilityService.acknowledgeReceipt({
+      remittanceId: exCSub.remittanceId,
+      receiverUserId: opsUserId,
+      receivedAmount: 3000.0,
+    });
+    const exCVer = await codCashAccountabilityService.verifyRemittance({
+      remittanceId: exCSub.remittanceId,
+      verifierUserId: finUserId,
+      verifiedAmount: 3000.0,
+    });
+    assert.strictEqual(exCVer.status, 'LIABILITY_CLEARED');
+    assert.strictEqual(exCVer.clearedAmount, 3000.0);
+    assert.strictEqual(exCVer.remainingCash, 5000.0);
+
+    const exCSum = await codCashAccountabilityService.getRiderCashSummary(riderHId);
+    assert.strictEqual(exCSum.totalRiderCashLiability, 5000.0);
+    assert.strictEqual(exCSum.totalOutstandingAmount, 5000.0);
+    const exCTrip = (await pool.query(`SELECT cod_reconciled FROM delivery_trips WHERE id = $1`, [exCOrd.tripId])).rows[0];
+    assert.strictEqual(exCTrip.cod_reconciled, false, 'Partial remittance must NOT mark trip cod_reconciled=TRUE');
+
+    // Reversal of a SHORTAGE remittance with an OPEN dispute cleanly closes the open dispute & restores disputed_amount
+    const revShortOrd = await seedOrderWithTrip({ paymentMethod: 'Pay on Delivery', riderId: riderHId, totalAmount: 400.0 });
+    await deliveryCompletionService.completeDeliveryWithOtp({
+      taskId: revShortOrd.tripId,
+      otp: revShortOrd.otp,
+      actor: { riderId: riderHId, isDispatchAdmin: false, actorUserId: riderHUserId },
+    });
+    const revShortSub = await codCashAccountabilityService.submitRemittance({
+      riderId: riderHId,
+      amount: 400.0,
+      orderIds: [revShortOrd.orderId],
+      submittedByUserId: riderHUserId,
+    });
+    await codCashAccountabilityService.acknowledgeReceipt({
+      remittanceId: revShortSub.remittanceId,
+      receiverUserId: opsUserId,
+      receivedAmount: 400.0,
+    });
+    const revShortVer = await codCashAccountabilityService.verifyRemittance({
+      remittanceId: revShortSub.remittanceId,
+      verifierUserId: finUserId,
+      verifiedAmount: 250.0,
+    });
+    assert.strictEqual(revShortVer.status, 'SHORTAGE');
+    const revShortDone = await codCashAccountabilityService.reverseVerifiedRemittance({
+      remittanceId: revShortSub.remittanceId,
+      actorUserId: adminUserId,
+      reason: 'Cash deposit batch voided before settlement cut-off',
+    });
+    assert.strictEqual(revShortDone.restoredLiability, 250.0);
+    const closedDisp = (await pool.query(`SELECT status, resolution_type FROM cod_cash_disputes WHERE id = $1`, [revShortVer.disputeId])).rows[0];
+    assert.strictEqual(closedDisp.status, 'REJECTED');
+    assert.strictEqual(closedDisp.resolution_type, 'REVERSED');
+    const rHDisputeCnt = Number((await pool.query(`SELECT active_cod_dispute_count FROM riders WHERE id = $1`, [riderHId])).rows[0].active_cod_dispute_count);
+    assert.strictEqual(rHDisputeCnt, 0);
+
+    // Reconciliation repeatability/idempotency + clean Rider H ledger check
+    const rHRecon1 = await paymentReconciliationService.runReconciliation({ runType: 'TEST', triggeredBy: finUserId, autoRepair: false });
+    const rHRecon2 = await paymentReconciliationService.runReconciliation({ runType: 'TEST', triggeredBy: finUserId, autoRepair: false });
+    assert.ok(!rHRecon1.discrepancies.some((d) => d.riderId === riderHId && d.category === 'RIDER_CASH_LIABILITY_DRIFT'), 'Rider H must have zero GL 1030 drift');
+    const dupKeyRow = (
+      await pool.query(
+        `SELECT occurrence_count FROM reconciliation_discrepancies WHERE discrepancy_key = $1`,
+        [`UNRECONCILED_COD_COLLECTION:${brokenCod.orderId}`]
+      )
+    ).rows[0];
+    assert.ok(Number(dupKeyRow.occurrence_count) >= 3, 'Repeated reconciliation runs must upsert occurrence_count idempotently');
+    assert.strictEqual(rHRecon1.discrepanciesFound, rHRecon2.discrepanciesFound);
+
+    // Persistent audit_logs verification for COD lifecycle actions
+    const auditActionsRes = await pool.query(
+      `SELECT action FROM audit_logs WHERE action IN (
+         'COD_REMITTANCE_SUBMITTED',
+         'COD_REMITTANCE_RECEIVED',
+         'COD_REMITTANCE_VERIFIED_WITH_SHORTAGE',
+         'COD_REMITTANCE_VERIFIED_WITH_EXCESS',
+         'COD_REMITTANCE_VERIFIED_AND_CLEARED',
+         'COD_DISPUTE_RESOLVED',
+         'COD_REMITTANCE_REVERSED'
+       )`
+    );
+    const seenActions = new Set(auditActionsRes.rows.map((r: any) => String(r.action)));
+    for (const reqAction of [
+      'COD_REMITTANCE_SUBMITTED',
+      'COD_REMITTANCE_RECEIVED',
+      'COD_REMITTANCE_VERIFIED_WITH_SHORTAGE',
+      'COD_REMITTANCE_VERIFIED_WITH_EXCESS',
+      'COD_REMITTANCE_VERIFIED_AND_CLEARED',
+      'COD_DISPUTE_RESOLVED',
+      'COD_REMITTANCE_REVERSED',
+    ]) {
+      assert.ok(seenActions.has(reqAction), `Expected persistent audit_logs record for ${reqAction}`);
+    }
+
+    // Synthetic anomaly probe verifying all 4 newly added COD reconciliation detectors trigger REQUIRES_REVIEW
+    const anomalyOrd = await seedOrderWithTrip({ paymentMethod: 'Pay on Delivery', riderId: riderHId, totalAmount: 350.0 });
+    await deliveryCompletionService.completeDeliveryWithOtp({
+      taskId: anomalyOrd.tripId,
+      otp: anomalyOrd.otp,
+      actor: { riderId: riderHId, isDispatchAdmin: false, actorUserId: riderHUserId },
+    });
+    const anomalyCol = (await pool.query(`SELECT id FROM cod_collections WHERE order_id = $1`, [anomalyOrd.orderId])).rows[0];
+    // 1) COD_PREMATURE_LIABILITY_CLEARANCE + 2) COD_ALLOCATION_MISMATCH
+    await pool.query(`UPDATE delivery_trips SET cod_reconciled = TRUE WHERE id = $1`, [anomalyOrd.tripId]);
+    await pool.query(`UPDATE cod_collections SET allocated_amount = 120.00 WHERE id = $1`, [anomalyCol.id]);
+    // 3) COD_PREMATURE_REMITTANCE_CLEARANCE
+    const premRemId = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO cod_remittances (id, remittance_reference, rider_id, submitted_by, status, submitted_amount, cleared_amount)
+       VALUES ($1, $2, $3, $4, 'SUBMITTED', 100.00, 100.00)`,
+      [premRemId, `REM_ANOM_PREM_${Date.now()}`, riderHId, riderHUserId]
+    );
+    // 4) COD_INVALID_REVERSAL
+    const invRevRemId = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO cod_remittances (id, remittance_reference, rider_id, submitted_by, status, submitted_amount, verified_amount, reversal_journal_batch_id)
+       VALUES ($1, $2, $3, $4, 'REVERSED', 100.00, 100.00, NULL)`,
+      [invRevRemId, `REM_ANOM_INVREV_${Date.now()}`, riderHId, riderHUserId]
+    );
+
+    const anomalyRecon = await paymentReconciliationService.runReconciliation({
+      runType: 'TEST',
+      triggeredBy: finUserId,
+      autoRepair: true,
+    });
+    assert.ok(
+      anomalyRecon.discrepancies.some((d) => d.category === 'COD_PREMATURE_LIABILITY_CLEARANCE' && d.orderId === anomalyOrd.orderId && d.status === 'REQUIRES_REVIEW'),
+      'Must detect COD_PREMATURE_LIABILITY_CLEARANCE without auto-clearing'
+    );
+    assert.ok(
+      anomalyRecon.discrepancies.some((d) => d.category === 'COD_ALLOCATION_MISMATCH' && d.collectionId === anomalyCol.id && d.status === 'REQUIRES_REVIEW'),
+      'Must detect COD_ALLOCATION_MISMATCH without auto-clearing'
+    );
+    assert.ok(
+      anomalyRecon.discrepancies.some((d) => d.category === 'COD_PREMATURE_REMITTANCE_CLEARANCE' && d.remittanceId === premRemId && d.status === 'REQUIRES_REVIEW'),
+      'Must detect COD_PREMATURE_REMITTANCE_CLEARANCE without auto-clearing'
+    );
+    assert.ok(
+      anomalyRecon.discrepancies.some((d) => d.category === 'COD_INVALID_REVERSAL' && d.remittanceId === invRevRemId && d.status === 'REQUIRES_REVIEW'),
+      'Must detect COD_INVALID_REVERSAL without auto-clearing'
+    );
+
+    // Simulated PostgreSQL outage (57P01 / ECONNREFUSED) -> HTTP 503 + Retry-After: 3
+    const origPoolQuery = pool.query.bind(pool);
+    const origPoolConnect = pool.connect.bind(pool);
+    (pool as any).query = async () => {
+      const e: any = new Error('terminating connection due to administrator command');
+      e.code = '57P01';
+      throw e;
+    };
+    (pool as any).connect = async () => {
+      const e: any = new Error('connect ECONNREFUSED 127.0.0.1:5432');
+      e.code = 'ECONNREFUSED';
+      throw e;
+    };
+    try {
+      const dbOutageRes = await apiCall(`/api/v1/settlements/rider/${riderHId}/cod-summary`, { token: finToken });
+      assert.strictEqual(dbOutageRes.status, 503, 'PG outage on COD route must return HTTP 503');
+      assert.strictEqual(dbOutageRes.data.error, 'DATABASE_UNAVAILABLE');
+    } finally {
+      (pool as any).query = origPoolQuery;
+      (pool as any).connect = origPoolConnect;
+    }
+
+    const finalTb = await ledgerService.getTrialBalance();
+    assert.strictEqual(finalTb.isBalanced, true);
+    assert.strictEqual(finalTb.difference, 0);
+
+    console.log('✓ Group H Passed: Examples A-E, escalated receivable, excess allocation, shortage reversal, audit logs, 4 recon detectors & DB outage 503 verified');
+    passedGroups++;
+
+    console.log(`\n✓ Sprint 15.9 COD Cash Accountability Test Suite PASSED (${passedGroups}/8 Groups Verified)!`);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await pool.end();

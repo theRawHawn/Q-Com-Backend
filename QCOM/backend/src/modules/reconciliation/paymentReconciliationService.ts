@@ -650,6 +650,36 @@ export class PaymentReconciliationService {
               });
             }
           }
+
+          // Detect premature liability clearance: trip.cod_reconciled = TRUE before cod_collections reaches CLEARED
+          const prematureClearRes = await client.query(
+            `SELECT cc.id AS collection_id, cc.order_id, cc.rider_id, cc.status AS col_status, cc.collected_amount, cc.cleared_amount, dt.id AS trip_id
+             FROM cod_collections cc
+             JOIN delivery_trips dt ON dt.order_id = cc.order_id AND dt.trip_type = 'FORWARD'
+             WHERE dt.cod_reconciled = TRUE
+               AND cc.status <> 'CLEARED'
+               ${options.orderId ? 'AND cc.order_id = $1' : ''}`,
+            orderFilterParams
+          );
+          for (const r of prematureClearRes.rows) {
+            detected.push({
+              discrepancyKey: `COD_PREMATURE_LIABILITY_CLEARANCE:${r.order_id}`,
+              category: 'COD_PREMATURE_LIABILITY_CLEARANCE',
+              severity: 'CRITICAL',
+              status: 'REQUIRES_REVIEW',
+              orderId: r.order_id,
+              riderId: r.rider_id || null,
+              collectionId: r.collection_id,
+              expectedAmount: Number(roundCurrency(r.collected_amount || 0)),
+              actualAmount: Number(roundCurrency(r.cleared_amount || 0)),
+              currency: 'INR',
+              details: {
+                tripId: r.trip_id,
+                collectionStatus: r.col_status,
+                reason: 'Forward delivery trip has cod_reconciled=TRUE despite uncleared COD collection.',
+              },
+            });
+          }
         } catch (err: any) {
           if (!isMissingCodSchemaError(err)) throw err;
         }
@@ -777,8 +807,8 @@ export class PaymentReconciliationService {
             const remAuditRes = await client.query(
               `SELECT id AS remittance_id, remittance_reference, rider_id, status,
                       submitted_by, received_by, verified_by,
-                      submitted_amount, verified_amount, shortage_amount, excess_amount,
-                      journal_batch_id, created_at, submitted_at
+                      submitted_amount, verified_amount, cleared_amount, shortage_amount, excess_amount,
+                      journal_batch_id, reversal_journal_batch_id, created_at, submitted_at
                FROM cod_remittances`
             );
 
@@ -805,8 +835,100 @@ export class PaymentReconciliationService {
               gl2080Map.set(String(g.rider_id), parseInt(String(g.cnt || '0'), 10) || 0);
             }
 
+            const unreversedRevAllocRes = await client.query(
+              `SELECT remittance_id, COUNT(*) AS cnt
+               FROM cod_remittance_allocations
+               WHERE status <> 'REVERSED'
+               GROUP BY remittance_id`
+            );
+            const nonReversedAllocMap = new Map<string, number>();
+            for (const ua of unreversedRevAllocRes.rows) {
+              nonReversedAllocMap.set(String(ua.remittance_id), parseInt(String(ua.cnt || '0'), 10) || 0);
+            }
+
+            // Detect collection-to-remittance allocation mismatches
+            const colAllocAuditRes = await client.query(
+              `SELECT id AS collection_id, order_id, rider_id, allocated_amount
+               FROM cod_collections
+               WHERE status <> 'REVERSED'`
+            );
+            const reservedAllocSumRes = await client.query(
+              `SELECT collection_id, COALESCE(SUM(allocated_amount), 0) AS reserved_sum
+               FROM cod_remittance_allocations
+               WHERE status = 'RESERVED'
+               GROUP BY collection_id`
+            );
+            const reservedSumMap = new Map<string, number>();
+            for (const ra of reservedAllocSumRes.rows) {
+              reservedSumMap.set(String(ra.collection_id), Number(roundCurrency(ra.reserved_sum || 0)));
+            }
+
+            for (const m of colAllocAuditRes.rows) {
+              const colAlloc = Number(roundCurrency(m.allocated_amount || 0));
+              const reservedSum = reservedSumMap.get(String(m.collection_id)) || 0;
+              if (Math.abs(colAlloc - reservedSum) > 0.01) {
+                detected.push({
+                  discrepancyKey: `COD_ALLOCATION_MISMATCH:${m.collection_id}`,
+                  category: 'COD_ALLOCATION_MISMATCH',
+                  severity: 'HIGH',
+                  status: 'REQUIRES_REVIEW',
+                  orderId: m.order_id,
+                  riderId: m.rider_id,
+                  collectionId: m.collection_id,
+                  expectedAmount: reservedSum,
+                  actualAmount: colAlloc,
+                  currency: 'INR',
+                  details: {
+                    reservedAllocationsSum: reservedSum,
+                    collectionAllocatedAmount: colAlloc,
+                  },
+                });
+              }
+            }
+
             const staleCutoffMs = Date.now() - staleMinutes * 60 * 1000;
             for (const rem of remAuditRes.rows) {
+              // Unverified remittance with premature non-zero cleared_amount
+              if (['DRAFT', 'SUBMITTED', 'RECEIVED', 'VERIFICATION_PENDING'].includes(rem.status)) {
+                const clearedNum = Number(roundCurrency(rem.cleared_amount || 0));
+                if (clearedNum > 0) {
+                  detected.push({
+                    discrepancyKey: `COD_PREMATURE_REMITTANCE_CLEARANCE:${rem.remittance_id}`,
+                    category: 'COD_PREMATURE_REMITTANCE_CLEARANCE',
+                    severity: 'CRITICAL',
+                    status: 'REQUIRES_REVIEW',
+                    riderId: rem.rider_id,
+                    remittanceId: rem.remittance_id,
+                    expectedAmount: 0,
+                    actualAmount: clearedNum,
+                    currency: 'INR',
+                    details: { remittanceReference: rem.remittance_reference, status: rem.status },
+                  });
+                }
+              }
+
+              // Reversed remittance integrity check
+              if (rem.status === 'REVERSED') {
+                const verNum = Number(roundCurrency(rem.verified_amount || 0));
+                const staleAllocCnt = nonReversedAllocMap.get(String(rem.remittance_id)) || 0;
+                if ((verNum > 0 && !rem.reversal_journal_batch_id) || staleAllocCnt > 0) {
+                  detected.push({
+                    discrepancyKey: `COD_INVALID_REVERSAL:${rem.remittance_id}`,
+                    category: 'COD_INVALID_REVERSAL',
+                    severity: 'CRITICAL',
+                    status: 'REQUIRES_REVIEW',
+                    riderId: rem.rider_id,
+                    remittanceId: rem.remittance_id,
+                    expectedAmount: verNum,
+                    details: {
+                      remittanceReference: rem.remittance_reference,
+                      hasReversalJournalBatch: Boolean(rem.reversal_journal_batch_id),
+                      nonReversedAllocations: staleAllocCnt,
+                    },
+                  });
+                }
+              }
+
               const isVerifiedState = ['VERIFIED', 'LIABILITY_CLEARED', 'SHORTAGE', 'EXCESS'].includes(rem.status);
               if (isVerifiedState) {
                 const sodBroken =

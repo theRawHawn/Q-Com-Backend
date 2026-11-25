@@ -1962,8 +1962,19 @@ export class CodCashAccountabilityService {
       );
       const dispute = dispRes.rows[0];
 
+      if (dispute.status === 'REJECTED') {
+        throw new CodAccountabilityError(
+          409,
+          'INVALID_DISPUTE_STATE_TRANSITION',
+          `Rejected/reversed dispute '${dispute.dispute_number}' cannot be resolved.`
+        );
+      }
+
+      const prevEvidence = (dispute.evidence && typeof dispute.evidence === 'object' ? dispute.evidence : {}) as Record<string, unknown>;
+      const sameIdempKey = Boolean(params.idempotencyKey && prevEvidence.resolveIdempotencyKey === params.idempotencyKey);
+
       if (dispute.status === 'RESOLVED') {
-        if (dispute.resolution_type === params.resolutionType && dispute.resolved_by === params.resolverUserId) {
+        if (sameIdempKey || (dispute.resolution_type === params.resolutionType && dispute.resolved_by === params.resolverUserId)) {
           return {
             success: true as const,
             idempotentReplay: true,
@@ -1979,17 +1990,59 @@ export class CodCashAccountabilityService {
         throw new CodAccountabilityError(409, 'DISPUTE_ALREADY_RESOLVED', `Dispute '${dispute.dispute_number}' is already resolved.`);
       }
 
+      const isFromEscalated = dispute.status === 'ESCALATED';
+      if (isFromEscalated && params.resolutionType === 'ESCALATED_TO_RECEIVABLE') {
+        if (sameIdempKey || dispute.resolved_by === params.resolverUserId) {
+          return {
+            success: true as const,
+            idempotentReplay: true,
+            disputeId: dispute.id as string,
+            disputeNumber: dispute.dispute_number as string,
+            status: 'ESCALATED',
+            resolutionType: 'ESCALATED_TO_RECEIVABLE' as DisputeResolutionType,
+            journalBatchId: dispute.journal_batch_id || null,
+            remainingCash: Number(roundCurrency(rider.floating_cash_balance || 0)),
+            unblocked: false,
+          };
+        }
+        throw new CodAccountabilityError(409, 'DISPUTE_ALREADY_ESCALATED', `Dispute '${dispute.dispute_number}' is already escalated to receivable.`);
+      }
+
       const amountBn = toDecimal(roundCurrency(dispute.disputed_amount));
       const amountNum = Number(roundCurrency(amountBn));
       const riderFloatBn = toDecimal(roundCurrency(rider.floating_cash_balance || 0));
       const riderWalletBn = toDecimal(roundCurrency(rider.wallet_balance || 0));
 
-      // Validate semantic compatibility between dispute type and resolution type
-      if (dispute.dispute_type === 'EXCESS' && !['EXCESS_RETURNED', 'EXCESS_ALLOCATED_TO_COLLECTION', 'CONFIRMED_NO_VARIANCE'].includes(params.resolutionType)) {
+      // Validate semantic compatibility between dispute type, current state, and resolution type
+      if (dispute.dispute_type === 'EXCESS') {
+        if (!['EXCESS_RETURNED', 'EXCESS_ALLOCATED_TO_COLLECTION', 'CONFIRMED_NO_VARIANCE'].includes(params.resolutionType)) {
+          throw new CodAccountabilityError(
+            400,
+            'INVALID_EXCESS_RESOLUTION',
+            `Excess cash disputes cannot be resolved via '${params.resolutionType}'.`
+          );
+        }
+      } else if (['EXCESS_RETURNED', 'EXCESS_ALLOCATED_TO_COLLECTION'].includes(params.resolutionType)) {
         throw new CodAccountabilityError(
           400,
-          'INVALID_EXCESS_RESOLUTION',
-          `Excess cash disputes cannot be resolved via '${params.resolutionType}'.`
+          'INVALID_RESOLUTION_FOR_DISPUTE_TYPE',
+          `Resolution '${params.resolutionType}' is valid only for EXCESS disputes, not '${dispute.dispute_type}'.`
+        );
+      }
+
+      if (params.resolutionType === 'RECEIVABLE_COLLECTED' && !isFromEscalated) {
+        throw new CodAccountabilityError(
+          409,
+          'RECEIVABLE_NOT_ESCALATED',
+          `Dispute '${dispute.dispute_number}' must be escalated to receivable (1050) before calling RECEIVABLE_COLLECTED.`
+        );
+      }
+
+      if (isFromEscalated && params.resolutionType === 'CONFIRMED_NO_VARIANCE') {
+        throw new CodAccountabilityError(
+          409,
+          'INVALID_DISPUTE_STATE_TRANSITION',
+          `Escalated receivable '${dispute.dispute_number}' must be settled via RECEIVABLE_COLLECTED, RECOVERED_CASH, RECOVERED_FROM_WALLET, or WRITTEN_OFF.`
         );
       }
 
@@ -2006,6 +2059,7 @@ export class CodCashAccountabilityService {
         }
 
         if (
+          !isFromEscalated &&
           ['RECOVERED_CASH', 'RECOVERED_FROM_WALLET', 'ESCALATED_TO_RECEIVABLE', 'WRITTEN_OFF'].includes(params.resolutionType) &&
           riderFloatBn.lt(amountBn)
         ) {
@@ -2016,25 +2070,62 @@ export class CodCashAccountabilityService {
           );
         }
 
+        let fifoCollectionsForExcess: any[] = [];
+        if (params.resolutionType === 'EXCESS_ALLOCATED_TO_COLLECTION') {
+          if (riderFloatBn.lt(amountBn)) {
+            throw new CodAccountabilityError(
+              409,
+              'INSUFFICIENT_FLOAT_FOR_EXCESS_ALLOCATION',
+              `Rider floating cash ₹${roundCurrency(riderFloatBn)} is less than excess ₹${amountNum.toFixed(2)} to allocate.`
+            );
+          }
+          const openColRes = await client.query(
+            `SELECT id, order_id, collected_amount, allocated_amount, cleared_amount, disputed_amount, status
+             FROM cod_collections
+             WHERE rider_id = $1
+               AND status IN ('COLLECTED', 'PARTIALLY_ALLOCATED', 'PARTIALLY_CLEARED', 'SHORTAGE_DISPUTED')
+             ORDER BY collected_at ASC, id ASC
+             FOR UPDATE`,
+            [riderId]
+          );
+          let freeTotalBn = new BigNumber(0);
+          for (const c of openColRes.rows) {
+            const freeBn = BigNumber.max(0, subtract(toDecimal(c.collected_amount), toDecimal(c.allocated_amount), toDecimal(c.cleared_amount)));
+            freeTotalBn = add(freeTotalBn, freeBn);
+          }
+          if (freeTotalBn.lt(amountBn)) {
+            throw new CodAccountabilityError(
+              409,
+              'INSUFFICIENT_UNALLOCATED_FLOAT_FOR_EXCESS_ALLOCATION',
+              `Unallocated COD collection balance ₹${roundCurrency(freeTotalBn)} is insufficient to absorb excess ₹${amountNum.toFixed(2)}.`
+            );
+          }
+          fifoCollectionsForExcess = openColRes.rows;
+        }
+
         ledgerRef = `TX_COD_DISP_${dispute.dispute_number}_${params.resolutionType}`;
         journalBatchId = await ledgerService.recordCodDisputeResolution({
           riderId,
           disputeNumber: dispute.dispute_number,
           resolutionType: params.resolutionType,
           amount: amountNum,
+          fromReceivable: isFromEscalated,
           orderId: dispute.order_id || null,
           reason: params.notes.trim(),
           client,
         });
 
-        if (['RECOVERED_CASH', 'ESCALATED_TO_RECEIVABLE', 'WRITTEN_OFF'].includes(params.resolutionType)) {
+        if (
+          (!isFromEscalated && ['RECOVERED_CASH', 'ESCALATED_TO_RECEIVABLE', 'WRITTEN_OFF'].includes(params.resolutionType)) ||
+          params.resolutionType === 'EXCESS_ALLOCATED_TO_COLLECTION'
+        ) {
           const nextFloat = subtract(riderFloatBn, amountBn);
           await client.query(`UPDATE riders SET floating_cash_balance = $1, updated_at = NOW() WHERE id = $2`, [
             roundCurrency(nextFloat),
             riderId,
           ]);
         } else if (params.resolutionType === 'RECOVERED_FROM_WALLET') {
-          const nextFloat = subtract(riderFloatBn, amountBn);
+          const nextFloat = isFromEscalated ? riderFloatBn : subtract(riderFloatBn, amountBn);
           const nextWallet = subtract(riderWalletBn, amountBn);
           await client.query(
             `UPDATE riders SET floating_cash_balance = $1, wallet_balance = $2, updated_at = NOW() WHERE id = $3`,
@@ -2052,59 +2143,153 @@ export class CodCashAccountabilityService {
             ]
           );
         }
-      }
 
-      // Clear shortage disputed_amount / collection states on linked remittance or collection
-      if (
-        dispute.remittance_id &&
-        ['RECOVERED_CASH', 'RECOVERED_FROM_WALLET', 'ESCALATED_TO_RECEIVABLE', 'WRITTEN_OFF'].includes(params.resolutionType)
-      ) {
-        const linkedCols = await client.query(
-          `SELECT a.collection_id, a.order_id, c.collected_amount, c.cleared_amount, c.disputed_amount
-           FROM cod_remittance_allocations a
-           JOIN cod_collections c ON c.id = a.collection_id
-           WHERE a.remittance_id = $1 AND c.disputed_amount > 0
-           FOR UPDATE`,
-          [dispute.remittance_id]
-        );
-        let remDispToClear = amountBn;
-        for (const col of linkedCols.rows) {
-          if (remDispToClear.lte(0)) break;
-          const colDisp = toDecimal(col.disputed_amount);
-          const take = BigNumber.min(remDispToClear, colDisp);
-          remDispToClear = subtract(remDispToClear, take);
-          const newCleared = add(col.cleared_amount, take);
-          const finalColStatus =
-            params.resolutionType === 'WRITTEN_OFF' && newCleared.lt(col.collected_amount)
-              ? 'WRITTEN_OFF'
-              : newCleared.gte(col.collected_amount)
+        if (params.resolutionType === 'EXCESS_ALLOCATED_TO_COLLECTION' && fifoCollectionsForExcess.length > 0) {
+          let excessRemainingBn = amountBn;
+          for (const col of fifoCollectionsForExcess) {
+            if (excessRemainingBn.lte(0)) break;
+            const freeBn = BigNumber.max(0, subtract(toDecimal(col.collected_amount), toDecimal(col.allocated_amount), toDecimal(col.cleared_amount)));
+            if (freeBn.lte(0)) continue;
+            const applyBn = BigNumber.min(excessRemainingBn, freeBn);
+            excessRemainingBn = subtract(excessRemainingBn, applyBn);
+            const newCleared = add(col.cleared_amount, applyBn);
+            const isFullyCleared = newCleared.gte(col.collected_amount);
+            const finalColStatus = isFullyCleared
               ? 'CLEARED'
+              : toDecimal(col.allocated_amount).gt(0)
+              ? 'PARTIALLY_ALLOCATED'
               : 'PARTIALLY_CLEARED';
-
-          const colClearedAtTs = finalColStatus === 'CLEARED' ? new Date() : null;
-          await client.query(
-            `UPDATE cod_collections
-             SET disputed_amount = GREATEST(0, disputed_amount - $1),
-                 cleared_amount = $2,
-                 status = $3,
-                 cleared_at = COALESCE(cleared_at, $4),
-                 updated_at = NOW()
-             WHERE id = $5`,
-            [roundCurrency(take), roundCurrency(newCleared), finalColStatus, colClearedAtTs, col.collection_id]
-          );
-
-          if (finalColStatus === 'CLEARED') {
+            const colClearedAtTs = isFullyCleared ? new Date() : null;
             await client.query(
-              `UPDATE delivery_trips SET cod_reconciled = TRUE, updated_at = NOW() WHERE order_id = $1 AND trip_type = 'FORWARD'`,
-              [col.order_id]
+              `UPDATE cod_collections
+               SET disputed_amount = GREATEST(0, disputed_amount - $1),
+                   cleared_amount = $2,
+                   status = $3,
+                   cleared_at = COALESCE(cleared_at, $4),
+                   updated_at = NOW()
+               WHERE id = $5`,
+              [roundCurrency(applyBn), roundCurrency(newCleared), finalColStatus, colClearedAtTs, col.id]
             );
+            if (isFullyCleared) {
+              await client.query(
+                `UPDATE delivery_trips SET cod_reconciled = TRUE, updated_at = NOW() WHERE order_id = $1 AND trip_type = 'FORWARD'`,
+                [col.order_id]
+              );
+            }
           }
         }
       }
 
-      // If ESCALATED_TO_RECEIVABLE keep status 'ESCALATED' until RECEIVABLE_COLLECTED, otherwise 'RESOLVED'
+      // Clear shortage disputed_amount / collection states on linked remittance or collection (only on first GL move out of 1030)
+      if (
+        !isFromEscalated &&
+        ['RECOVERED_CASH', 'RECOVERED_FROM_WALLET', 'ESCALATED_TO_RECEIVABLE', 'WRITTEN_OFF'].includes(params.resolutionType)
+      ) {
+        if (dispute.remittance_id) {
+          const linkedCols = await client.query(
+            `SELECT a.collection_id, a.order_id, c.collected_amount, c.cleared_amount, c.disputed_amount
+             FROM cod_remittance_allocations a
+             JOIN cod_collections c ON c.id = a.collection_id
+             WHERE a.remittance_id = $1 AND c.disputed_amount > 0
+             FOR UPDATE`,
+            [dispute.remittance_id]
+          );
+          let remDispToClear = amountBn;
+          for (const col of linkedCols.rows) {
+            if (remDispToClear.lte(0)) break;
+            const colDisp = toDecimal(col.disputed_amount);
+            const take = BigNumber.min(remDispToClear, colDisp);
+            remDispToClear = subtract(remDispToClear, take);
+            const newCleared = add(col.cleared_amount, take);
+            const isFull = newCleared.gte(col.collected_amount);
+            const finalColStatus =
+              params.resolutionType === 'WRITTEN_OFF'
+                ? 'WRITTEN_OFF'
+                : isFull
+                ? 'CLEARED'
+                : 'PARTIALLY_CLEARED';
+
+            const colClearedAtTs = finalColStatus === 'CLEARED' ? new Date() : null;
+            await client.query(
+              `UPDATE cod_collections
+               SET disputed_amount = GREATEST(0, disputed_amount - $1),
+                   cleared_amount = $2,
+                   status = $3,
+                   cleared_at = COALESCE(cleared_at, $4),
+                   updated_at = NOW()
+               WHERE id = $5`,
+              [roundCurrency(take), roundCurrency(newCleared), finalColStatus, colClearedAtTs, col.collection_id]
+            );
+
+            if (finalColStatus === 'CLEARED') {
+              await client.query(
+                `UPDATE delivery_trips SET cod_reconciled = TRUE, updated_at = NOW() WHERE order_id = $1 AND trip_type = 'FORWARD'`,
+                [col.order_id]
+              );
+            }
+          }
+        } else if (dispute.collection_id || dispute.order_id) {
+          const targetColRes = dispute.collection_id
+            ? await client.query(
+                `SELECT id AS collection_id, order_id, collected_amount, allocated_amount, cleared_amount, disputed_amount
+                 FROM cod_collections
+                 WHERE id = $1 AND rider_id = $2 AND status <> 'REVERSED'
+                 FOR UPDATE`,
+                [dispute.collection_id, riderId]
+              )
+            : await client.query(
+                `SELECT id AS collection_id, order_id, collected_amount, allocated_amount, cleared_amount, disputed_amount
+                 FROM cod_collections
+                 WHERE order_id = $1 AND rider_id = $2 AND status <> 'REVERSED'
+                 FOR UPDATE`,
+                [dispute.order_id, riderId]
+              );
+          if (targetColRes.rows.length > 0) {
+            const col = targetColRes.rows[0];
+            const availableOnCol = BigNumber.max(
+              0,
+              subtract(toDecimal(col.collected_amount), toDecimal(col.allocated_amount), toDecimal(col.cleared_amount))
+            );
+            const take = BigNumber.min(amountBn, availableOnCol);
+            if (take.gt(0)) {
+              const newCleared = add(col.cleared_amount, take);
+              const isFull = newCleared.gte(col.collected_amount);
+              const finalColStatus =
+                params.resolutionType === 'WRITTEN_OFF'
+                  ? 'WRITTEN_OFF'
+                  : isFull
+                  ? 'CLEARED'
+                  : 'PARTIALLY_CLEARED';
+              const colClearedAtTs = finalColStatus === 'CLEARED' ? new Date() : null;
+              await client.query(
+                `UPDATE cod_collections
+                 SET disputed_amount = GREATEST(0, disputed_amount - $1),
+                     cleared_amount = $2,
+                     status = $3,
+                     cleared_at = COALESCE(cleared_at, $4),
+                     updated_at = NOW()
+                 WHERE id = $5`,
+                [roundCurrency(take), roundCurrency(newCleared), finalColStatus, colClearedAtTs, col.collection_id]
+              );
+              if (finalColStatus === 'CLEARED') {
+                await client.query(
+                  `UPDATE delivery_trips SET cod_reconciled = TRUE, updated_at = NOW() WHERE order_id = $1 AND trip_type = 'FORWARD'`,
+                  [col.order_id]
+                );
+              }
+            }
+          }
+        }
+      }
+
+      // If ESCALATED_TO_RECEIVABLE keep status 'ESCALATED' until settled, otherwise 'RESOLVED'
       const nextDisputeStatus = params.resolutionType === 'ESCALATED_TO_RECEIVABLE' ? 'ESCALATED' : 'RESOLVED';
       const resolvedAtTs = nextDisputeStatus === 'RESOLVED' ? new Date() : null;
+      const nextEvidence = {
+        ...prevEvidence,
+        ...(params.idempotencyKey ? { resolveIdempotencyKey: params.idempotencyKey } : {}),
+        ...(isFromEscalated ? { escalatedSettlementCompleted: true } : {}),
+      };
       await client.query(
         `UPDATE cod_cash_disputes
          SET status = $1,
@@ -2114,8 +2299,9 @@ export class CodCashAccountabilityService {
              journal_batch_id = COALESCE($5, journal_batch_id),
              ledger_transaction_reference = COALESCE($6, ledger_transaction_reference),
              resolved_at = COALESCE($7, resolved_at),
+             evidence = $8,
              updated_at = NOW()
-         WHERE id = $8`,
+         WHERE id = $9`,
         [
           nextDisputeStatus,
           params.resolutionType,
@@ -2124,6 +2310,7 @@ export class CodCashAccountabilityService {
           journalBatchId,
           ledgerRef,
           resolvedAtTs,
+          JSON.stringify(nextEvidence),
           dispute.id,
         ]
       );
@@ -2228,6 +2415,23 @@ export class CodCashAccountabilityService {
         );
       }
 
+      const linkedDisputes = await client.query(
+        `SELECT id, dispute_number, status, resolution_type
+         FROM cod_cash_disputes
+         WHERE remittance_id = $1
+         FOR UPDATE`,
+        [rem.id]
+      );
+      for (const ld of linkedDisputes.rows) {
+        if (ld.status === 'ESCALATED' || (ld.status === 'RESOLVED' && ld.resolution_type !== 'CONFIRMED_NO_VARIANCE')) {
+          throw new CodAccountabilityError(
+            409,
+            'REMITTANCE_DISPUTE_ALREADY_PROCESSED',
+            `Cannot reverse remittance '${rem.remittance_reference}' because linked dispute '${ld.dispute_number}' already posted financial resolution '${ld.resolution_type || ld.status}'.`
+          );
+        }
+      }
+
       const verifiedBn = toDecimal(roundCurrency(rem.verified_amount || 0));
       const clearedBn = toDecimal(roundCurrency(rem.cleared_amount || 0));
       const excessBn = toDecimal(roundCurrency(rem.excess_amount || 0));
@@ -2253,7 +2457,8 @@ export class CodCashAccountabilityService {
       ]);
 
       const allocs = await client.query(
-        `SELECT a.id AS alloc_id, a.collection_id, a.order_id, a.cleared_amount, c.cleared_amount AS col_cleared, c.allocated_amount AS col_allocated
+        `SELECT a.id AS alloc_id, a.collection_id, a.order_id, a.allocated_amount, a.cleared_amount,
+                c.cleared_amount AS col_cleared, c.allocated_amount AS col_allocated, c.disputed_amount AS col_disputed
          FROM cod_remittance_allocations a
          JOIN cod_collections c ON c.id = a.collection_id
          WHERE a.remittance_id = $1
@@ -2262,7 +2467,12 @@ export class CodCashAccountabilityService {
       );
       for (const a of allocs.rows) {
         const nextColCleared = BigNumber.max(0, subtract(a.col_cleared, a.cleared_amount));
-        const nextStatus = nextColCleared.gt(0)
+        const shortageDelta =
+          rem.status === 'SHORTAGE' ? BigNumber.max(0, subtract(a.allocated_amount, a.cleared_amount)) : new BigNumber(0);
+        const nextColDisputed = BigNumber.max(0, subtract(a.col_disputed, shortageDelta));
+        const nextStatus = nextColDisputed.gt(0)
+          ? 'SHORTAGE_DISPUTED'
+          : nextColCleared.gt(0)
           ? 'PARTIALLY_CLEARED'
           : toDecimal(a.col_allocated).gt(0)
           ? 'PARTIALLY_ALLOCATED'
@@ -2271,11 +2481,12 @@ export class CodCashAccountabilityService {
         await client.query(
           `UPDATE cod_collections
            SET cleared_amount = $1,
-               status = $2,
+               disputed_amount = $2,
+               status = $3,
                cleared_at = NULL,
                updated_at = NOW()
-           WHERE id = $3`,
-          [roundCurrency(nextColCleared), nextStatus, a.collection_id]
+           WHERE id = $4`,
+          [roundCurrency(nextColCleared), roundCurrency(nextColDisputed), nextStatus, a.collection_id]
         );
         await client.query(
           `UPDATE cod_remittance_allocations SET status = 'REVERSED', updated_at = NOW() WHERE id = $1`,
@@ -2284,6 +2495,33 @@ export class CodCashAccountabilityService {
         await client.query(
           `UPDATE delivery_trips SET cod_reconciled = FALSE, updated_at = NOW() WHERE order_id = $1 AND trip_type = 'FORWARD'`,
           [a.order_id]
+        );
+      }
+
+      let closedOpenDisputes = 0;
+      for (const ld of linkedDisputes.rows) {
+        if (['OPEN', 'UNDER_INVESTIGATION'].includes(ld.status)) {
+          await client.query(
+            `UPDATE cod_cash_disputes
+             SET status = 'REJECTED',
+                 resolution_type = 'REVERSED',
+                 resolved_by = $1,
+                 resolved_at = NOW(),
+                 resolution_notes = $2,
+                 updated_at = NOW()
+             WHERE id = $3`,
+            [params.actorUserId, `Closed on remittance reversal: ${params.reason.trim()}`, ld.id]
+          );
+          closedOpenDisputes++;
+        }
+      }
+      if (closedOpenDisputes > 0) {
+        await client.query(
+          `UPDATE riders
+           SET active_cod_dispute_count = GREATEST(0, active_cod_dispute_count - $1),
+               updated_at = NOW()
+           WHERE id = $2`,
+          [closedOpenDisputes, riderId]
         );
       }
 
@@ -2301,7 +2539,7 @@ export class CodCashAccountabilityService {
         [params.actorUserId, params.reason.trim(), revBatchId, revBatchId ? revRef : null, rem.id]
       );
 
-      const syncRes = await this.syncRiderCodRestrictionInTx(client, riderId);
+      const syncRes = await this.syncRiderCodRestrictionInTx(client, riderId, { liftSuspensionIfClear: true });
 
       return {
         success: true as const,
