@@ -831,13 +831,13 @@ export class RiderPayoutService {
     allocatedCollections: Array<{ collectionId: string; orderId: string; allocatedAmount: number }>;
   }> {
     const pool = getPool();
-    let actorUserId: string = params.submittedByUserId || '';
+    let actorUserId: string | null = params.submittedByUserId || null;
     if (!actorUserId) {
       const rRow = await pool.query(`SELECT user_id FROM riders WHERE id = $1 LIMIT 1`, [params.riderId]);
       if (rRow.rows.length === 0) {
         throw new Error(`RIDER_NOT_FOUND: Rider '${params.riderId}' does not exist.`);
       }
-      actorUserId = rRow.rows[0].user_id || params.riderId;
+      actorUserId = (rRow.rows[0].user_id as string | null) || null;
     }
 
     const methodMap: Record<string, string> = {

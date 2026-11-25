@@ -266,8 +266,14 @@ async function runRedisChecks(redisModule: typeof import('../../src/database/red
       // Simulate Redis key-type fault -> fail closed 503
       await client.del(`ratelimit:cod:remittance:user:${codRemitUserId}`);
       await client.set(`ratelimit:cod:remittance:user:${codRemitUserId}`, 'corrupt-type');
-      const faultRes = await fetch(codUrl, { method: 'POST', headers: { 'x-test-rate-limit': '1' } });
-      assert.equal(faultRes.status, 503, 'codRemittanceRateLimiter must fail closed (503) on Redis error.');
+      const prevNodeEnv = env.NODE_ENV;
+      env.NODE_ENV = 'production';
+      try {
+        const faultRes = await fetch(codUrl, { method: 'POST', headers: { 'x-test-rate-limit': '1' } });
+        assert.equal(faultRes.status, 503, 'codRemittanceRateLimiter must fail closed (503) on Redis error.');
+      } finally {
+        env.NODE_ENV = prevNodeEnv;
+      }
     } finally {
       await new Promise<void>((resolve, reject) => codServer.close((err) => (err ? reject(err) : resolve())));
     }

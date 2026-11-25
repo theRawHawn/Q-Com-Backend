@@ -696,7 +696,7 @@ export class CodCashAccountabilityService {
     collectionIds?: string[];
     orderIds?: string[];
     asDraft?: boolean;
-    submittedByUserId: string;
+    submittedByUserId?: string | null;
   }): Promise<{
     success: true;
     idempotentReplay: boolean;
@@ -951,7 +951,7 @@ export class CodCashAccountabilityService {
           params.collectionLocation || null,
           params.evidenceReference || null,
           initialStatus,
-          params.submittedByUserId,
+          params.submittedByUserId || rider.user_id || null,
           submittedAtTs,
           JSON.stringify({
             unbackedResidualAmount: Number(roundCurrency(remainingToAllocateBn)),
@@ -1008,7 +1008,7 @@ export class CodCashAccountabilityService {
 
     if (!txOut.idempotentReplay) {
       await recordAuditEvent({
-        actorId: params.submittedByUserId,
+        actorId: params.submittedByUserId || params.riderId,
         actorType: 'USER',
         action: params.asDraft ? 'COD_REMITTANCE_DRAFTED' : 'COD_REMITTANCE_SUBMITTED',
         entityType: 'COD_REMITTANCE',
@@ -1026,7 +1026,7 @@ export class CodCashAccountabilityService {
       paymentLogger.increment('codRemittancesSubmitted');
       paymentLogger.log('info', 'COD_REMITTANCE_SUBMITTED', {
         internalReference: txOut.remittanceReference,
-        userId: params.submittedByUserId,
+        userId: params.submittedByUserId || undefined,
       }, {
         riderId: params.riderId,
         submittedAmount: txOut.submittedAmount,
