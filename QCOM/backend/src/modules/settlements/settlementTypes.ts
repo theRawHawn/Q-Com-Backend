@@ -34,6 +34,9 @@ export interface OrderSettlementAllocation {
   riderTdsAmount: number;
   netRiderPayable: number;
   platformSubsidy: number;
+  platformDiscountSubsidy?: number;
+  sellerDiscountAmount?: number;
+  cessAmount?: number;
   status: 'ALLOCATED' | 'SETTLED' | 'REVERSED';
   allocatedAt: string;
 }

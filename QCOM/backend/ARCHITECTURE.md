@@ -70,15 +70,15 @@ graph TD
 | Module | Source Path | Primary Responsibility | Authoritative Tables |
 | :--- | :--- | :--- | :--- |
 | **Auth & RBAC** | `src/modules/auth`, `src/modules/rbac` | Phone OTP / Admin Scrypt authentication, JWT & session versioning, dynamic RBAC | `users`, `auth_sessions`, `refresh_tokens`, `otp_challenges`, `roles`, `permissions` |
-| **Catalog & Pricing** | `src/modules/catalog`, `src/modules/pricing` | Product master, merchant store catalog, dynamic delivery and tax pricing calculation | `products`, `merchants`, `pricing_delivery_rules`, `statutory_tax_rules` |
+| **Catalog & Pricing** | `src/modules/catalog`, `src/modules/pricing` | Product master, decimal-safe (`bignumber.js`) GST/Cess pricing (`tax_inclusive`/`tax_exclusive`), dynamic `indian_states` Place of Supply, atomic coupons & promotions (`couponPromotionService`), DB carts (`cartService`) | `products`, `merchants`, `indian_states`, `tax_rate_configs`, `pricing_calculation_snapshots`, `coupons`, `coupon_redemptions`, `promotions`, `promotion_applications`, `carts`, `cart_items` |
 | **Inventory** | `src/modules/inventory` | Multi-store stock tracking, selective reservations, zero-oversell row locking | `store_inventory`, `inventory_reservations`, `seller_stock_alerts` |
-| **Orders** | `src/modules/orders` | Checkout orchestration, order state machine, cancellation & compensation | `orders`, `order_items`, `order_returns`, `order_return_items` |
+| **Orders & Invoices** | `src/modules/orders`, `src/modules/invoices` | Checkout orchestration with `409 PRICE_CHANGED`/`QUOTE_EXPIRED` protection, prorated cancellations/returns, GST Tax Invoices (honest `irn: null`), and GST Credit Notes | `orders`, `order_items`, `order_returns`, `order_return_items`, `gst_invoices`, `credit_notes`, `credit_note_line_items` |
 | **Dispatch & Delivery**| `src/modules/dispatch`, `src/modules/delivery` | Rider proximity discovery, trip broadcasting, delivery OTP handshakes | `delivery_trips`, `riders`, `dispatch_assignments`, `dispatch_offers` |
 | **Payments** | `src/modules/payments` | Payment provider abstraction, durable webhook deduplication, refund state machine | `payment_intents`, `payment_attempts`, `webhook_events`, `refunds` |
-| **Settlement & Ledger**| `src/modules/settlements`, `src/modules/ledger` | Double-entry journal accounting, merchant payouts, rider earnings, statutory withholding (TDS/TCS) | `general_ledger_accounts`, `general_ledger_entries`, `order_settlement_allocations`, `seller_payouts`, `rider_payouts` |
+| **Settlement & Ledger**| `src/modules/settlements`, `src/modules/ledger` | Double-entry journal accounting (including COA `5040` platform subsidy), merchant payouts, rider earnings, statutory withholding (TDS/TCS) | `general_ledger_accounts`, `general_ledger_entries`, `order_settlement_allocations`, `seller_payouts`, `rider_payouts` |
 | **Outbox & Events** | `src/modules/outbox`, `src/modules/notifications` | Transactional outbox event publishing, push notification queues | `outbox_events`, `notification_campaigns`, `notification_deliveries` |
 | **Realtime** | `src/modules/realtime` | WebSocket connection lifecycle, private channel authorization, ephemeral GPS telemetry | Ephemeral (Redis / Memory) |
-| **Recovery** | `src/modules/recovery` | Lease-based financial recovery worker for stalled transactions and reconciliation | `payment_intents` (recovery lease metadata) |
+| **Recovery & Reconciliation** | `src/modules/recovery`, `src/modules/reconciliation` | Lease-based financial recovery worker and audit reconciliation (Checks 1–14: payment, COD, pricing, GST, coupons, settlements) | `payment_intents`, `reconciliation_runs`, `reconciliation_discrepancies` |
 
 ---
 

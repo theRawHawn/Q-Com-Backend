@@ -243,9 +243,9 @@ export async function runSprint4MigrationTests(): Promise<void> {
     console.log(`✓ Test 6 passed: Double-entry ledger verified: Total Debits (₹${total_debits}) == Total Credits (₹${total_credits})`);
 
     // -------------------------------------------------------------
-    // Test 7: Statutory GST Invoices & 64-char IRN Generation
+    // Test 7: Statutory GST Invoices & Honest E-Invoicing Gate (No Fake IRN)
     // -------------------------------------------------------------
-    console.log('[Test 7] Testing Form GST INV-1 & 64-character SHA-256 IRN...');
+    console.log('[Test 7] Testing Form GST INV-1 & Honest Non-Fabricated IRN Status...');
     const invRes = await fetch(`${baseUrl}/api/invoices/order/${placedOrder.id}`, {
       headers: { Authorization: `Bearer ${customerToken}` },
     });
@@ -255,8 +255,9 @@ export async function runSprint4MigrationTests(): Promise<void> {
     assert.strictEqual(invBody.invoices.length, 2); // Form GST INV-1 and QCOM Platform Invoice
     const sellerInv = invBody.invoices.find((i: any) => i.invoiceType === 'SELLER_TAX_INVOICE');
     assert.ok(sellerInv);
-    assert.strictEqual(sellerInv.irn.length, 64);
-    console.log(`✓ Test 7 passed: Statutory Form GST INV-1 generated with IRN ${sellerInv.irn.slice(0, 16)}...`);
+    assert.strictEqual(sellerInv.irn, null);
+    assert.strictEqual(sellerInv.eInvoicingStatus, 'NOT_APPLICABLE');
+    console.log(`✓ Test 7 passed: Statutory Form GST INV-1 generated with honest irn=null (${sellerInv.eInvoicingStatus}).`);
 
     // -------------------------------------------------------------
     // Test 8: Routing & Snapping

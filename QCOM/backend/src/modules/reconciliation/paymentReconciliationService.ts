@@ -1124,6 +1124,174 @@ export class PaymentReconciliationService {
           }
         }
 
+        // Check 14: Pricing, GST, Coupon, Promotion, & Credit Note Integrity Audit
+        const isMissingSprint16SchemaError = (err: any): boolean => {
+          const code = String(err?.code || '');
+          const msg = String(err?.message || '').toLowerCase();
+          return code === '42P01' || code === '42703' || (msg.includes('does not exist') && (msg.includes('relation') || msg.includes('column')));
+        };
+
+        try {
+          // 14A: Order GST mutual exclusion (CGST/SGST and IGST never both > 0), non-negative tax/discount/total, snapshot total parity
+          const orderGstRes = await client.query(
+            `SELECT id AS order_id, total_amount, discount_amount, taxable_amount,
+                    cgst_amount, sgst_amount, igst_amount, COALESCE(cess_amount, 0) AS cess_amount,
+                    pricing_snapshot
+             FROM orders
+             WHERE 1=1 ${options.orderId ? 'AND id = $1' : ''}
+             LIMIT 500`,
+            orderFilterParams
+          );
+          for (const r of orderGstRes.rows) {
+            const cgst = Number(roundCurrency(r.cgst_amount || 0));
+            const sgst = Number(roundCurrency(r.sgst_amount || 0));
+            const igst = Number(roundCurrency(r.igst_amount || 0));
+            const cess = Number(roundCurrency(r.cess_amount || 0));
+            const disc = Number(roundCurrency(r.discount_amount || 0));
+            const tot = Number(roundCurrency(r.total_amount || 0));
+
+            if ((cgst > 0 || sgst > 0) && igst > 0) {
+              detected.push({
+                discrepancyKey: `ORDER_GST_MUTUAL_EXCLUSION:${r.order_id}`,
+                category: 'ORDER_GST_MUTUAL_EXCLUSION',
+                severity: 'CRITICAL',
+                status: 'REQUIRES_REVIEW',
+                orderId: r.order_id,
+                currency: 'INR',
+                details: { cgst, sgst, igst },
+              });
+            }
+
+            if (cgst < 0 || sgst < 0 || igst < 0 || cess < 0 || disc < 0 || tot < 0) {
+              detected.push({
+                discrepancyKey: `ORDER_NEGATIVE_FINANCIAL_FIELD:${r.order_id}`,
+                category: 'ORDER_NEGATIVE_FINANCIAL_FIELD',
+                severity: 'CRITICAL',
+                status: 'REQUIRES_REVIEW',
+                orderId: r.order_id,
+                currency: 'INR',
+                details: { cgst, sgst, igst, cess, discountAmount: disc, totalAmount: tot },
+              });
+            }
+
+            if (r.pricing_snapshot) {
+              const snap = typeof r.pricing_snapshot === 'string' ? JSON.parse(r.pricing_snapshot) : r.pricing_snapshot;
+              if (snap && snap.grandTotal !== undefined && snap.grandTotal !== null) {
+                const snapTotal = Number(roundCurrency(snap.grandTotal));
+                if (Math.abs(snapTotal - tot) > 0.02) {
+                  detected.push({
+                    discrepancyKey: `ORDER_SNAPSHOT_TOTAL_DRIFT:${r.order_id}`,
+                    category: 'ORDER_SNAPSHOT_TOTAL_DRIFT',
+                    severity: 'HIGH',
+                    status: 'REQUIRES_REVIEW',
+                    orderId: r.order_id,
+                    expectedAmount: snapTotal,
+                    actualAmount: tot,
+                    currency: 'INR',
+                    details: { snapshotGrandTotal: snapTotal, orderTotal: tot },
+                  });
+                }
+              }
+            }
+          }
+
+          // 14B: Accepted returns missing formal GST Credit Note
+          const missingCnRes = await client.query(
+            `SELECT ret.id AS return_id, ret.order_id, ret.refund_id
+             FROM order_returns ret
+             LEFT JOIN credit_notes cn ON cn.return_id = ret.id AND cn.credit_note_type = 'SELLER_CREDIT_NOTE'
+             WHERE ret.status = 'ACCEPTED'
+               AND ret.refund_id IS NOT NULL
+               ${options.orderId ? 'AND ret.order_id = $1' : ''}
+               AND cn.id IS NULL
+             LIMIT 200`,
+            orderFilterParams
+          );
+          for (const r of missingCnRes.rows) {
+            detected.push({
+              discrepancyKey: `MISSING_RETURN_CREDIT_NOTE:${r.return_id}`,
+              category: 'MISSING_RETURN_CREDIT_NOTE',
+              severity: 'HIGH',
+              status: 'REQUIRES_REVIEW',
+              orderId: r.order_id,
+              refundId: r.refund_id || null,
+              details: { returnId: r.return_id },
+            });
+          }
+
+          // 14C: Invoices claiming NOT_APPLICABLE e-Invoicing must never carry a non-null fake IRN
+          const fakeIrnRes = await client.query(
+            `SELECT id AS invoice_id, invoice_number, order_id, irn, e_invoicing_status
+             FROM invoices
+             WHERE e_invoicing_status = 'NOT_APPLICABLE'
+               AND irn IS NOT NULL
+               ${options.orderId ? 'AND order_id = $1' : ''}
+             LIMIT 200`,
+            orderFilterParams
+          );
+          for (const r of fakeIrnRes.rows) {
+            detected.push({
+              discrepancyKey: `INVALID_FABRICATED_IRN:${r.invoice_id}`,
+              category: 'INVALID_FABRICATED_IRN',
+              severity: 'CRITICAL',
+              status: 'REQUIRES_REVIEW',
+              orderId: r.order_id,
+              details: { invoiceId: r.invoice_id, invoiceNumber: r.invoice_number, irn: r.irn, eInvoicingStatus: r.e_invoicing_status },
+            });
+          }
+
+          // 14D: Portfolio coupon & promotion usage_count vs active ledger count
+          if (!options.orderId) {
+            const couponDriftRes = await client.query(
+              `SELECT c.id AS coupon_id, c.code, c.usage_count,
+                      COALESCE(SUM(CASE WHEN cr.status IN ('RESERVED', 'REDEEMED') THEN 1 ELSE 0 END), 0) AS active_count
+               FROM coupons c
+               LEFT JOIN coupon_redemptions cr ON cr.coupon_id = c.id
+               GROUP BY c.id, c.code, c.usage_count`
+            );
+            for (const r of couponDriftRes.rows) {
+              const expected = parseInt(String(r.active_count || '0'), 10);
+              const actual = parseInt(String(r.usage_count || '0'), 10);
+              if (actual !== expected) {
+                detected.push({
+                  discrepancyKey: `COUPON_USAGE_COUNT_DRIFT:${r.coupon_id}`,
+                  category: 'COUPON_USAGE_COUNT_DRIFT',
+                  severity: 'MEDIUM',
+                  status: 'REQUIRES_REVIEW',
+                  expectedAmount: expected,
+                  actualAmount: actual,
+                  details: { couponId: r.coupon_id, code: r.code, activeRedemptions: expected, recordedUsageCount: actual },
+                });
+              }
+            }
+
+            const promoDriftRes = await client.query(
+              `SELECT p.id AS promotion_id, p.code, p.usage_count,
+                      COALESCE(SUM(CASE WHEN pa.status IN ('RESERVED', 'APPLIED') THEN 1 ELSE 0 END), 0) AS active_count
+               FROM promotions p
+               LEFT JOIN promotion_applications pa ON pa.promotion_id = p.id
+               GROUP BY p.id, p.code, p.usage_count`
+            );
+            for (const r of promoDriftRes.rows) {
+              const expected = parseInt(String(r.active_count || '0'), 10);
+              const actual = parseInt(String(r.usage_count || '0'), 10);
+              if (actual !== expected) {
+                detected.push({
+                  discrepancyKey: `PROMOTION_USAGE_COUNT_DRIFT:${r.promotion_id}`,
+                  category: 'PROMOTION_USAGE_COUNT_DRIFT',
+                  severity: 'MEDIUM',
+                  status: 'REQUIRES_REVIEW',
+                  expectedAmount: expected,
+                  actualAmount: actual,
+                  details: { promotionId: r.promotion_id, code: r.code, activeApplications: expected, recordedUsageCount: actual },
+                });
+              }
+            }
+          }
+        } catch (err: any) {
+          if (!isMissingSprint16SchemaError(err)) throw err;
+        }
+
         // Persist all detected discrepancies inside this run
         for (const d of detected) {
           const id = await this.upsertDiscrepancy(client, runId, d);

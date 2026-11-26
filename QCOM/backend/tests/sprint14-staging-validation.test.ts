@@ -408,6 +408,8 @@ export async function runSprint14StagingValidationTests(): Promise<void> {
         RAZORPAY_WEBHOOK_SECRET: 'secret',
         PAYMENT_SECRET: 'qcom_secure_payment_secret_2026_isolated_key',
         RESERVATION_TTL_MINUTES: 15,
+        QCOM_LEGAL_NAME: 'QCOM Quick Commerce Pvt Ltd',
+        EINVOICING_ENABLED: false,
       };
 
       let threw = false;

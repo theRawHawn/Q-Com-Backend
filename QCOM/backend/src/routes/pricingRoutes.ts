@@ -6,6 +6,7 @@ import { requireMerchantOwnership } from '../middleware/resourceOwnership.js';
 import { adminSensitiveRateLimiter, sellerActionRateLimiter } from '../middleware/rateLimiter.js';
 import { pricingEngine, PricingEngineError } from '../modules/pricing/pricingEngine.js';
 import { taxEngine, TaxEngineError } from '../modules/pricing/taxEngine.js';
+import { CouponPromotionError, couponPromotionService } from '../modules/pricing/couponPromotionService.js';
 import { recordAuditEvent } from '../modules/audit/auditService.js';
 
 export const pricingRouter = Router();
@@ -225,6 +226,7 @@ const handleCheckoutCalculation = async (req: Request, res: Response): Promise<v
     storeId,
     items,
     placeOfSupplyStateCode,
+    deliveryAddressId,
     customerGstin,
     customerLocation,
     deliveryCoordinates,
@@ -273,7 +275,8 @@ const handleCheckoutCalculation = async (req: Request, res: Response): Promise<v
             quantity: Number(i.quantity || 1),
           }))
         : [],
-      placeOfSupplyStateCode: placeOfSupplyStateCode || '29',
+      placeOfSupplyStateCode: placeOfSupplyStateCode || undefined,
+      deliveryAddressId: deliveryAddressId ? String(deliveryAddressId) : undefined,
       customerGstin,
       customerLocation: effectiveLoc,
       distanceKm,
@@ -343,7 +346,7 @@ const handleCheckoutCalculation = async (req: Request, res: Response): Promise<v
       return;
     }
 
-    if (err instanceof PricingEngineError || err instanceof TaxEngineError) {
+    if (err instanceof PricingEngineError || err instanceof TaxEngineError || err instanceof CouponPromotionError) {
       res.status(err.statusCode).json({
         success: false,
         error: err.code,
@@ -581,7 +584,7 @@ pricingRouter.put(
   authenticate,
   async (req: Request, res: Response): Promise<void> => {
     const { merchantId, productId } = req.params;
-    const { hsnCode, gstRatePercent, effectiveFrom } = req.body;
+    const { hsnCode, gstRatePercent, effectiveFrom, taxCategory, cessRatePercent, taxInclusive } = req.body;
     const requestId = (req as any).requestId || req.headers['x-request-id'] || 'req-pricing';
 
     // 1. Tenant Ownership Enforcement
@@ -629,6 +632,9 @@ pricingRouter.put(
         merchantId,
         hsnCode: String(hsnCode),
         gstRatePercent,
+        taxCategory: taxCategory ? String(taxCategory) as any : undefined,
+        cessRatePercent: cessRatePercent !== undefined ? cessRatePercent : undefined,
+        taxInclusive: taxInclusive !== undefined ? Boolean(taxInclusive) : undefined,
         effectiveFrom: effectiveFrom ? String(effectiveFrom) : undefined,
         actorId: req.auth!.userId,
       });
@@ -1003,5 +1009,85 @@ pricingRouter.post(
   }
 );
 
+/**
+ * POST /api/v1/pricing/coupons/validate
+ * Authoritative server-side coupon validation and discount calculation preview.
+ */
+pricingRouter.post('/coupons/validate', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+  const { merchantId, items, couponCode, placeOfSupplyStateCode, deliveryAddressId, distanceKm } = req.body;
+  const requestId = (req as any).requestId || req.headers['x-request-id'] || 'req-coupon';
 
+  if (!couponCode || typeof couponCode !== 'string') {
+    res.status(400).json({ success: false, error: 'MISSING_COUPON_CODE', message: 'couponCode is required.', requestId });
+    return;
+  }
 
+  try {
+    const quote = await pricingEngine.calculate({
+      merchantId,
+      items: Array.isArray(items)
+        ? items.map((i: any) => ({
+            productId: String(i.productId || i.id || ''),
+            quantity: Number(i.quantity || 1),
+          }))
+        : [],
+      couponCode,
+      placeOfSupplyStateCode,
+      deliveryAddressId,
+      distanceKm,
+      userId: req.auth?.userId,
+    });
+
+    res.status(200).json({
+      success: true,
+      valid: Boolean(quote.appliedCoupon),
+      appliedCoupon: quote.appliedCoupon || null,
+      discountAmount: quote.discountAmount,
+      grandTotal: quote.grandTotal,
+      quote,
+      requestId,
+    });
+  } catch (err: any) {
+    if (err instanceof PricingEngineError || err instanceof TaxEngineError || err instanceof CouponPromotionError) {
+      res.status(err.statusCode).json({
+        success: false,
+        valid: false,
+        error: err.code,
+        message: err.message,
+        requestId,
+      });
+      return;
+    }
+    res.status(500).json({
+      success: false,
+      error: 'COUPON_VALIDATION_FAILED',
+      message: err.message || 'Failed to validate coupon.',
+      requestId,
+    });
+  }
+});
+
+/**
+ * GET /api/v1/pricing/promotions/active
+ * Lists currently active automatic promotions (zero fabricated defaults).
+ */
+pricingRouter.get('/promotions/active', async (req: Request, res: Response): Promise<void> => {
+  const pool = getPool();
+  const requestId = (req as any).requestId || req.headers['x-request-id'] || 'req-promos';
+  try {
+    const promos = await couponPromotionService.listPromotions(pool);
+    const active = promos.filter((p: any) => p.is_active);
+    res.status(200).json({
+      success: true,
+      promotions: active,
+      requestId,
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: 'PROMOTIONS_FETCH_FAILED',
+      message: err.message || 'Failed to load active promotions.',
+      requestId,
+    });
+  }
+});

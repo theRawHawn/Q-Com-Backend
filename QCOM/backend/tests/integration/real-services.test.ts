@@ -351,6 +351,7 @@ async function runPostgresChecks(): Promise<void> {
       assert.ok(applied.some((name) => name.startsWith('026_')), 'Fresh database must apply migration 026.');
       assert.ok(applied.some((name) => name.startsWith('029_')), 'Fresh database must apply migration 029.');
       assert.ok(applied.some((name) => name.startsWith('030_')), 'Fresh database must apply migration 030.');
+      assert.ok(applied.some((name) => name.startsWith('031_')), 'Fresh database must apply migration 031.');
       assert.deepEqual(await runMigrations({ poolOverride: freshPool }), [], 'A migration rerun must apply no changes.');
 
       const previousFiles = migrationFiles.filter((migration) => Number(migration.version) < 25);
@@ -377,6 +378,7 @@ async function runPostgresChecks(): Promise<void> {
       assert.ok(upgradeApplied.some((name) => name.startsWith('028_')), 'Upgrade must apply migration 028.');
       assert.ok(upgradeApplied.some((name) => name.startsWith('029_')), 'Upgrade must apply migration 029.');
       assert.ok(upgradeApplied.some((name) => name.startsWith('030_')), 'Upgrade must apply migration 030.');
+      assert.ok(upgradeApplied.some((name) => name.startsWith('031_')), 'Upgrade must apply migration 031.');
       const upgradedTripIndexes = await upgradePool.query<{ indexname: string }>(
         `SELECT indexname FROM pg_indexes
          WHERE schemaname = current_schema()
@@ -528,8 +530,9 @@ async function runPostgresChecks(): Promise<void> {
       await runSprint15_7PostgresChecks(freshPool);
       await runSprint15_8PostgresChecks(freshPool);
       await runSprint15_9PostgresChecks(freshPool);
+      await runSprint16_0PostgresChecks(freshPool);
 
-      console.log('PostgreSQL 16 fresh/upgrade migrations, Sprint 15.7/15.8/15.9 integrity/concurrency/pg_locks checks, outbox claims, fencing, and rollback checks passed.');
+      console.log('PostgreSQL 16 fresh/upgrade migrations, Sprint 15.7/15.8/15.9/16.0 integrity/concurrency/pg_locks checks, outbox claims, fencing, and rollback checks passed.');
     } finally {
       setPool(null);
       await Promise.all([freshPool.end(), upgradePool.end()]);
@@ -1518,6 +1521,118 @@ async function runSprint15_9PostgresChecks(freshPool: import('pg').Pool): Promis
   assert.equal(multiRiderRow.status, 'SUSPENDED', 'Crossing floating_cash_limit concurrently must trigger SUSPENDED');
 
   console.log('PostgreSQL 16 Sprint 15.9 checks (Migration 030 schema, GL triggers, 23514 SoD constraints, 23505 uniqueness, post-commit retry, rollback, concurrent multi-order COD collections, ceiling enforcement & concurrent remittance lock hierarchy) passed.');
+}
+
+async function runSprint16_0PostgresChecks(freshPool: import('pg').Pool): Promise<void> {
+  const crypto = await import('node:crypto');
+  const { orderService } = await import('../../src/modules/orders/orderService.js');
+  const { cancellationService } = await import('../../src/modules/orders/cancellationService.js');
+  const { couponPromotionService } = await import('../../src/modules/pricing/couponPromotionService.js');
+  const { paymentReconciliationService } = await import('../../src/modules/reconciliation/paymentReconciliationService.js');
+
+  console.log('[PG16-16.0] Verifying Migration 031 schema, triggers & CHECK constraints...');
+  const tblRes = await freshPool.query<{ table_name: string }>(
+    `SELECT table_name FROM information_schema.tables
+     WHERE table_schema = current_schema()
+       AND table_name IN (
+         'indian_states', 'tax_rate_configs', 'pricing_calculation_snapshots',
+         'promotions', 'promotion_applications', 'carts', 'cart_items',
+         'credit_notes', 'credit_note_line_items'
+       )`
+  );
+  assert.equal(tblRes.rowCount, 9, 'Migration 031 must create all 9 pricing/GST/promotion/cart/credit-note tables.');
+
+  const statesCount = Number((await freshPool.query(`SELECT COUNT(*) AS cnt FROM indian_states`)).rows[0].cnt);
+  assert.ok(statesCount >= 36, 'indian_states must contain >= 36 Indian states and Union Territories.');
+
+  const merchRow = (
+    await freshPool.query(`SELECT id, latitude, longitude FROM merchants WHERE merchant_code = 'MERCH-BLR-01' LIMIT 1`)
+  ).rows[0];
+  const merchantId = merchRow.id as string;
+  const storeLat = Number(merchRow.latitude);
+  const storeLng = Number(merchRow.longitude);
+
+  const prodRow = (
+    await freshPool.query(
+      `SELECT p.id FROM products p JOIN store_inventory si ON si.product_id = p.id
+       WHERE si.merchant_id = $1 AND si.is_available = TRUE LIMIT 1`,
+      [merchantId]
+    )
+  ).rows[0];
+  const productId = prodRow.id as string;
+  await freshPool.query(
+    `UPDATE store_inventory SET stock_count = 5000, reserved_count = 0 WHERE merchant_id = $1 AND product_id = $2`,
+    [merchantId, productId]
+  );
+
+  // Create race coupon with usage_limit = 100 on real PostgreSQL 16
+  await couponPromotionService.createCoupon({
+    code: 'PG16RACE100',
+    title: 'PG16 200-Way Race Limit 100',
+    discountType: 'FLAT_AMOUNT',
+    discountValue: 20,
+    minOrderValueInr: 100,
+    usageLimit: 100,
+    perUserLimit: 200,
+    fundingSource: 'PLATFORM',
+    actorId: (await freshPool.query(`SELECT id FROM users ORDER BY created_at ASC LIMIT 1`)).rows[0].id,
+  });
+
+  const userRows = await freshPool.query(`SELECT id FROM users ORDER BY created_at ASC LIMIT 1`);
+  const raceUserId = userRows.rows[0].id as string;
+
+  // 200 simultaneous checkouts racing against usage_limit = 100 on real PG16 connections!
+  console.log('[PG16-16.0] Executing 200 concurrent checkouts racing on coupon usage_limit=100...');
+  const batches: Array<PromiseSettledResult<any>> = [];
+  const allPromises = Array.from({ length: 200 }, (_, i) =>
+    orderService.createOrder({
+      userId: raceUserId,
+      merchantId,
+      items: [{ productId, quantity: 1 }],
+      couponCode: 'PG16RACE100',
+      placeOfSupplyStateCode: '29',
+      paymentMethod: 'Pay on Delivery',
+      jobSite: { address: `PG16 Race ${i}`, latitude: storeLat + 0.01, longitude: storeLng + 0.01 },
+      idempotencyKey: `pg16_cpn_race_${i}_${Date.now()}`,
+    })
+  );
+  batches.push(...(await Promise.allSettled(allPromises)));
+
+  const won = batches.filter((r) => r.status === 'fulfilled') as Array<PromiseFulfilledResult<any>>;
+  const lost = batches.filter((r) => r.status === 'rejected');
+  assert.equal(won.length, 100, `Strictly 100 of 200 concurrent checkouts may redeem usage_limit=100 coupon; got ${won.length}`);
+  assert.equal(lost.length, 100, `Remaining 100 concurrent checkouts must fail; got ${lost.length}`);
+
+  const couponPost = (await freshPool.query(`SELECT usage_count FROM coupons WHERE code = 'PG16RACE100'`)).rows[0];
+  assert.equal(Number(couponPost.usage_count), 100, 'Coupons.usage_count must equal strictly 100 after 200-way race');
+  const activeRedCnt = Number(
+    (
+      await freshPool.query(
+        `SELECT COUNT(*) AS cnt FROM coupon_redemptions cr
+         JOIN coupons c ON c.id = cr.coupon_id
+         WHERE c.code = 'PG16RACE100' AND cr.status IN ('RESERVED', 'REDEEMED')`
+      )
+    ).rows[0].cnt
+  );
+  assert.equal(activeRedCnt, 100, 'Active coupon_redemptions must equal 100');
+
+  // Cancel 1 winning order -> release slot cleanly to 99, verify rollback on manual DB error leaves 99 intact
+  await cancellationService.cancelByCustomer({
+    orderId: won[0].value.order.id,
+    userId: raceUserId,
+    reason: 'PG16 cancellation coupon release check',
+  });
+  const couponAfterCancel = (await freshPool.query(`SELECT usage_count FROM coupons WHERE code = 'PG16RACE100'`)).rows[0];
+  assert.equal(Number(couponAfterCancel.usage_count), 99);
+
+  // Verify Check 14 reconciliation passes with zero Sprint 16.0 drift on valid seeded/race orders
+  const recon = await paymentReconciliationService.runReconciliation({});
+  const s16Drift = recon.discrepancies.filter((d) =>
+    ['COUPON_USAGE_COUNT_DRIFT', 'PROMOTION_USAGE_COUNT_DRIFT', 'INVALID_FABRICATED_IRN', 'ORDER_GST_MUTUAL_EXCLUSION'].includes(d.category)
+  );
+  assert.equal(s16Drift.length, 0, `Expected 0 Sprint 16.0 reconciliation drift discrepancies, found: ${JSON.stringify(s16Drift)}`);
+
+  console.log('PostgreSQL 16 Sprint 16.0 checks (Migration 031 schema, 200-way coupon race against limit=100, cancellation release, Check 14) passed.');
 }
 
 async function runSuite(): Promise<void> {

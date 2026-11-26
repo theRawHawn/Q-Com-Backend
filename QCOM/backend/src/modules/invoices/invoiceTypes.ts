@@ -3,16 +3,24 @@ export interface InvoiceData {
   invoiceNumber: string;
   orderId: string;
   invoiceType: 'SUMMARY' | 'SELLER_TAX_INVOICE' | 'QCOM_PLATFORM_INVOICE';
-  irn: string;
+  irn: string | null;
+  eInvoicingStatus?: string;
   qrData: string;
   sellerGstin?: string;
   sellerLegalName?: string;
   customerGstin?: string;
   customerBusinessName?: string;
+  placeOfSupplyStateCode?: string;
+  placeOfSupplyStateName?: string;
+  supplierStateCode?: string;
+  isInterState?: boolean;
+  financialYear?: string;
+  discountAmount?: number;
   taxableAmount: number;
   cgstAmount: number;
   sgstAmount: number;
   igstAmount: number;
+  cessAmount?: number;
   totalAmount: number;
   issuedAt: string;
   items: {
@@ -20,11 +28,55 @@ export interface InvoiceData {
     hsnSacCode: string;
     quantity: number;
     unitPrice: number;
+    discountAmount?: number;
     taxableValue: number;
     gstRatePercent: number;
     cgstAmount: number;
     sgstAmount: number;
     igstAmount: number;
+    cessAmount?: number;
+    taxInclusive?: boolean;
+    totalAmount: number;
+  }[];
+}
+
+export interface CreditNoteData {
+  id: string;
+  creditNoteNumber: string;
+  invoiceId?: string | null;
+  orderId: string;
+  returnId?: string | null;
+  refundId?: string | null;
+  creditNoteType: 'SELLER_CREDIT_NOTE' | 'QCOM_CREDIT_NOTE';
+  reasonCode: string;
+  sellerGstin?: string;
+  sellerLegalName?: string;
+  customerGstin?: string;
+  customerBusinessName?: string;
+  placeOfSupplyStateCode?: string;
+  supplierStateCode?: string;
+  isInterState: boolean;
+  financialYear: string;
+  irn: string | null;
+  eInvoicingStatus: string;
+  taxableAmount: number;
+  cgstAmount: number;
+  sgstAmount: number;
+  igstAmount: number;
+  cessAmount: number;
+  totalAmount: number;
+  issuedAt: string;
+  items: {
+    orderItemId?: string | null;
+    description: string;
+    hsnSacCode: string;
+    quantity: number;
+    taxableValue: number;
+    gstRatePercent: number;
+    cgstAmount: number;
+    sgstAmount: number;
+    igstAmount: number;
+    cessAmount: number;
     totalAmount: number;
   }[];
 }

@@ -1,5 +1,7 @@
 export type ChargeType = 'DELIVERY' | 'HANDLING' | 'PLATFORM' | 'OTHER';
 export type TaxBucket = 'SELLER_GOODS' | 'QCOM_SERVICE_FEES' | 'STATUTORY_COLLECTIONS';
+export type TaxCategory = 'TAXABLE' | 'EXEMPT' | 'NIL_RATED' | 'ZERO_RATED';
+export type DiscountFundingSource = 'SELLER' | 'PLATFORM' | 'SHARED';
 
 export interface PricingEngineItemInput {
   productId: string;
@@ -13,6 +15,7 @@ export interface PricingEngineInput {
   items: PricingEngineItemInput[];
   placeOfSupplyStateCode?: string;
   customerGstin?: string;
+  deliveryAddressId?: string;
   customerLocation?: {
     latitude: number;
     longitude: number;
@@ -22,18 +25,46 @@ export interface PricingEngineInput {
   transactionDate?: string | Date;
   userId?: string;
   idempotencyKey?: string;
+  isFirstOrderOverride?: boolean;
+}
+
+export interface AppliedDiscountDetail {
+  sourceType: 'PROMOTION' | 'COUPON';
+  sourceId: string;
+  code: string;
+  title?: string;
+  discountAmount: string;
+  sellerShareAmount: string;
+  platformShareAmount: string;
+  fundingSource: DiscountFundingSource;
+  discountTarget: 'ITEMS' | 'DELIVERY';
+}
+
+export interface LineItemDiscountShare {
+  sourceType: 'PROMOTION' | 'COUPON';
+  sourceId: string;
+  code: string;
+  discountAmount: string;
+  sellerShareAmount: string;
+  platformShareAmount: string;
+  fundingSource: DiscountFundingSource;
 }
 
 export interface PricingLineItem {
   productId: string;
   productName: string;
   sku: string;
+  category?: string;
   hsnCode: string;
   quantity: number;
   unitPrice: string;
   grossAmount: string;
+  inclusiveGrossAmount: string;
   discountAmount: string;
+  inclusiveDiscountAmount: string;
   taxableAmount: string;
+  taxCategory: TaxCategory;
+  taxInclusive: boolean;
   taxBucket: 'SELLER_GOODS';
   taxRateSource: 'SELLER_DECLARED' | 'FALLBACK_CATALOG';
   gstRatePercent: string;
@@ -43,15 +74,21 @@ export interface PricingLineItem {
   sgstAmount: string;
   igstRatePercent: string;
   igstAmount: string;
+  cessRatePercent: string;
+  cessAmount: string;
   totalGstAmount: string;
+  totalTaxAmount: string;
   lineTotal: string;
   taxRuleId: string;
   taxRuleCode: string;
+  appliedDiscounts: LineItemDiscountShare[];
 }
 
 export interface PricingCharge {
   chargeType: ChargeType;
   description: string;
+  grossTaxableAmount?: string;
+  discountAmount?: string;
   taxableAmount: string;
   taxBucket: 'QCOM_SERVICE_FEES';
   taxRateSource: 'QCOM_STATUTORY_RULE';
@@ -104,7 +141,9 @@ export interface SellerGoodsBreakdown {
   cgstAmount: string;
   sgstAmount: string;
   igstAmount: string;
+  cessAmount: string;
   totalGst: string;
+  totalTaxWithCess: string;
   totalSellerPayable: string;
 }
 
@@ -135,16 +174,23 @@ export interface PricingQuote {
   merchantId: string;
   storeId?: string;
   placeOfSupplyStateCode: string;
+  placeOfSupplyStateName?: string;
+  placeOfSupplySource?: string;
   merchantStateCode: string;
+  merchantStateName?: string;
   isInterState: boolean;
   items: PricingLineItem[];
   charges: PricingCharge[];
   itemsSubtotal: string;
   discountAmount: string;
+  deliveryDiscountAmount: string;
+  platformDiscountSubsidy: string;
+  sellerDiscountAmount: string;
   taxableAmount: string;
   totalCgst: string;
   totalSgst: string;
   totalIgst: string;
+  totalCess: string;
   totalTax: string;
   totalCharges: string;
   grandTotal: string;
@@ -158,9 +204,14 @@ export interface PricingQuote {
   withholding: WithholdingBreakdown;
   roundingPolicy: string;
   expiresAt: string;
+  appliedPromotions: AppliedDiscountDetail[];
   appliedCoupon?: {
+    couponId?: string;
     code: string;
     discountAmount: string;
+    fundingSource?: DiscountFundingSource;
+    sellerShareAmount?: string;
+    platformShareAmount?: string;
   };
 }
 
@@ -173,6 +224,9 @@ export interface SellerProductTaxRecord {
   cgstRatePercent: string;
   sgstRatePercent: string;
   igstRatePercent: string;
+  cessRatePercent: string;
+  taxCategory: TaxCategory;
+  taxInclusive: boolean;
   taxRateSource: string;
   status: 'ACTIVE' | 'UNDER_REVIEW' | 'SUPERSEDED';
   adminReviewFlag: boolean;

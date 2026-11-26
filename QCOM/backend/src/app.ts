@@ -18,6 +18,7 @@ import { authRouter, adminAuthRouter } from './routes/authRoutes.js';
 import { rbacRouter } from './routes/rbacRoutes.js';
 import { resourceRouter } from './routes/resourceDemoRoutes.js';
 import { pricingRouter } from './routes/pricingRoutes.js';
+import { cartRouter } from './routes/cartRoutes.js';
 import { customerRouter } from './routes/customerRoutes.js';
 import { orderRouter } from './routes/orderRoutes.js';
 import { paymentRouter, handleWebhookRequest } from './routes/paymentRoutes.js';
@@ -187,6 +188,7 @@ export function createApp(): Express {
   // Sprint 3: Mount Centralized Pricing & Tax Engine Routers
   apiRouter.use('/pricing', pricingRouter);
   apiRouter.use('/checkout', pricingRouter);
+  apiRouter.use('/cart', cartRouter);
 
   // Sprint 4: Mount Consolidated Customer & Operations Domain Routers
   apiRouter.use('/profile', customerRouter);

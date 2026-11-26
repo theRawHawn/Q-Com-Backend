@@ -6,6 +6,7 @@ import { refundService, PreparedRefundIntent, RefundRecord } from '../payments/r
 import { outboxService } from '../outbox/outboxService.js';
 import { transitionPaymentIntentState, transitionPaymentAttemptState } from '../payments/paymentStateMachine.js';
 import { isCodPaymentMethod } from '../ledger/ledgerService.js';
+import { couponPromotionService } from '../pricing/couponPromotionService.js';
 
 export interface CancellationResult {
   order: any;
@@ -124,6 +125,7 @@ export class CancellationService {
 
       await dispatchService.cancelOrderDispatch(orderId, client);
       await this.restoreOrderInventory(o, client);
+      await couponPromotionService.releaseForOrder(client, orderId);
 
       let preparedRefund: PreparedRefundIntent | undefined;
       const reasonCode = `ORDER_CANCELLED_${cancelledBy}`;
@@ -466,6 +468,7 @@ export class CancellationService {
 
     await dispatchService.cancelOrderDispatch(orderId, client);
     await this.restoreOrderInventory(o, client);
+    await couponPromotionService.releaseForOrder(client, orderId);
 
     let refundRecord: RefundRecord | undefined;
     if (o.payment_status === 'PAID' && !isCodPaymentMethod(o.payment_method)) {

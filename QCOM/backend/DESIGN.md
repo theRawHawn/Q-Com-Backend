@@ -39,6 +39,13 @@ Every financial movement creates an immutable `journal_batches` record containin
 - Order trip broadcasting targets available riders within the merchant store's geofenced radius.
 - Rider GPS pings are ingested at 1-second intervals into memory/Redis and broadcast directly to subscribers without writing high-frequency telemetry into persistent PostgreSQL tables.
 
+### 2.5 Authoritative Pricing, Indian GST Engine, Concurrency-Safe Promotions/Coupons & GST Credit Notes (`src/modules/pricing`, `src/modules/invoices`)
+- **Decimal-Safe Arithmetic (`money.ts`):** All price, discount, GST (`CGST`/`SGST`/`IGST`), Cess, prorated refund, and settlement math executes via `bignumber.js` (`ROUND_HALF_UP` to 2 decimals) — never binary floats.
+- **GST Inclusivity & Fail-Closed Classification (`taxEngine.ts`):** Supports `tax_inclusive` MRP back-calculation (`taxable = gross / (1 + (gstRate + cessRate)/100)`), `tax_exclusive` forward calculation, and `TAXABLE`/`EXEMPT`/`NIL_RATED`/`ZERO_RATED` categories. Products or sellers missing verified tax classifications fail closed with HTTP `422` (`UNVERIFIED_PRODUCT_TAX` / `INVALID_STATE_CONFIGURATION`).
+- **Dynamic Place of Supply:** Inter-state vs. intra-state GST splits resolve dynamically from seller (`merchants.state_code`) vs. customer delivery state (`indian_states` 36-state/UT master) with zero hardcoded `'29'` defaults.
+- **Concurrency-Safe Coupons, Promotions & Funding Splits (`couponPromotionService.ts`):** Coupons lock under `SELECT ... FOR UPDATE` and track `RESERVED` -> `REDEEMED` / `RELEASED` / `REVERSED` slots, rejecting over-limit checkouts even under 200-way concurrent bursts. Discounts allocate proportionally across line items and split funding (`SELLER`, `PLATFORM`, `SHARED`), crediting/debiting COA `5040` (`Platform Promotion Subsidy`) in balanced GL batches.
+- **Persistent Carts, Quote Integrity & Prorated Credit Notes:** DB-backed carts (`carts`/`cart_items`) verify server-computed checkout quotes (`409 PRICE_CHANGED` / `QUOTE_EXPIRED`). Invoices stamp real dynamic Apr–Mar Indian FY and honest `irn: null` / `eInvoicingStatus: 'NOT_APPLICABLE'` when IRP is disabled. Partial/full returns generate immutable GST `credit_notes` & `credit_note_line_items` matching prorated discounted tax-inclusive item totals (`line_total_payable`).
+
 ---
 
 ## 3. Error-Handling & Resilience Conventions

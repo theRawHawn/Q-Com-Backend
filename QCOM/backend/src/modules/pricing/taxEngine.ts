@@ -6,6 +6,7 @@ import {
   SellerProductTaxRecord,
   GstTcsBreakdown,
   WithholdingBreakdown,
+  TaxCategory,
 } from './pricingTypes.js';
 import {
   toDecimal,
@@ -28,6 +29,13 @@ export class TaxEngineError extends Error {
   }
 }
 
+const VALID_TAX_CATEGORIES: ReadonlySet<string> = new Set([
+  'TAXABLE',
+  'EXEMPT',
+  'NIL_RATED',
+  'ZERO_RATED',
+]);
+
 export class TaxEngine {
   /**
    * Formats Date to YYYY-MM-DD for SQL comparison
@@ -37,15 +45,148 @@ export class TaxEngine {
   }
 
   // =========================================================================
+  // STATUTORY PLACE OF SUPPLY & INDIAN STATE MASTER VALIDATION
+  // =========================================================================
+
+  /**
+   * Validates a 2-digit Indian GST state/UT code against the `indian_states` master table.
+   * Rejects fabricated or inactive codes with 422 INVALID_STATE_CODE.
+   */
+  async validateStateCode(
+    stateCode: string,
+    poolOverride?: pg.Pool | pg.PoolClient
+  ): Promise<{ code: string; name: string; isUnionTerritory: boolean }> {
+    const clean = (stateCode || '').trim();
+    if (!/^[0-9]{2}$/.test(clean)) {
+      throw new TaxEngineError(
+        'INVALID_STATE_CODE',
+        `State code '${stateCode}' must be a valid 2-digit Indian GST state/UT code.`,
+        422
+      );
+    }
+
+    const runner = poolOverride || getPool();
+    const res = await runner.query(
+      `SELECT code, name, is_union_territory, is_active FROM indian_states WHERE code = $1`,
+      [clean]
+    );
+
+    if (res.rows.length === 0 || res.rows[0].is_active === false) {
+      throw new TaxEngineError(
+        'INVALID_STATE_CODE',
+        `State code '${clean}' is not an active Indian GST state/UT code.`,
+        422
+      );
+    }
+
+    return {
+      code: res.rows[0].code,
+      name: res.rows[0].name,
+      isUnionTerritory: Boolean(res.rows[0].is_union_territory),
+    };
+  }
+
+  /**
+   * Returns human-readable state name from `indian_states` or null if unknown.
+   */
+  async getStateName(
+    stateCode: string | null | undefined,
+    poolOverride?: pg.Pool | pg.PoolClient
+  ): Promise<string | null> {
+    if (!stateCode) return null;
+    const runner = poolOverride || getPool();
+    const res = await runner.query(
+      `SELECT name FROM indian_states WHERE code = $1 LIMIT 1`,
+      [stateCode.trim()]
+    );
+    return res.rows.length > 0 ? res.rows[0].name : null;
+  }
+
+  /**
+   * Authoritatively resolves Place of Supply without hardcoded fallbacks.
+   * Priority order:
+   *  1. Explicit `placeOfSupplyStateCode` (validated against `indian_states`)
+   *  2. Valid `customerGstin` prefix (first 2 digits validated)
+   *  3. Explicit `deliveryAddressId` -> `saved_addresses.state_code`
+   *  4. Customer's `saved_addresses.state_code` / `saved_gstins.state_code`
+   *  5. Seller's `merchantStateCode` (validated)
+   */
+  async resolvePlaceOfSupply(
+    params: {
+      explicitStateCode?: string | null;
+      customerGstin?: string | null;
+      deliveryAddressId?: string | null;
+      userId?: string | null;
+      merchantStateCode: string;
+    },
+    poolOverride?: pg.Pool | pg.PoolClient
+  ): Promise<{
+    stateCode: string;
+    stateName: string;
+    source: 'EXPLICIT' | 'CUSTOMER_GSTIN' | 'DELIVERY_ADDRESS' | 'SAVED_ADDRESS' | 'SAVED_GSTIN' | 'MERCHANT_STATE';
+  }> {
+    const runner = poolOverride || getPool();
+
+    if (params.explicitStateCode && params.explicitStateCode.trim() !== '') {
+      const state = await this.validateStateCode(params.explicitStateCode, runner);
+      return { stateCode: state.code, stateName: state.name, source: 'EXPLICIT' };
+    }
+
+    if (params.customerGstin && params.customerGstin.trim().length >= 2) {
+      const prefix = params.customerGstin.trim().slice(0, 2);
+      if (/^[0-9]{2}$/.test(prefix)) {
+        const state = await this.validateStateCode(prefix, runner);
+        return { stateCode: state.code, stateName: state.name, source: 'CUSTOMER_GSTIN' };
+      }
+    }
+
+    if (params.deliveryAddressId && params.userId) {
+      const addrRes = await runner.query(
+        `SELECT state_code FROM saved_addresses WHERE id = $1 AND user_id = $2 LIMIT 1`,
+        [params.deliveryAddressId, params.userId]
+      );
+      if (addrRes.rows.length > 0 && addrRes.rows[0].state_code) {
+        const state = await this.validateStateCode(addrRes.rows[0].state_code, runner);
+        return { stateCode: state.code, stateName: state.name, source: 'DELIVERY_ADDRESS' };
+      }
+    }
+
+    if (params.userId) {
+      const defaultAddrRes = await runner.query(
+        `SELECT state_code FROM saved_addresses
+          WHERE user_id = $1 AND state_code IS NOT NULL
+          ORDER BY created_at DESC LIMIT 1`,
+        [params.userId]
+      );
+      if (defaultAddrRes.rows.length > 0 && defaultAddrRes.rows[0].state_code) {
+        const state = await this.validateStateCode(defaultAddrRes.rows[0].state_code, runner);
+        return { stateCode: state.code, stateName: state.name, source: 'SAVED_ADDRESS' };
+      }
+
+      const gstinRes = await runner.query(
+        `SELECT state_code FROM saved_gstins
+          WHERE user_id = $1 AND state_code IS NOT NULL
+          ORDER BY is_default DESC, created_at DESC LIMIT 1`,
+        [params.userId]
+      );
+      if (gstinRes.rows.length > 0 && gstinRes.rows[0].state_code) {
+        const state = await this.validateStateCode(gstinRes.rows[0].state_code, runner);
+        return { stateCode: state.code, stateName: state.name, source: 'SAVED_GSTIN' };
+      }
+    }
+
+    const merchState = await this.validateStateCode(params.merchantStateCode, runner);
+    return { stateCode: merchState.code, stateName: merchState.name, source: 'MERCHANT_STATE' };
+  }
+
+  // =========================================================================
   // BUCKET A: SELLER'S GOODS TAX (Seller declared on product catalogue)
   // =========================================================================
 
   /**
-   * Resolves the authoritative Seller-Declared Product GST Configuration.
-   * Priority:
-   *  1. Active record in `seller_product_tax` for the specific merchant and product on transaction date.
-   *  2. Fallback to `products` table (`hsn_code` and `gst_rate_percent`).
-   *  3. Fallback to `statutory_tax_rules` as fail-safe.
+   * Resolves the authoritative Seller-Declared Product GST & Cess Configuration.
+   * Fail-closed: rejects unverified or incomplete tax classifications with 422 MISSING_TAX_CLASSIFICATION,
+   * and enforces zero GST/Cess for EXEMPT / NIL_RATED / ZERO_RATED items.
    */
   async resolveSellerProductTax(
     productId: string,
@@ -57,6 +198,9 @@ export class TaxEngine {
     ruleCode: string;
     hsnCode: string;
     gstRatePercent: string;
+    cessRatePercent: string;
+    taxCategory: TaxCategory;
+    taxInclusive: boolean;
     taxRateSource: 'SELLER_DECLARED' | 'FALLBACK_CATALOG';
     status: string;
     adminReviewFlag: boolean;
@@ -64,9 +208,26 @@ export class TaxEngine {
     const runner = poolOverride || getPool();
     const dateStr = this.formatDate(transactionDate);
 
+    // Fetch catalog metadata first so verification flag & defaults are authoritative
+    const prodRes = await runner.query(
+      `SELECT id, sku, hsn_code, gst_rate_percent, cess_rate_percent, tax_category, tax_inclusive, is_tax_classification_verified
+         FROM products
+        WHERE id = $1`,
+      [productId]
+    );
+
+    if (prodRes.rows.length > 0 && prodRes.rows[0].is_tax_classification_verified === false) {
+      throw new TaxEngineError(
+        'MISSING_TAX_CLASSIFICATION',
+        `Product '${prodRes.rows[0].sku || productId}' does not have verified GST/HSN classification and cannot be transacted.`,
+        422
+      );
+    }
+
     // 1. Look up in seller_product_tax table
     const sellerTaxRes = await runner.query(
-      `SELECT id, product_id, merchant_id, hsn_code, gst_rate_percent, 
+      `SELECT id, product_id, merchant_id, hsn_code, gst_rate_percent,
+              cess_rate_percent, tax_category, tax_inclusive,
               tax_rate_source, status, admin_review_flag, effective_from, effective_to
          FROM seller_product_tax
         WHERE product_id = $1
@@ -81,11 +242,21 @@ export class TaxEngine {
 
     if (sellerTaxRes.rows.length > 0) {
       const row = sellerTaxRes.rows[0];
+      const taxCategory = (row.tax_category || prodRes.rows[0]?.tax_category || 'TAXABLE') as TaxCategory;
+      const gstRateBn = toDecimal(row.gst_rate_percent);
+      const cessRateBn = toDecimal(row.cess_rate_percent ?? prodRes.rows[0]?.cess_rate_percent ?? 0);
+      const taxInclusive = Boolean(row.tax_inclusive ?? prodRes.rows[0]?.tax_inclusive ?? false);
+
+      this.validateCategoryRates(taxCategory, gstRateBn, cessRateBn, row.hsn_code);
+
       return {
         ruleId: row.id,
         ruleCode: `SELLER_TAX_${row.hsn_code}`,
         hsnCode: row.hsn_code,
-        gstRatePercent: toDecimal(row.gst_rate_percent).toFixed(2),
+        gstRatePercent: gstRateBn.toFixed(2),
+        cessRatePercent: cessRateBn.toFixed(2),
+        taxCategory,
+        taxInclusive,
         taxRateSource: 'SELLER_DECLARED',
         status: row.status,
         adminReviewFlag: Boolean(row.admin_review_flag),
@@ -93,18 +264,30 @@ export class TaxEngine {
     }
 
     // 2. Fallback to catalog product specification
-    const prodRes = await runner.query(
-      `SELECT id, sku, hsn_code, gst_rate_percent FROM products WHERE id = $1`,
-      [productId]
-    );
-
     if (prodRes.rows.length > 0) {
       const p = prodRes.rows[0];
+      if (!p.hsn_code || String(p.hsn_code).trim() === '' || p.gst_rate_percent === null || p.gst_rate_percent === undefined) {
+        throw new TaxEngineError(
+          'MISSING_TAX_CLASSIFICATION',
+          `Product '${p.sku || productId}' is missing statutory HSN code or GST rate.`,
+          422
+        );
+      }
+      const taxCategory = (p.tax_category || 'TAXABLE') as TaxCategory;
+      const gstRateBn = toDecimal(p.gst_rate_percent);
+      const cessRateBn = toDecimal(p.cess_rate_percent ?? 0);
+      const taxInclusive = Boolean(p.tax_inclusive ?? false);
+
+      this.validateCategoryRates(taxCategory, gstRateBn, cessRateBn, p.hsn_code);
+
       return {
         ruleId: p.id,
         ruleCode: `CATALOG_TAX_${p.hsn_code}`,
         hsnCode: p.hsn_code,
-        gstRatePercent: toDecimal(p.gst_rate_percent).toFixed(2),
+        gstRatePercent: gstRateBn.toFixed(2),
+        cessRatePercent: cessRateBn.toFixed(2),
+        taxCategory,
+        taxInclusive,
         taxRateSource: 'FALLBACK_CATALOG',
         status: 'ACTIVE',
         adminReviewFlag: false,
@@ -112,17 +295,43 @@ export class TaxEngine {
     }
 
     throw new TaxEngineError(
-      'SELLER_PRODUCT_TAX_NOT_CONFIGURED',
+      'MISSING_TAX_CLASSIFICATION',
       `No seller product tax or catalogue configuration found for product '${productId}'.`,
       422
     );
   }
 
+  private validateCategoryRates(
+    taxCategory: string,
+    gstRateBn: BigNumber,
+    cessRateBn: BigNumber,
+    hsnCode: string
+  ): void {
+    if (!VALID_TAX_CATEGORIES.has(taxCategory)) {
+      throw new TaxEngineError(
+        'INVALID_TAX_CLASSIFICATION',
+        `Unsupported tax category '${taxCategory}' for HSN '${hsnCode}'.`,
+        422
+      );
+    }
+    if (!hsnCode || hsnCode.trim().length < 2) {
+      throw new TaxEngineError(
+        'MISSING_TAX_CLASSIFICATION',
+        'Valid HSN code is mandatory for GST calculation.',
+        422
+      );
+    }
+    if (taxCategory !== 'TAXABLE' && (gstRateBn.isGreaterThan(0) || cessRateBn.isGreaterThan(0))) {
+      throw new TaxEngineError(
+        'INVALID_TAX_CLASSIFICATION',
+        `Tax category '${taxCategory}' must have 0% GST and 0% Cess (received ${gstRateBn.toFixed(2)}% GST, ${cessRateBn.toFixed(2)}% Cess).`,
+        422
+      );
+    }
+  }
+
   /**
-   * Declares or updates a seller's product GST rate and HSN code.
-   * Controls & Validation:
-   * - Validates standard Indian GST slabs (0%, 5%, 12%, 18%, 28%).
-   * - If a seller enters a non-standard rate, it is saved but automatically flagged with `admin_review_flag = TRUE`.
+   * Declares or updates a seller's product GST rate, HSN code, tax category, Cess rate, and inclusivity mode.
    */
   async declareSellerProductTax(
     params: {
@@ -130,6 +339,9 @@ export class TaxEngine {
       merchantId: string;
       hsnCode: string;
       gstRatePercent: number | string;
+      cessRatePercent?: number | string;
+      taxCategory?: TaxCategory;
+      taxInclusive?: boolean;
       effectiveFrom?: string;
       actorId?: string;
     },
@@ -137,9 +349,15 @@ export class TaxEngine {
   ): Promise<SellerProductTaxRecord> {
     const runner = poolOverride || getPool();
     const rateBn = toDecimal(params.gstRatePercent);
+    const cessBn = toDecimal(params.cessRatePercent ?? 0);
+    const taxCategory: TaxCategory = params.taxCategory || 'TAXABLE';
+    const taxInclusive = Boolean(params.taxInclusive ?? false);
 
     if (rateBn.isLessThan(0) || rateBn.isGreaterThan(100)) {
       throw new TaxEngineError('INVALID_GST_RATE', 'GST rate percent must be between 0% and 100%.', 400);
+    }
+    if (cessBn.isLessThan(0) || cessBn.isGreaterThan(100)) {
+      throw new TaxEngineError('INVALID_GST_RATE', 'Cess rate percent must be between 0% and 100%.', 400);
     }
 
     const cleanHsn = params.hsnCode.trim();
@@ -147,13 +365,14 @@ export class TaxEngine {
       throw new TaxEngineError('INVALID_HSN_CODE', 'A valid HSN code is required.', 400);
     }
 
+    this.validateCategoryRates(taxCategory, rateBn, cessBn, cleanHsn);
+
     // Dynamic database-driven standard slabs check: queries active statutory tax rules in PostgreSQL
     const ratesRes = await runner.query(
       `SELECT DISTINCT gst_rate_percent FROM statutory_tax_rules WHERE is_active = TRUE`
     );
     const validDbSlabs = ratesRes.rows.map(r => toDecimal(r.gst_rate_percent).toNumber());
-    // In India statutory goods slabs include 0, 5, 12, 18, 28
-    const standardSlabs = validDbSlabs.length > 0 ? validDbSlabs : [0, 5, 12, 18, 28];
+    const standardSlabs = Array.from(new Set([...validDbSlabs, 0, 5, 12, 18, 28]));
     const isStandard = standardSlabs.includes(rateBn.toNumber());
     const adminReviewFlag = !isStandard;
     const adminReviewNotes = !isStandard
@@ -166,9 +385,10 @@ export class TaxEngine {
     const res = await runner.query(
       `INSERT INTO seller_product_tax
         (product_id, merchant_id, hsn_code, gst_rate_percent, cgst_rate_percent, sgst_rate_percent, igst_rate_percent,
+         cess_rate_percent, tax_category, tax_inclusive,
          tax_rate_source, status, admin_review_flag, admin_review_notes, effective_from, seller_declared_at, created_at, updated_at)
        VALUES
-        ($1, $2, $3, $4, $5, $6, $7, 'SELLER_DECLARED', 'ACTIVE', $8, $9, $10::date, NOW(), NOW(), NOW())
+        ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'SELLER_DECLARED', 'ACTIVE', $11, $12, $13::date, NOW(), NOW(), NOW())
        ON CONFLICT (product_id, merchant_id, effective_from)
        DO UPDATE SET
         hsn_code = EXCLUDED.hsn_code,
@@ -176,6 +396,9 @@ export class TaxEngine {
         cgst_rate_percent = EXCLUDED.cgst_rate_percent,
         sgst_rate_percent = EXCLUDED.sgst_rate_percent,
         igst_rate_percent = EXCLUDED.igst_rate_percent,
+        cess_rate_percent = EXCLUDED.cess_rate_percent,
+        tax_category = EXCLUDED.tax_category,
+        tax_inclusive = EXCLUDED.tax_inclusive,
         admin_review_flag = EXCLUDED.admin_review_flag,
         admin_review_notes = EXCLUDED.admin_review_notes,
         updated_at = NOW()
@@ -188,6 +411,9 @@ export class TaxEngine {
         halfRate.toFixed(2),
         halfRate.toFixed(2),
         rateBn.toFixed(2),
+        cessBn.toFixed(2),
+        taxCategory,
+        taxInclusive,
         adminReviewFlag,
         adminReviewNotes,
         effectiveFrom,
@@ -204,6 +430,9 @@ export class TaxEngine {
       cgstRatePercent: toDecimal(row.cgst_rate_percent).toFixed(2),
       sgstRatePercent: toDecimal(row.sgst_rate_percent).toFixed(2),
       igstRatePercent: toDecimal(row.igst_rate_percent).toFixed(2),
+      cessRatePercent: toDecimal(row.cess_rate_percent ?? 0).toFixed(2),
+      taxCategory: (row.tax_category || 'TAXABLE') as TaxCategory,
+      taxInclusive: Boolean(row.tax_inclusive),
       taxRateSource: row.tax_rate_source,
       status: row.status,
       adminReviewFlag: Boolean(row.admin_review_flag),
@@ -221,7 +450,6 @@ export class TaxEngine {
 
   /**
    * Resolves the authoritative effective-dated statutory tax rule for QCOM services.
-   * Enforces zero matching -> TAX_RULE_NOT_FOUND, multiple conflicting -> TAX_RULE_CONFLICT.
    */
   async resolveTaxRule(
     hsnOrSac: string,
@@ -233,7 +461,7 @@ export class TaxEngine {
     const dateStr = this.formatDate(transactionDate);
 
     const res = await runner.query(
-      `SELECT id, rule_code, tax_type, hsn_or_sac_code, description, 
+      `SELECT id, rule_code, tax_type, hsn_or_sac_code, description,
               effective_from, effective_to,
               gst_rate_percent, cgst_rate_percent, sgst_rate_percent, igst_rate_percent,
               calculation_base, rounding_rule, statutory_reference
@@ -284,8 +512,6 @@ export class TaxEngine {
 
   /**
    * Dynamically resolves active statutory service tax rule directly by tax_type
-   * (e.g. DELIVERY_GST, HANDLING_GST, COMMISSION_GST) from statutory_tax_rules table
-   * without hardcoding SAC codes in application code.
    */
   async resolveServiceTaxRule(
     taxType: 'DELIVERY_GST' | 'HANDLING_GST' | 'COMMISSION_GST',
@@ -296,7 +522,7 @@ export class TaxEngine {
     const dateStr = this.formatDate(transactionDate);
 
     const res = await runner.query(
-      `SELECT id, rule_code, tax_type, hsn_or_sac_code, description, 
+      `SELECT id, rule_code, tax_type, hsn_or_sac_code, description,
               effective_from, effective_to,
               gst_rate_percent, cgst_rate_percent, sgst_rate_percent, igst_rate_percent,
               calculation_base, rounding_rule, statutory_reference
@@ -345,11 +571,105 @@ export class TaxEngine {
   }
 
   /**
-   * Calculates GST breakdown for a line item or charge based on place of supply (intra-state vs inter-state).
+   * Extracts taxable base, CGST/SGST/IGST, and Cess from a tax-inclusive gross amount
+   * using exact BigNumber arithmetic and deterministic 1-paisa base rounding reconciliation
+   * so base + cgst + sgst + igst + cess === roundCurrency(inclusiveGross) strictly.
+   */
+  extractInclusiveBaseAndTaxes(params: {
+    inclusiveGross: string | BigNumber;
+    gstRatePercent: string | BigNumber;
+    cessRatePercent?: string | BigNumber;
+    taxCategory?: TaxCategory;
+    merchantStateCode: string;
+    placeOfSupplyStateCode: string;
+  }): {
+    isInterState: boolean;
+    taxableAmount: string;
+    gstRatePercent: string;
+    cgstRatePercent: string;
+    cgstAmount: string;
+    sgstRatePercent: string;
+    sgstAmount: string;
+    igstRatePercent: string;
+    igstAmount: string;
+    cessRatePercent: string;
+    cessAmount: string;
+    totalGstAmount: string;
+    totalTaxWithCessAmount: string;
+    inclusiveTotal: string;
+  } {
+    const grossRounded = roundCurrency(params.inclusiveGross);
+    const grossBn = toDecimal(grossRounded);
+    const isExemptCategory = params.taxCategory && params.taxCategory !== 'TAXABLE';
+    const gstRateBn = isExemptCategory ? new BigNumber(0) : toDecimal(params.gstRatePercent);
+    const cessRateBn = isExemptCategory ? new BigNumber(0) : toDecimal(params.cessRatePercent ?? 0);
+    const isInterState = params.merchantStateCode.trim() !== params.placeOfSupplyStateCode.trim();
+
+    const combinedRatePct = add(gstRateBn, cessRateBn);
+    if (combinedRatePct.isZero() || grossBn.isZero()) {
+      return {
+        isInterState,
+        taxableAmount: grossRounded,
+        gstRatePercent: gstRateBn.toFixed(2),
+        cgstRatePercent: isInterState ? '0.00' : divide(gstRateBn, 2).toFixed(2),
+        cgstAmount: '0.00',
+        sgstRatePercent: isInterState ? '0.00' : divide(gstRateBn, 2).toFixed(2),
+        sgstAmount: '0.00',
+        igstRatePercent: isInterState ? gstRateBn.toFixed(2) : '0.00',
+        igstAmount: '0.00',
+        cessRatePercent: cessRateBn.toFixed(2),
+        cessAmount: '0.00',
+        totalGstAmount: '0.00',
+        totalTaxWithCessAmount: '0.00',
+        inclusiveTotal: grossRounded,
+      };
+    }
+
+    const divisor = add(1, divide(combinedRatePct, 100));
+    const rawBaseBn = divide(grossBn, divisor);
+    let baseRounded = roundCurrency(rawBaseBn);
+
+    const calc = this.calculateGst({
+      taxableAmount: baseRounded,
+      taxRule: { gst_rate_percent: gstRateBn.toFixed(2) },
+      cessRatePercent: cessRateBn.toFixed(2),
+      taxCategory: params.taxCategory,
+      merchantStateCode: params.merchantStateCode,
+      placeOfSupplyStateCode: params.placeOfSupplyStateCode,
+    });
+
+    const computedSum = add(baseRounded, calc.totalTaxWithCessAmount);
+    const diff = subtract(grossBn, computedSum);
+    if (!diff.isZero()) {
+      baseRounded = roundCurrency(add(baseRounded, diff));
+    }
+
+    return {
+      isInterState: calc.isInterState,
+      taxableAmount: baseRounded,
+      gstRatePercent: calc.gstRatePercent,
+      cgstRatePercent: calc.cgstRatePercent,
+      cgstAmount: calc.cgstAmount,
+      sgstRatePercent: calc.sgstRatePercent,
+      sgstAmount: calc.sgstAmount,
+      igstRatePercent: calc.igstRatePercent,
+      igstAmount: calc.igstAmount,
+      cessRatePercent: calc.cessRatePercent,
+      cessAmount: calc.cessAmount,
+      totalGstAmount: calc.totalGstAmount,
+      totalTaxWithCessAmount: calc.totalTaxWithCessAmount,
+      inclusiveTotal: grossRounded,
+    };
+  }
+
+  /**
+   * Calculates GST & Cess breakdown for a line item or charge based on place of supply (intra-state vs inter-state).
    */
   calculateGst(params: {
     taxableAmount: string | BigNumber;
     taxRule: { gst_rate_percent: string; rule_code?: string; id?: string };
+    cessRatePercent?: string | BigNumber;
+    taxCategory?: TaxCategory;
     merchantStateCode: string;
     placeOfSupplyStateCode: string;
   }): {
@@ -361,13 +681,19 @@ export class TaxEngine {
     sgstAmount: string;
     igstRatePercent: string;
     igstAmount: string;
+    cessRatePercent: string;
+    cessAmount: string;
     totalGstAmount: string;
+    totalTaxWithCessAmount: string;
   } {
-    const { taxableAmount, taxRule, merchantStateCode, placeOfSupplyStateCode } = params;
+    const { taxableAmount, taxRule, merchantStateCode, placeOfSupplyStateCode, taxCategory } = params;
     const taxableBn = toDecimal(taxableAmount);
-    const gstRateBn = toDecimal(taxRule.gst_rate_percent);
+    const isExemptCategory = taxCategory && taxCategory !== 'TAXABLE';
+    const gstRateBn = isExemptCategory ? new BigNumber(0) : toDecimal(taxRule.gst_rate_percent);
+    const cessRateBn = isExemptCategory ? new BigNumber(0) : toDecimal(params.cessRatePercent ?? 0);
 
     const isInterState = merchantStateCode.trim() !== placeOfSupplyStateCode.trim();
+    const cessAmt = roundCurrency(multiply(taxableBn, divide(cessRateBn, 100)));
 
     if (!isInterState) {
       // Intra-state supply: CGST (50%) + SGST (50%)
@@ -375,6 +701,7 @@ export class TaxEngine {
       const cgstAmt = roundCurrency(multiply(taxableBn, divide(halfRate, 100)));
       const sgstAmt = roundCurrency(multiply(taxableBn, divide(halfRate, 100)));
       const totalGst = roundCurrency(add(cgstAmt, sgstAmt));
+      const totalWithCess = roundCurrency(add(totalGst, cessAmt));
 
       return {
         isInterState: false,
@@ -385,11 +712,15 @@ export class TaxEngine {
         sgstAmount: sgstAmt,
         igstRatePercent: '0.00',
         igstAmount: '0.00',
+        cessRatePercent: cessRateBn.toFixed(2),
+        cessAmount: cessAmt,
         totalGstAmount: totalGst,
+        totalTaxWithCessAmount: totalWithCess,
       };
     } else {
       // Inter-state supply: IGST (100%)
       const igstAmt = roundCurrency(multiply(taxableBn, divide(gstRateBn, 100)));
+      const totalWithCess = roundCurrency(add(igstAmt, cessAmt));
 
       return {
         isInterState: true,
@@ -400,7 +731,10 @@ export class TaxEngine {
         sgstAmount: '0.00',
         igstRatePercent: gstRateBn.toFixed(2),
         igstAmount: igstAmt,
+        cessRatePercent: cessRateBn.toFixed(2),
+        cessAmount: cessAmt,
         totalGstAmount: igstAmt,
+        totalTaxWithCessAmount: totalWithCess,
       };
     }
   }
@@ -411,7 +745,6 @@ export class TaxEngine {
 
   /**
    * Resolves Section 52 GST-TCS rule and calculates TCS amount on Net Taxable Supplies.
-   * Net Taxable Supplies = Sum of product taxable amounts (excluding customer GST).
    */
   async resolveGstTcs(params: {
     netTaxableSupplies: string | BigNumber;
@@ -504,7 +837,6 @@ export class TaxEngine {
     const dateStr = this.formatDate(txnDate);
     const grossBn = toDecimal(params.grossTaxableAmount);
 
-    // Determine target statutory regime
     const isNewAct2025 = txnDate.getTime() >= new Date('2026-04-01T00:00:00Z').getTime();
     const governingLaw = isNewAct2025 ? 'INCOME_TAX_ACT_2025' : 'INCOME_TAX_ACT_1961';
 
@@ -557,13 +889,6 @@ export class TaxEngine {
   // BUCKET SEPARATION & CONTRACTUAL SETTLEMENT PREVIEW (Sprint 3.1)
   // =========================================================================
 
-  /**
-   * Calculates a contractual settlement preview separating:
-   * 1. Seller's Gross Proceeds = Seller's taxable goods value + Seller's GST
-   * 2. QCOM's Commission & Service Fee = Commission taxable + GST on commission (SAC 9983)
-   * 3. Net Seller Settlement = Gross proceeds - QCOM Commission - Commission GST
-   * (Statutory TCS/TDS deducted if required by law)
-   */
   async calculateSettlementPreview(params: {
     sellerGoodsTaxable: string | BigNumber;
     sellerGstRatePercent: string | BigNumber;
@@ -597,7 +922,6 @@ export class TaxEngine {
     const sellerGstAmtBn = roundCurrency(multiply(goodsTaxableBn, divide(sellerGstRateBn, 100)));
     const sellerGrossProceedsBn = add(goodsTaxableBn, sellerGstAmtBn);
 
-    // QCOM Commission
     let commTaxableBn = new BigNumber(0);
     if (params.commissionFlatInr !== undefined) {
       commTaxableBn = toDecimal(params.commissionFlatInr);
@@ -605,7 +929,6 @@ export class TaxEngine {
       commTaxableBn = toDecimal(roundCurrency(multiply(goodsTaxableBn, divide(toDecimal(params.commissionRatePercent), 100))));
     }
 
-    // Dynamic QCOM Commission GST: Read from database statutory_tax_rules table
     let commGstRateBn: BigNumber;
     if (params.commissionGstRatePercent !== undefined) {
       commGstRateBn = toDecimal(params.commissionGstRatePercent);
@@ -620,7 +943,6 @@ export class TaxEngine {
     const commGstAmtBn = roundCurrency(multiply(commTaxableBn, divide(commGstRateBn, 100)));
     const totalQcomFeeBn = add(commTaxableBn, commGstAmtBn);
 
-    // Dynamic Statutory deductions: Read from database rules
     let tcsAmtBn = new BigNumber(0);
     if (params.applyGstTcs) {
       let tcsRateBn: BigNumber;
@@ -670,13 +992,6 @@ export class TaxEngine {
     };
   }
 
-  /**
-   * Calculates actual real-life merchant settlement directly from PostgreSQL database records.
-   * - Picks merchant's actual contract commission rate from `merchants.commission_rate_percent`.
-   * - Picks active statutory commission GST rule from `statutory_tax_rules`.
-   * - Picks active Section 52 GST-TCS rule from `gst_tcs_rules`.
-   * - Picks active Section 393 Withholding rule from `statutory_withholding_rules` based on merchant's constitution and PAN.
-   */
   async calculateMerchantSettlement(params: {
     merchantId: string;
     sellerGoodsTaxable: string | BigNumber;
@@ -688,10 +1003,9 @@ export class TaxEngine {
     const runner = params.poolOverride || getPool();
     const txnDate = params.transactionDate || new Date();
 
-    // 1. Fetch real-life merchant contract and tax attributes from PostgreSQL
     const merchRes = await runner.query(
-      `SELECT id, merchant_code, name, commission_rate_percent, pan_status, constitution_type, state_code 
-         FROM merchants 
+      `SELECT id, merchant_code, name, commission_rate_percent, pan_status, constitution_type, state_code
+         FROM merchants
         WHERE id = $1`,
       [params.merchantId]
     );
@@ -701,13 +1015,9 @@ export class TaxEngine {
     }
     const merchant = merchRes.rows[0];
 
-    // Real contract commission rate
     const commissionRatePercent = merchant.commission_rate_percent;
-
-    // 2. Fetch real statutory commission GST rule
     const commTaxRule = await this.resolveServiceTaxRule('COMMISSION_GST', txnDate, runner);
 
-    // 3. Fetch real Section 52 TCS breakdown
     const isInterState = params.isInterState ?? false;
     const gstTcs = await this.resolveGstTcs({
       netTaxableSupplies: params.sellerGoodsTaxable,
@@ -716,7 +1026,6 @@ export class TaxEngine {
       poolOverride: runner,
     });
 
-    // 4. Fetch real Section 393 Withholding breakdown
     const withholding = await this.resolveWithholding({
       grossTaxableAmount: params.sellerGoodsTaxable,
       merchantConstitution: merchant.constitution_type || 'INDIVIDUAL',

@@ -25,6 +25,7 @@ import { ledgerService } from '../ledger/ledgerService.js';
 import { bloomFilterService } from '../resilience/bloomFilterService.js';
 import { financialWebhookService } from './financialWebhookService.js';
 import { refundService } from './refundService.js';
+import { couponPromotionService } from '../pricing/couponPromotionService.js';
 
 const DEFAULT_INTENT_EXPIRY_MINUTES = 15;
 
@@ -1160,6 +1161,7 @@ export class PaymentService {
         });
 
         await inventoryService.releaseStock(orderId, client);
+        await couponPromotionService.releaseForOrder(client, orderId);
 
         paymentLogger.increment('captures');
         paymentLogger.log('warn', 'LATE_PAYMENT_CAPTURED_ROUTED_TO_REFUND', {
@@ -1204,6 +1206,7 @@ export class PaymentService {
       }
 
       await inventoryService.commitStock(orderId, client);
+      await couponPromotionService.markRedeemedForOrder(client, orderId);
 
       const insReceipt = await client.query(
         `INSERT INTO payment_receipts (order_id, transaction_id, amount, status, signature)
@@ -1649,6 +1652,7 @@ export class PaymentService {
             });
 
             await inventoryService.releaseStock(order.id, client);
+            await couponPromotionService.releaseForOrder(client, order.id);
 
             await client.query(
               `UPDATE webhook_events
@@ -1695,6 +1699,7 @@ export class PaymentService {
           }
 
           await inventoryService.commitStock(order.id, client);
+          await couponPromotionService.markRedeemedForOrder(client, order.id);
 
           await client.query(
             `INSERT INTO payment_receipts (order_id, transaction_id, amount, status, signature)
@@ -1794,6 +1799,7 @@ export class PaymentService {
             });
 
             await inventoryService.releaseStock(order.id, client);
+            await couponPromotionService.releaseForOrder(client, order.id);
             await client.query(
               `UPDATE orders
                SET status = 'cancelled',
@@ -2149,6 +2155,7 @@ export class PaymentService {
           });
 
           await inventoryService.releaseStock(orderId, client);
+          await couponPromotionService.releaseForOrder(client, orderId);
 
           paymentLogger.increment('captures');
           return {
@@ -2168,6 +2175,7 @@ export class PaymentService {
         });
 
         await inventoryService.commitStock(orderId, client);
+        await couponPromotionService.markRedeemedForOrder(client, orderId);
 
         await client.query(
           `INSERT INTO payment_receipts (order_id, transaction_id, amount, status, signature)
@@ -2229,6 +2237,7 @@ export class PaymentService {
         }
 
         await inventoryService.releaseStock(orderId, client);
+        await couponPromotionService.releaseForOrder(client, orderId);
 
         await client.query(
           `UPDATE orders
@@ -2326,6 +2335,8 @@ export class PaymentService {
             });
           }
         } catch {}
+
+        await couponPromotionService.releaseForOrder(client, row.order_id);
 
         paymentEventPublisher.emit('PaymentExpired', {
           orderId: row.order_id,

@@ -8,7 +8,9 @@ import { refundService, PreparedRefundIntent, RefundRecord } from '../payments/r
 import { sellerSettlementService } from '../settlements/sellerSettlementService.js';
 import { outboxService } from '../outbox/outboxService.js';
 import { bloomFilterService } from '../resilience/bloomFilterService.js';
-import { toDecimal, roundCurrency, add, multiply } from '../pricing/money.js';
+import { toDecimal, roundCurrency, add, multiply, divide } from '../pricing/money.js';
+import { couponPromotionService } from '../pricing/couponPromotionService.js';
+import { invoiceService } from '../invoices/invoiceService.js';
 
 export interface RequestReturnItemInput {
   orderItemId: string;
@@ -92,9 +94,9 @@ export class ReturnService {
         throw new Error('UNAUTHORIZED_RETURN_REQUEST: Authenticated user does not own this order.');
       }
 
-      // Must be delivered
-      if (order.status !== 'delivered') {
-        throw new Error(`ORDER_NOT_DELIVERED: Returns can only be requested for 'delivered' orders. Current status: '${order.status}'.`);
+      // Must be delivered or partially_returned
+      if (order.status !== 'delivered' && order.status !== 'partially_returned') {
+        throw new Error(`ORDER_NOT_DELIVERED: Returns can only be requested for 'delivered' or 'partially_returned' orders. Current status: '${order.status}'.`);
       }
 
       // Check 48-hour return window
@@ -387,6 +389,17 @@ export class ReturnService {
         WHERE id = $1
       `, [ret.id]);
 
+      if (ret.pickup_trip_id) {
+        await client.query(`
+          UPDATE delivery_trips
+          SET status = 'RETURNED_TO_HUB',
+              updated_at = NOW()
+          WHERE id = $1
+            AND trip_type = 'REVERSE_PICKUP'
+            AND status NOT IN ('DELIVERED', 'RETURNED_TO_HUB', 'CANCELLED')
+        `, [ret.pickup_trip_id]);
+      }
+
       await outboxService.stageEvent(client, {
         eventType: 'ReturnReceivedAtStore',
         aggregateType: 'RETURN',
@@ -437,10 +450,16 @@ export class ReturnService {
 
       let totalPassedUnits = 0;
       let totalRefundAmountBn = new BigNumber(0);
+      const passedItemIds: { id: string; orderItemId: string; productId: string; qty: number; refundAmount: number }[] = [];
 
       for (const d of params.itemDecisions) {
         const itemRes = await client.query(`
-          SELECT ori.*, oi.unit_price, oi.taxable_amount, oi.cgst_amount, oi.sgst_amount, oi.igst_amount, oi.quantity as orig_qty
+          SELECT ori.*, oi.unit_price, oi.quantity as orig_qty,
+                 oi.taxable_amount, oi.cgst_amount, oi.sgst_amount, oi.igst_amount,
+                 COALESCE(oi.cess_amount, 0) AS cess_amount,
+                 oi.line_total_payable, oi.total_price,
+                 COALESCE(oi.refunded_quantity, 0) AS refunded_quantity,
+                 COALESCE(oi.refunded_amount, 0) AS refunded_amount
           FROM order_return_items ori
           JOIN order_items oi ON ori.order_item_id = oi.id
           WHERE ori.id = $1 AND ori.return_id = $2
@@ -452,8 +471,35 @@ export class ReturnService {
         const qty = parseInt(it.quantity, 10);
 
         if (d.qcPassed) {
+          const origQty = Math.max(1, parseInt(it.orig_qty, 10));
+          const alreadyRefundedQty = parseInt(it.refunded_quantity || '0', 10);
+          const alreadyRefundedAmtBn = toDecimal(it.refunded_amount || '0');
+          const linePayableBn =
+            it.line_total_payable !== null && it.line_total_payable !== undefined
+              ? toDecimal(it.line_total_payable)
+              : it.taxable_amount !== null && it.taxable_amount !== undefined
+                ? add(it.taxable_amount, it.cgst_amount || 0, it.sgst_amount || 0, it.igst_amount || 0, it.cess_amount || 0)
+                : toDecimal(it.total_price ?? multiply(it.unit_price, origQty));
+
+          const remainingQty = Math.max(0, origQty - alreadyRefundedQty);
+          if (qty > remainingQty) {
+            throw new Error(`RETURN_QUANTITY_EXCEEDED: Cannot refund ${qty} units when only ${remainingQty} remain.`);
+          }
+          const remainingAmtBn = BigNumber.max(0, linePayableBn.minus(alreadyRefundedAmtBn));
+          const itemRefundBn =
+            qty >= remainingQty
+              ? remainingAmtBn
+              : BigNumber.min(remainingAmtBn, toDecimal(roundCurrency(divide(multiply(linePayableBn, qty), origQty))));
+
           totalPassedUnits += qty;
-          totalRefundAmountBn = add(totalRefundAmountBn, multiply(it.unit_price, qty));
+          totalRefundAmountBn = add(totalRefundAmountBn, itemRefundBn);
+          passedItemIds.push({
+            id: it.id,
+            orderItemId: it.order_item_id,
+            productId: it.product_id,
+            qty,
+            refundAmount: Number(roundCurrency(itemRefundBn)),
+          });
 
           await inventoryService.restockItem(ret.merchant_id, it.product_id, qty, client);
 
@@ -487,27 +533,57 @@ export class ReturnService {
       let refundRecord: RefundRecord | undefined;
       let clawbackResult: any;
 
-      if (totalPassedUnits > 0 && totalRefundAmount > 0) {
-        const refRes = await refundService.createRefund({
-          orderId: ret.order_id,
-          amount: totalRefundAmount,
-          reasonCode: `RETURN_${ret.reason_code}`,
-          reasonDescription: params.qcNotes || 'Return QC inspection passed.',
-          clientOverride: client,
-        });
-        refundRecord = refRes.refund;
+      if (totalPassedUnits > 0) {
+        if (totalRefundAmount > 0) {
+          const refRes = await refundService.createRefund({
+            orderId: ret.order_id,
+            amount: totalRefundAmount,
+            reasonCode: `RETURN_${ret.reason_code}`,
+            reasonDescription: params.qcNotes || 'Return QC inspection passed.',
+            clientOverride: client,
+          });
+          refundRecord = refRes.refund;
 
-        if (refundRecord.status === 'FAILED') {
-          throw new Error(`RETURN_REFUND_FAILED: Payment gateway rejected refund for returned items (${refundRecord.refundNumber}).`);
+          if (refundRecord.status === 'FAILED') {
+            throw new Error(`RETURN_REFUND_FAILED: Payment gateway rejected refund for returned items (${refundRecord.refundNumber}).`);
+          }
+
+          clawbackResult = await sellerSettlementService.processSellerClawback({
+            orderId: ret.order_id,
+            merchantId: ret.merchant_id,
+            refundAmount: totalRefundAmount,
+            returnId: ret.id,
+            clientOverride: client,
+          });
         }
 
-        clawbackResult = await sellerSettlementService.processSellerClawback({
-          orderId: ret.order_id,
-          merchantId: ret.merchant_id,
-          refundAmount: totalRefundAmount,
-          returnId: ret.id,
-          clientOverride: client,
-        });
+        for (const pItem of passedItemIds) {
+          await client.query(`
+            UPDATE order_items
+            SET refunded_quantity = COALESCE(refunded_quantity, 0) + $1,
+                refunded_amount = COALESCE(refunded_amount, 0) + $2
+            WHERE id = $3
+          `, [pItem.qty, pItem.refundAmount, pItem.orderItemId]);
+        }
+
+        const allItemsRes = await client.query(`
+          SELECT quantity, COALESCE(refunded_quantity, 0) AS refunded_quantity,
+                 COALESCE(line_total_payable, taxable_amount + cgst_amount + sgst_amount + igst_amount + COALESCE(cess_amount, 0), total_price) AS payable
+          FROM order_items
+          WHERE order_id = $1
+          FOR UPDATE
+        `, [ret.order_id]);
+
+        const allFullyReturned =
+          allItemsRes.rows.length > 0 &&
+          allItemsRes.rows.every((r: any) => Number(r.refunded_quantity) >= Number(r.quantity));
+        const totalOrderPayableBn = allItemsRes.rows.reduce(
+          (s: BigNumber, r: any) => s.plus(toDecimal(r.payable || 0)),
+          new BigNumber(0)
+        );
+        const returnRatio = totalOrderPayableBn.gt(0)
+          ? Number(BigNumber.min(1, divide(totalRefundAmount, totalOrderPayableBn)))
+          : 1;
 
         await client.query(`
           UPDATE order_returns
@@ -516,13 +592,22 @@ export class ReturnService {
               qc_notes = $2,
               completed_at = NOW()
           WHERE id = $3
-        `, [refundRecord.id, params.qcNotes || null, ret.id]);
+        `, [refundRecord?.id || null, params.qcNotes || null, ret.id]);
 
         await client.query(`
           UPDATE orders
-          SET status = 'returned', updated_at = NOW()
+          SET status = $2, updated_at = NOW()
           WHERE id = $1
-        `, [ret.order_id]);
+        `, [ret.order_id, allFullyReturned ? 'returned' : 'partially_returned']);
+
+        await couponPromotionService.reverseForReturn(client, ret.order_id, returnRatio, allFullyReturned);
+        await invoiceService.issueCreditNoteForReturn({
+          orderId: ret.order_id,
+          returnId: ret.id,
+          refundId: refundRecord?.id || null,
+          reasonCode: `RETURN_${ret.reason_code}`,
+          clientOverride: client,
+        });
 
         await outboxService.stageEvent(client, {
           eventType: 'ReturnAccepted',
@@ -531,8 +616,9 @@ export class ReturnService {
           payload: {
             returnId: ret.id,
             orderId: ret.order_id,
-            refundId: refundRecord.id,
+            refundId: refundRecord?.id || null,
             refundAmount: totalRefundAmount,
+            allFullyReturned,
           },
         });
       } else {
@@ -576,7 +662,7 @@ export class ReturnService {
       totalRefundAmount: number;
       reasonCode: string;
       preparedRefund?: PreparedRefundIntent;
-      passedItemIds: { id: string; productId: string; qty: number }[];
+      passedItemIds: { id: string; orderItemId: string; productId: string; qty: number; refundAmount: number }[];
       failedItemIds: string[];
     }
 
@@ -598,12 +684,17 @@ export class ReturnService {
 
       let totalPassedUnits = 0;
       let totalRefundAmountBn = new BigNumber(0);
-      const passedItemIds: { id: string; productId: string; qty: number }[] = [];
+      const passedItemIds: { id: string; orderItemId: string; productId: string; qty: number; refundAmount: number }[] = [];
       const failedItemIds: string[] = [];
 
       for (const d of params.itemDecisions) {
         const itemRes = await client.query(`
-          SELECT ori.*, oi.unit_price
+          SELECT ori.*, oi.unit_price, oi.quantity as orig_qty,
+                 oi.taxable_amount, oi.cgst_amount, oi.sgst_amount, oi.igst_amount,
+                 COALESCE(oi.cess_amount, 0) AS cess_amount,
+                 oi.line_total_payable, oi.total_price,
+                 COALESCE(oi.refunded_quantity, 0) AS refunded_quantity,
+                 COALESCE(oi.refunded_amount, 0) AS refunded_amount
           FROM order_return_items ori
           JOIN order_items oi ON ori.order_item_id = oi.id
           WHERE ori.id = $1 AND ori.return_id = $2
@@ -615,9 +706,35 @@ export class ReturnService {
         const qty = parseInt(it.quantity, 10);
 
         if (d.qcPassed) {
+          const origQty = Math.max(1, parseInt(it.orig_qty, 10));
+          const alreadyRefundedQty = parseInt(it.refunded_quantity || '0', 10);
+          const alreadyRefundedAmtBn = toDecimal(it.refunded_amount || '0');
+          const linePayableBn =
+            it.line_total_payable !== null && it.line_total_payable !== undefined
+              ? toDecimal(it.line_total_payable)
+              : it.taxable_amount !== null && it.taxable_amount !== undefined
+                ? add(it.taxable_amount, it.cgst_amount || 0, it.sgst_amount || 0, it.igst_amount || 0, it.cess_amount || 0)
+                : toDecimal(it.total_price ?? multiply(it.unit_price, origQty));
+
+          const remainingQty = Math.max(0, origQty - alreadyRefundedQty);
+          if (qty > remainingQty) {
+            throw new Error(`RETURN_QUANTITY_EXCEEDED: Cannot refund ${qty} units when only ${remainingQty} remain.`);
+          }
+          const remainingAmtBn = BigNumber.max(0, linePayableBn.minus(alreadyRefundedAmtBn));
+          const itemRefundBn =
+            qty >= remainingQty
+              ? remainingAmtBn
+              : BigNumber.min(remainingAmtBn, toDecimal(roundCurrency(divide(multiply(linePayableBn, qty), origQty))));
+
           totalPassedUnits += qty;
-          totalRefundAmountBn = add(totalRefundAmountBn, multiply(toDecimal(it.unit_price), qty));
-          passedItemIds.push({ id: it.id, productId: it.product_id, qty });
+          totalRefundAmountBn = add(totalRefundAmountBn, itemRefundBn);
+          passedItemIds.push({
+            id: it.id,
+            orderItemId: it.order_item_id,
+            productId: it.product_id,
+            qty,
+            refundAmount: Number(roundCurrency(itemRefundBn)),
+          });
         } else {
           failedItemIds.push(it.id);
         }
@@ -625,7 +742,7 @@ export class ReturnService {
 
       const totalRefundAmount = Number(roundCurrency(totalRefundAmountBn));
 
-      if (totalPassedUnits <= 0 || totalRefundAmount <= 0) {
+      if (totalPassedUnits <= 0) {
         for (const fid of failedItemIds) {
           await client.query(
             `UPDATE order_return_items SET qc_status = 'FAILED', restocked = FALSE WHERE id = $1`,
@@ -654,15 +771,18 @@ export class ReturnService {
       }
 
       const reasonCode = `RETURN_${ret.reason_code}`;
-      const preparedRefund = await refundService.prepareRefundIntent(
-        {
-          orderId: ret.order_id,
-          amount: totalRefundAmount,
-          reasonCode,
-          reasonDescription: params.qcNotes || 'Return QC inspection passed.',
-        },
-        client
-      );
+      const preparedRefund =
+        totalRefundAmount > 0
+          ? await refundService.prepareRefundIntent(
+              {
+                orderId: ret.order_id,
+                amount: totalRefundAmount,
+                reasonCode,
+                reasonDescription: params.qcNotes || 'Return QC inspection passed.',
+              },
+              client
+            )
+          : undefined;
 
       return {
         ret,
@@ -679,20 +799,23 @@ export class ReturnService {
     }
 
     // Phase 2 (OUTSIDE any DB TX): call payment gateway and persist refund state
-    const refExec = await refundService.executePreparedRefund({
-      prepared: prep.preparedRefund!,
-      orderId: prep.ret.order_id,
-      reasonCode: prep.reasonCode,
-    });
-    const refundRecord = refExec.refund;
+    let refundRecord: RefundRecord | undefined;
+    if (prep.preparedRefund) {
+      const refExec = await refundService.executePreparedRefund({
+        prepared: prep.preparedRefund,
+        orderId: prep.ret.order_id,
+        reasonCode: prep.reasonCode,
+      });
+      refundRecord = refExec.refund;
 
-    if (refundRecord.status === 'FAILED') {
-      throw new Error(
-        `RETURN_REFUND_FAILED: Payment gateway rejected refund for returned items (${refundRecord.refundNumber}).`
-      );
+      if (refundRecord.status === 'FAILED') {
+        throw new Error(
+          `RETURN_REFUND_FAILED: Payment gateway rejected refund for returned items (${refundRecord.refundNumber}).`
+        );
+      }
     }
 
-    // Phase 3 (short TX): apply restocks, seller clawback, and transition order_returns/orders atomically
+    // Phase 3 (short TX): apply restocks, seller clawback, credit notes, promo reversals, and transition atomically
     return transaction(async (client) => {
       const lockRet = await client.query(
         `SELECT * FROM order_returns WHERE id = $1 AND merchant_id = $2 FOR UPDATE`,
@@ -712,6 +835,13 @@ export class ReturnService {
         await client.query(
           `UPDATE order_return_items SET qc_status = 'PASSED', restocked = TRUE WHERE id = $1`,
           [pItem.id]
+        );
+        await client.query(
+          `UPDATE order_items
+           SET refunded_quantity = COALESCE(refunded_quantity, 0) + $1,
+               refunded_amount = COALESCE(refunded_amount, 0) + $2
+           WHERE id = $3`,
+          [pItem.qty, pItem.refundAmount, pItem.orderItemId]
         );
         await outboxService.stageEvent(client, {
           eventType: 'InventoryRestocked',
@@ -733,13 +863,35 @@ export class ReturnService {
         );
       }
 
-      const clawbackResult = await sellerSettlementService.processSellerClawback({
-        orderId: curRet.order_id,
-        merchantId: curRet.merchant_id,
-        refundAmount: prep.totalRefundAmount,
-        returnId: curRet.id,
-        clientOverride: client,
-      });
+      const clawbackResult =
+        prep.totalRefundAmount > 0
+          ? await sellerSettlementService.processSellerClawback({
+              orderId: curRet.order_id,
+              merchantId: curRet.merchant_id,
+              refundAmount: prep.totalRefundAmount,
+              returnId: curRet.id,
+              clientOverride: client,
+            })
+          : undefined;
+
+      const allItemsRes = await client.query(`
+        SELECT quantity, COALESCE(refunded_quantity, 0) AS refunded_quantity,
+               COALESCE(line_total_payable, taxable_amount + cgst_amount + sgst_amount + igst_amount + COALESCE(cess_amount, 0), total_price) AS payable
+        FROM order_items
+        WHERE order_id = $1
+        FOR UPDATE
+      `, [curRet.order_id]);
+
+      const allFullyReturned =
+        allItemsRes.rows.length > 0 &&
+        allItemsRes.rows.every((r: any) => Number(r.refunded_quantity) >= Number(r.quantity));
+      const totalOrderPayableBn = allItemsRes.rows.reduce(
+        (s: BigNumber, r: any) => s.plus(toDecimal(r.payable || 0)),
+        new BigNumber(0)
+      );
+      const returnRatio = totalOrderPayableBn.gt(0)
+        ? Number(BigNumber.min(1, divide(prep.totalRefundAmount, totalOrderPayableBn)))
+        : 1;
 
       await client.query(
         `UPDATE order_returns
@@ -748,13 +900,22 @@ export class ReturnService {
              qc_notes = $2,
              completed_at = NOW()
          WHERE id = $3`,
-        [refundRecord.id, params.qcNotes || null, curRet.id]
+        [refundRecord?.id || null, params.qcNotes || null, curRet.id]
       );
 
       await client.query(
-        `UPDATE orders SET status = 'returned', updated_at = NOW() WHERE id = $1`,
-        [curRet.order_id]
+        `UPDATE orders SET status = $2, updated_at = NOW() WHERE id = $1`,
+        [curRet.order_id, allFullyReturned ? 'returned' : 'partially_returned']
       );
+
+      await couponPromotionService.reverseForReturn(client, curRet.order_id, returnRatio, allFullyReturned);
+      await invoiceService.issueCreditNoteForReturn({
+        orderId: curRet.order_id,
+        returnId: curRet.id,
+        refundId: refundRecord?.id || null,
+        reasonCode: prep.reasonCode,
+        clientOverride: client,
+      });
 
       await outboxService.stageEvent(client, {
         eventType: 'ReturnAccepted',
@@ -763,8 +924,9 @@ export class ReturnService {
         payload: {
           returnId: curRet.id,
           orderId: curRet.order_id,
-          refundId: refundRecord.id,
+          refundId: refundRecord?.id || null,
           refundAmount: prep.totalRefundAmount,
+          allFullyReturned,
         },
       });
 

@@ -34,6 +34,7 @@ export interface FulfillmentAllocationLedgerParams {
   storeDelayPenalty: number;
   gstTcsAmount: number;
   sellerTdsAmount: number;
+  platformDiscountSubsidy?: number;
   client?: pg.PoolClient;
 }
 
@@ -426,6 +427,7 @@ export class LedgerService {
     const storeDelayPenalty = assertNonNegativeMoney(params.storeDelayPenalty, 'storeDelayPenalty');
     const gstTcsAmount = assertNonNegativeMoney(params.gstTcsAmount, 'gstTcsAmount');
     const sellerTdsAmount = assertNonNegativeMoney(params.sellerTdsAmount, 'sellerTdsAmount');
+    const platformDiscountSubsidy = assertNonNegativeMoney(params.platformDiscountSubsidy || 0, 'platformDiscountSubsidy');
 
     const totalFeeGst = Number(roundCurrency(add(commissionGst, deliveryFeeGst, handlingFeeGst)));
     const totalPlatformCharges = Number(roundCurrency(add(customerHandlingFee, storeDelayPenalty)));
@@ -450,6 +452,18 @@ export class LedgerService {
       merchantId: params.merchantId,
       riderId: params.riderId,
     });
+
+    // 1B. Debit Platform Promotional Subsidy Expense (COA 5040) when platform funds item discounts
+    if (platformDiscountSubsidy > 0) {
+      entries.push({
+        account: '5040',
+        side: 'DEBIT',
+        amount: platformDiscountSubsidy,
+        narration: `Platform-funded coupon/promotion subsidy reimbursed to merchant for order ${params.orderId}`,
+        orderId: params.orderId,
+        merchantId: params.merchantId,
+      });
+    }
 
     // 2. Debit Rider Logistics Expense
     if (grossRiderFare > 0) {

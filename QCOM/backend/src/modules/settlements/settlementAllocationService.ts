@@ -67,6 +67,9 @@ export class SettlementAllocationService {
           riderTdsAmount: parseFloat(row.rider_tds_amount),
           netRiderPayable: parseFloat(row.net_rider_payable),
           platformSubsidy: parseFloat(row.platform_subsidy),
+          platformDiscountSubsidy: parseFloat(row.platform_discount_subsidy || '0'),
+          sellerDiscountAmount: parseFloat(row.seller_discount_amount || '0'),
+          cessAmount: parseFloat(row.cess_amount || '0'),
           status: row.status,
           allocatedAt: row.allocated_at.toISOString(),
         };
@@ -142,10 +145,18 @@ export class SettlementAllocationService {
       const commissionGstStr = roundCurrency(multiply(platformCommissionStr, divide(commGstRateBn, 100)));
       const commissionGst = Number(commissionGstStr);
 
+      // Dynamic inter-state check (zero hardcoded false)
+      const isInterState = Boolean(
+        snapshot.isInterState ??
+          (order.place_of_supply_state_code &&
+            merchant.state_code &&
+            order.place_of_supply_state_code !== merchant.state_code)
+      );
+
       // Resolve Section 52 GST-TCS (0.50% on Net Taxable Supplies)
       const gstTcs = await taxEngine.resolveGstTcs({
         netTaxableSupplies: roundCurrency(sellerGoodsTaxableBn),
-        isInterState: false,
+        isInterState,
         transactionDate: order.created_at,
         poolOverride: client,
       });
@@ -161,17 +172,37 @@ export class SettlementAllocationService {
       });
       const sellerTdsAmount = Number(roundCurrency(withholding.withholdingAmount || '0.00'));
 
+      // Extract item-level platform subsidy (FREE_DELIVERY waives QCOM delivery revenue, not seller goods)
+      let platformItemSubsidyBn = new BigNumber(0);
+      if (snapshot.appliedCoupon || Array.isArray(snapshot.appliedPromotions)) {
+        if (snapshot.appliedCoupon?.platformShareAmount) {
+          platformItemSubsidyBn = platformItemSubsidyBn.plus(toDecimal(snapshot.appliedCoupon.platformShareAmount));
+        }
+        if (Array.isArray(snapshot.appliedPromotions)) {
+          for (const promo of snapshot.appliedPromotions) {
+            if (promo?.discountTarget === 'ITEMS' && promo?.platformShareAmount) {
+              platformItemSubsidyBn = platformItemSubsidyBn.plus(toDecimal(promo.platformShareAmount));
+            }
+          }
+        }
+      } else {
+        platformItemSubsidyBn = toDecimal(order.platform_discount_subsidy || '0.00');
+      }
+      const platformDiscountSubsidy = Number(roundCurrency(platformItemSubsidyBn));
+      const sellerDiscountAmount = Number(roundCurrency(order.seller_discount_amount ?? snapshot.sellerDiscountAmount ?? '0.00'));
+      const cessAmount = Number(roundCurrency(order.cess_amount ?? snapshot.sellerGoodsBreakdown?.cessAmount ?? '0.00'));
+
       // Store preparation delay penalty (if store prep exceeded 5 mins SLA)
       let storeDelayPenalty = 0.00;
       if (merchant.base_prep_mins && merchant.base_prep_mins > 5) {
         storeDelayPenalty = Number(roundCurrency(multiply(merchant.base_prep_mins - 5, '1.20')));
       }
 
-      // Net Seller Payable calculation
+      // Net Seller Payable calculation (reimburses seller for item-level platform subsidies)
       const netSellerPayable = Number(
         roundCurrency(
           subtract(
-            grossGmv,
+            add(grossGmv, platformDiscountSubsidy),
             platformCommission,
             commissionGst,
             gstTcsAmount,
@@ -182,17 +213,23 @@ export class SettlementAllocationService {
       );
 
       // Customer fees
-      const customerDeliveryFee = Number(roundCurrency(snapshot.qcomFeesBreakdown?.deliveryTaxable ?? order.delivery_fee ?? '0.00'));
+      const snapshotCharges: any[] = Array.isArray(snapshot.charges) ? snapshot.charges : [];
+      const deliveryCharge = snapshotCharges.find((c) => c.chargeType === 'DELIVERY');
+      const handlingCharge = snapshotCharges.find((c) => c.chargeType === 'HANDLING');
+
+      const customerDeliveryFee = Number(roundCurrency(deliveryCharge?.taxableAmount ?? snapshot.qcomFeesBreakdown?.deliveryTaxable ?? order.delivery_fee ?? '0.00'));
       const deliveryFeeGst = Number(
         roundCurrency(
-          snapshot.qcomFeesBreakdown?.deliveryGst ??
+          deliveryCharge?.totalGstAmount ??
+            snapshot.qcomFeesBreakdown?.deliveryGst ??
             (toDecimal(customerDeliveryFee).gt(0) ? roundCurrency(multiply(customerDeliveryFee, '0.18')) : '0.00')
         )
       );
-      const customerHandlingFee = Number(roundCurrency(snapshot.qcomFeesBreakdown?.handlingTaxable ?? order.handling_fee ?? '0.00'));
+      const customerHandlingFee = Number(roundCurrency(handlingCharge?.taxableAmount ?? snapshot.qcomFeesBreakdown?.handlingTaxable ?? order.handling_fee ?? '0.00'));
       const handlingFeeGst = Number(
         roundCurrency(
-          snapshot.qcomFeesBreakdown?.handlingGst ??
+          handlingCharge?.totalGstAmount ??
+            snapshot.qcomFeesBreakdown?.handlingGst ??
             (toDecimal(customerHandlingFee).gt(0) ? roundCurrency(multiply(customerHandlingFee, '0.18')) : '0.00')
         )
       );
@@ -262,6 +299,7 @@ export class SettlementAllocationService {
         storeDelayPenalty,
         gstTcsAmount,
         sellerTdsAmount,
+        platformDiscountSubsidy,
         client,
       });
 
@@ -374,9 +412,10 @@ export class SettlementAllocationService {
           order_total, gross_gmv, seller_goods_taxable, seller_goods_gst,
           platform_commission, commission_gst, gst_tcs_amount, seller_tds_amount,
           store_delay_penalty, net_seller_payable, customer_delivery_fee, customer_handling_fee,
-          gross_rider_fare, customer_tip, rider_tds_amount, net_rider_payable, platform_subsidy, status
+          gross_rider_fare, customer_tip, rider_tds_amount, net_rider_payable, platform_subsidy,
+          platform_discount_subsidy, seller_discount_amount, cess_amount, status
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, 'ALLOCATED')
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, 'ALLOCATED')
         RETURNING *
       `, [
         orderId,
@@ -401,6 +440,9 @@ export class SettlementAllocationService {
         riderTdsAmount,
         netRiderPayable,
         platformSubsidy,
+        platformDiscountSubsidy,
+        sellerDiscountAmount,
+        cessAmount,
       ]);
 
       const a = insRes.rows[0];
@@ -459,6 +501,9 @@ export class SettlementAllocationService {
         riderTdsAmount: parseFloat(a.rider_tds_amount),
         netRiderPayable: parseFloat(a.net_rider_payable),
         platformSubsidy: parseFloat(a.platform_subsidy),
+        platformDiscountSubsidy: parseFloat(a.platform_discount_subsidy || '0'),
+        sellerDiscountAmount: parseFloat(a.seller_discount_amount || '0'),
+        cessAmount: parseFloat(a.cess_amount || '0'),
         status: a.status,
         allocatedAt: a.allocated_at.toISOString(),
       };

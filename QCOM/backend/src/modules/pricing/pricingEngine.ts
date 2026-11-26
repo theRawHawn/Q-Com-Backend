@@ -13,13 +13,14 @@ import {
   toDecimal,
   roundCurrency,
   multiply,
-  divide,
   add,
   subtract,
+  max,
   ROUNDING_POLICY,
   CURRENCY_CODE,
 } from './money.js';
 import { taxEngine, TaxEngineError } from './taxEngine.js';
+import { couponPromotionService, CouponPromotionError } from './couponPromotionService.js';
 
 export const PRICING_ENGINE_VERSION = '3.0.0';
 export const QUOTE_TTL_MINUTES = 15;
@@ -39,9 +40,6 @@ export class PricingEngineError extends Error {
 export class PricingEngine {
   readonly version = PRICING_ENGINE_VERSION;
 
-  /**
-   * Calculates distance in kilometers between two coordinates using Haversine formula
-   */
   private calculateDistanceKm(
     lat1: number,
     lon1: number,
@@ -49,7 +47,7 @@ export class PricingEngine {
     lon2: number
   ): number {
     const toRad = (deg: number) => (deg * Math.PI) / 180;
-    const R = 6371; // Earth radius in km
+    const R = 6371;
     const dLat = toRad(lat2 - lat1);
     const dLon = toRad(lon2 - lon1);
     const a =
@@ -60,9 +58,6 @@ export class PricingEngine {
     return Number((R * c).toFixed(2));
   }
 
-  /**
-   * Resolves the active delivery pricing rule for a given date
-   */
   async resolveDeliveryRule(
     transactionDate: Date = new Date(),
     poolOverride?: pg.Pool | pg.PoolClient
@@ -109,10 +104,6 @@ export class PricingEngine {
     };
   }
 
-  /**
-   * Main calculation entrypoint: Calculates authoritative pricing, taxes, charges,
-   * produces an immutable snapshot, and persists it to PostgreSQL.
-   */
   async calculate(
     input: PricingEngineInput,
     poolOverride?: pg.Pool | pg.PoolClient
@@ -147,9 +138,9 @@ export class PricingEngine {
       }
     }
 
-    // 2. Load Authoritative Merchant and Store Details
+    // 2. Load Authoritative Merchant and Validate Statutory State Codes
     const merchRes = await runner.query(
-      `SELECT m.id, m.merchant_code, m.name, m.business_name, m.state_code, 
+      `SELECT m.id, m.merchant_code, m.name, m.business_name, m.state_code,
               m.latitude, m.longitude, m.pan_status, m.constitution_type, m.status,
               m.service_radius_meters
          FROM merchants m
@@ -166,20 +157,37 @@ export class PricingEngine {
       throw new PricingEngineError('MERCHANT_NOT_ACTIVE', 'Merchant store is currently not active.', 422);
     }
 
-    const merchantStateCode = merchant.state_code || '29';
-    let placeOfSupplyStateCode = input.placeOfSupplyStateCode?.trim();
-    if (!placeOfSupplyStateCode && input.userId) {
-      const gstinRes = await runner.query(
-        `SELECT state_code FROM saved_gstins WHERE user_id = $1 ORDER BY is_default DESC LIMIT 1`,
-        [input.userId]
+    if (!merchant.state_code || String(merchant.state_code).trim() === '') {
+      throw new PricingEngineError(
+        'MISSING_MERCHANT_STATE_CODE',
+        `Merchant '${merchant.merchant_code || merchant.id}' does not have a valid GST state code configured.`,
+        422
       );
-      if (gstinRes.rows.length > 0 && gstinRes.rows[0].state_code) {
-        placeOfSupplyStateCode = gstinRes.rows[0].state_code;
+    }
+
+    let merchantStateInfo: { code: string; name: string };
+    let posResolution: { stateCode: string; stateName: string; source: string };
+    try {
+      merchantStateInfo = await taxEngine.validateStateCode(merchant.state_code, runner);
+      posResolution = await taxEngine.resolvePlaceOfSupply(
+        {
+          explicitStateCode: input.placeOfSupplyStateCode,
+          customerGstin: input.customerGstin,
+          deliveryAddressId: input.deliveryAddressId,
+          userId: input.userId,
+          merchantStateCode: merchantStateInfo.code,
+        },
+        runner
+      );
+    } catch (err) {
+      if (err instanceof TaxEngineError) {
+        throw new PricingEngineError(err.code, err.message, err.statusCode);
       }
+      throw err;
     }
-    if (!placeOfSupplyStateCode) {
-      placeOfSupplyStateCode = merchantStateCode;
-    }
+
+    const merchantStateCode = merchantStateInfo.code;
+    const placeOfSupplyStateCode = posResolution.stateCode;
     const isInterState = merchantStateCode !== placeOfSupplyStateCode;
 
     // Resolve Store
@@ -194,7 +202,7 @@ export class PricingEngine {
       }
     }
 
-    // 3. Load Authoritative Product Data & Inventory (ZERO TRUST: Never use client prices!)
+    // 3. Load Authoritative Product Data, Inventory, and Verified Tax Classification (ZERO TRUST)
     const productIds = input.items.map(i => i.productId);
     const prodRes = await runner.query(
       `SELECT p.id as product_id, p.sku, p.name, p.category, p.hsn_code, p.gst_rate_percent,
@@ -208,6 +216,9 @@ export class PricingEngine {
 
     const productMap = new Map<string, any>();
     prodRes.rows.forEach(r => productMap.set(r.product_id, r));
+
+    const sellerTaxMap = new Map<string, Awaited<ReturnType<typeof taxEngine.resolveSellerProductTax>>>();
+    let grossCatalogTotalBn = new BigNumber(0);
 
     for (const itm of input.items) {
       if (!productMap.has(itm.productId)) {
@@ -231,149 +242,28 @@ export class PricingEngine {
           422
         );
       }
-    }
 
-    // 4. Calculate Line Item Pricing & GST
-    const calculatedItems: PricingLineItem[] = [];
-    let grossSubtotalBn = new BigNumber(0);
-
-    for (const itm of input.items) {
-      const p = productMap.get(itm.productId);
-      const unitPriceBn = toDecimal(p.selling_price);
-      const grossAmtBn = multiply(unitPriceBn, itm.quantity);
-      grossSubtotalBn = grossSubtotalBn.plus(grossAmtBn);
-    }
-
-    // 4b. Dynamic Database-Backed Coupon Discount Calculation
-    let totalDiscountBn = new BigNumber(0);
-    let appliedCouponInfo: { code: string; discountAmount: string } | undefined;
-
-    if (input.couponCode && input.couponCode.trim() !== '') {
-      const cleanCouponCode = input.couponCode.trim().toUpperCase();
-      const couponRes = await runner.query(
-        `SELECT id, code, discount_type, discount_value, min_order_value_inr, max_discount_inr,
-                applicable_merchant_id, usage_limit, usage_count, valid_from, valid_to, is_active
-           FROM coupons
-          WHERE UPPER(code) = $1
-            AND is_active = TRUE
-            AND valid_from <= $2::timestamptz
-            AND (valid_to IS NULL OR valid_to >= $2::timestamptz)
-            AND (applicable_merchant_id IS NULL OR applicable_merchant_id = $3)
-          LIMIT 1`,
-        [cleanCouponCode, txnDate.toISOString(), input.merchantId]
-      );
-
-      if (couponRes.rows.length === 0) {
-        throw new PricingEngineError(
-          'INVALID_COUPON',
-          `Coupon code '${cleanCouponCode}' is invalid, expired, or does not apply to this merchant.`,
-          422
+      try {
+        const sellerTax = await taxEngine.resolveSellerProductTax(
+          itm.productId,
+          input.merchantId,
+          txnDate,
+          runner
         );
-      }
-
-      const coupon = couponRes.rows[0];
-      const minOrderVal = toDecimal(coupon.min_order_value_inr);
-      if (grossSubtotalBn.isLessThan(minOrderVal)) {
-        throw new PricingEngineError(
-          'COUPON_MIN_ORDER_NOT_MET',
-          `Coupon '${coupon.code}' requires a minimum order subtotal of ₹${minOrderVal.toFixed(2)}.`,
-          422
-        );
-      }
-
-      if (coupon.discount_type === 'FLAT_AMOUNT') {
-        const flatDiscount = toDecimal(coupon.discount_value);
-        totalDiscountBn = BigNumber.min(flatDiscount, grossSubtotalBn);
-      } else if (coupon.discount_type === 'PERCENTAGE') {
-        const percentVal = toDecimal(coupon.discount_value);
-        let calcDiscount = multiply(grossSubtotalBn, divide(percentVal, 100));
-        if (coupon.max_discount_inr) {
-          calcDiscount = BigNumber.min(calcDiscount, toDecimal(coupon.max_discount_inr));
+        sellerTaxMap.set(itm.productId, sellerTax);
+      } catch (err) {
+        if (err instanceof TaxEngineError) {
+          throw new PricingEngineError(err.code, err.message, err.statusCode);
         }
-        totalDiscountBn = calcDiscount;
+        throw err;
       }
 
-      appliedCouponInfo = {
-        code: coupon.code,
-        discountAmount: roundCurrency(totalDiscountBn),
-      };
+      grossCatalogTotalBn = grossCatalogTotalBn.plus(multiply(toDecimal(p.selling_price), itm.quantity));
     }
 
-    // Distribute discount proportionally across items
-    let remainingDiscountToDistribute = totalDiscountBn;
-
-    for (let idx = 0; idx < input.items.length; idx++) {
-      const itm = input.items[idx];
-      const p = productMap.get(itm.productId);
-      const unitPriceBn = toDecimal(p.selling_price);
-      const grossAmtBn = multiply(unitPriceBn, itm.quantity);
-
-      let itemDiscountBn = new BigNumber(0);
-      if (totalDiscountBn.isGreaterThan(0) && grossSubtotalBn.isGreaterThan(0)) {
-        if (idx === input.items.length - 1) {
-          // Last item absorbs any rounding remainder
-          itemDiscountBn = remainingDiscountToDistribute;
-        } else {
-          const ratio = divide(grossAmtBn, grossSubtotalBn);
-          itemDiscountBn = toDecimal(roundCurrency(multiply(totalDiscountBn, ratio)));
-          remainingDiscountToDistribute = remainingDiscountToDistribute.minus(itemDiscountBn);
-        }
-      }
-
-      const taxableAmtBn = subtract(grossAmtBn, itemDiscountBn);
-
-      // Resolve Authoritative Seller-Declared Product Tax (Bucket A: Seller's Goods GST)
-      const sellerTax = await taxEngine.resolveSellerProductTax(
-        itm.productId,
-        input.merchantId,
-        txnDate,
-        runner
-      );
-
-      // Calculate GST (Intra-state CGST+SGST vs Inter-state IGST)
-      const gstResult = taxEngine.calculateGst({
-        taxableAmount: taxableAmtBn,
-        taxRule: {
-          gst_rate_percent: sellerTax.gstRatePercent,
-          rule_code: sellerTax.ruleCode,
-          id: sellerTax.ruleId,
-        },
-        merchantStateCode,
-        placeOfSupplyStateCode: placeOfSupplyStateCode || merchantStateCode || '29',
-      });
-
-      const lineTotalBn = add(taxableAmtBn, gstResult.totalGstAmount);
-
-      calculatedItems.push({
-        productId: itm.productId,
-        productName: p.name,
-        sku: p.sku,
-        hsnCode: sellerTax.hsnCode,
-        quantity: itm.quantity,
-        unitPrice: roundCurrency(unitPriceBn),
-        grossAmount: roundCurrency(grossAmtBn),
-        discountAmount: roundCurrency(itemDiscountBn),
-        taxableAmount: roundCurrency(taxableAmtBn),
-        taxBucket: 'SELLER_GOODS',
-        taxRateSource: sellerTax.taxRateSource,
-        gstRatePercent: gstResult.gstRatePercent,
-        cgstRatePercent: gstResult.cgstRatePercent,
-        cgstAmount: gstResult.cgstAmount,
-        sgstRatePercent: gstResult.sgstRatePercent,
-        sgstAmount: gstResult.sgstAmount,
-        igstRatePercent: gstResult.igstRatePercent,
-        igstAmount: gstResult.igstAmount,
-        totalGstAmount: gstResult.totalGstAmount,
-        lineTotal: roundCurrency(lineTotalBn),
-        taxRuleId: sellerTax.ruleId,
-        taxRuleCode: sellerTax.ruleCode,
-      });
-    }
-
-    // 5. Calculate Logistics, Handling & Platform Charges
+    // 4. Resolve Logistics & Distance BEFORE evaluating FREE_DELIVERY promotions
     const deliveryRule = await this.resolveDeliveryRule(txnDate, runner);
 
-    // Determine Distance dynamically from real-life coordinates or explicit inputs
     let distanceKm: number;
     if (input.distanceKm !== undefined) {
       distanceKm = Number(toDecimal(input.distanceKm).toFixed(2));
@@ -385,16 +275,21 @@ export class PricingEngine {
         input.customerLocation.longitude
       );
     } else if (input.userId && merchant.latitude && merchant.longitude) {
-      const addrRes = await runner.query(
-        `SELECT latitude, longitude FROM saved_addresses WHERE user_id = $1 AND latitude IS NOT NULL AND longitude IS NOT NULL ORDER BY created_at DESC LIMIT 1`,
-        [input.userId]
-      );
-      if (addrRes.rows.length > 0 && addrRes.rows[0].latitude && addrRes.rows[0].longitude) {
+      const addrQuery = input.deliveryAddressId
+        ? await runner.query(
+            `SELECT latitude, longitude FROM saved_addresses WHERE id = $1 AND user_id = $2 AND latitude IS NOT NULL AND longitude IS NOT NULL LIMIT 1`,
+            [input.deliveryAddressId, input.userId]
+          )
+        : await runner.query(
+            `SELECT latitude, longitude FROM saved_addresses WHERE user_id = $1 AND latitude IS NOT NULL AND longitude IS NOT NULL ORDER BY created_at DESC LIMIT 1`,
+            [input.userId]
+          );
+      if (addrQuery.rows.length > 0 && addrQuery.rows[0].latitude && addrQuery.rows[0].longitude) {
         distanceKm = this.calculateDistanceKm(
           Number(merchant.latitude),
           Number(merchant.longitude),
-          Number(addrRes.rows[0].latitude),
-          Number(addrRes.rows[0].longitude)
+          Number(addrQuery.rows[0].latitude),
+          Number(addrQuery.rows[0].longitude)
         );
       } else {
         distanceKm = toDecimal(deliveryRule.base_distance_km).toNumber();
@@ -403,48 +298,202 @@ export class PricingEngine {
       distanceKm = toDecimal(deliveryRule.base_distance_km).toNumber();
     }
 
-    // Calculate Base Delivery Fee & Excess Distance Slabs
     const baseDist = toDecimal(deliveryRule.base_distance_km);
     const baseFee = toDecimal(deliveryRule.base_fee_inr);
     const perKmFee = toDecimal(deliveryRule.per_km_fee_inr);
 
-    let deliveryTaxableBn = baseFee;
+    let rawDeliveryTaxableBn = baseFee;
     if (distanceKm > baseDist.toNumber()) {
       const excessDistRaw = distanceKm - baseDist.toNumber();
-      // Round excess distance to nearest 0.1 km (100 meters)
       const excessDistRounded = Math.ceil(excessDistRaw * 10) / 10;
-      const extraFare = multiply(excessDistRounded, perKmFee);
-      deliveryTaxableBn = add(deliveryTaxableBn, extraFare);
+      rawDeliveryTaxableBn = add(rawDeliveryTaxableBn, multiply(excessDistRounded, perKmFee));
     }
 
-    // Free delivery threshold check
     if (deliveryRule.free_delivery_threshold_inr) {
       const threshold = toDecimal(deliveryRule.free_delivery_threshold_inr);
-      if (grossSubtotalBn.isGreaterThanOrEqualTo(threshold)) {
-        deliveryTaxableBn = new BigNumber(0);
+      if (grossCatalogTotalBn.isGreaterThanOrEqualTo(threshold)) {
+        rawDeliveryTaxableBn = new BigNumber(0);
       }
     }
 
-    // Resolve Delivery GST dynamically from statutory_tax_rules table
-    const deliveryTaxRule = await taxEngine.resolveServiceTaxRule(
-      'DELIVERY_GST',
-      txnDate,
-      runner
-    );
+    // 5. Evaluate Automatic Promotions & Explicit Coupons with Eligibility, Stackability, and Conflict Control
+    let discountEval: Awaited<ReturnType<typeof couponPromotionService.evaluateQuoteDiscounts>>;
+    try {
+      discountEval = await couponPromotionService.evaluateQuoteDiscounts(
+        {
+          merchantId: input.merchantId,
+          userId: input.userId,
+          items: input.items.map((itm) => {
+            const p = productMap.get(itm.productId);
+            return {
+              productId: itm.productId,
+              category: p.category || '',
+              quantity: itm.quantity,
+              unitPrice: p.selling_price,
+            };
+          }),
+          deliveryFeeTaxable: rawDeliveryTaxableBn,
+          couponCode: input.couponCode,
+          transactionDate: txnDate,
+          isFirstOrderOverride: input.isFirstOrderOverride,
+        },
+        runner
+      );
+    } catch (err) {
+      if (err instanceof CouponPromotionError) {
+        throw new PricingEngineError(err.code, err.message, err.statusCode);
+      }
+      throw err;
+    }
 
+    // 6. Compute Line Item GST & Cess (Post-Discount, supporting Tax-Inclusive & Tax-Exclusive + All Tax Categories)
+    const calculatedItems: PricingLineItem[] = [];
+    let preDiscountTaxableSubtotalBn = new BigNumber(0);
+    let totalItemDiscountTaxableBn = new BigNumber(0);
+
+    for (let idx = 0; idx < input.items.length; idx++) {
+      const itm = input.items[idx];
+      const p = productMap.get(itm.productId);
+      const cand = discountEval.items[idx];
+      const sellerTax = sellerTaxMap.get(itm.productId)!;
+
+      const unitPriceBn = toDecimal(p.selling_price);
+      const grossCatalogLineBn = cand.grossLine;
+      const netCatalogLineBn = cand.remainingLine;
+      const inclusiveDiscBn = subtract(grossCatalogLineBn, netCatalogLineBn);
+
+      if (sellerTax.taxInclusive) {
+        const preDiscExtract = taxEngine.extractInclusiveBaseAndTaxes({
+          inclusiveGross: grossCatalogLineBn,
+          gstRatePercent: sellerTax.gstRatePercent,
+          cessRatePercent: sellerTax.cessRatePercent,
+          taxCategory: sellerTax.taxCategory,
+          merchantStateCode,
+          placeOfSupplyStateCode,
+        });
+
+        const postDiscExtract = taxEngine.extractInclusiveBaseAndTaxes({
+          inclusiveGross: netCatalogLineBn,
+          gstRatePercent: sellerTax.gstRatePercent,
+          cessRatePercent: sellerTax.cessRatePercent,
+          taxCategory: sellerTax.taxCategory,
+          merchantStateCode,
+          placeOfSupplyStateCode,
+        });
+
+        const preTaxDiscountBn = max(subtract(preDiscExtract.taxableAmount, postDiscExtract.taxableAmount), 0);
+
+        preDiscountTaxableSubtotalBn = add(preDiscountTaxableSubtotalBn, preDiscExtract.taxableAmount);
+        totalItemDiscountTaxableBn = add(totalItemDiscountTaxableBn, preTaxDiscountBn);
+
+        calculatedItems.push({
+          productId: itm.productId,
+          productName: p.name,
+          sku: p.sku,
+          category: p.category,
+          hsnCode: sellerTax.hsnCode,
+          quantity: itm.quantity,
+          unitPrice: roundCurrency(unitPriceBn),
+          grossAmount: preDiscExtract.taxableAmount,
+          inclusiveGrossAmount: roundCurrency(grossCatalogLineBn),
+          discountAmount: roundCurrency(preTaxDiscountBn),
+          inclusiveDiscountAmount: roundCurrency(inclusiveDiscBn),
+          taxableAmount: postDiscExtract.taxableAmount,
+          taxCategory: sellerTax.taxCategory,
+          taxInclusive: true,
+          taxBucket: 'SELLER_GOODS',
+          taxRateSource: sellerTax.taxRateSource,
+          gstRatePercent: postDiscExtract.gstRatePercent,
+          cgstRatePercent: postDiscExtract.cgstRatePercent,
+          cgstAmount: postDiscExtract.cgstAmount,
+          sgstRatePercent: postDiscExtract.sgstRatePercent,
+          sgstAmount: postDiscExtract.sgstAmount,
+          igstRatePercent: postDiscExtract.igstRatePercent,
+          igstAmount: postDiscExtract.igstAmount,
+          cessRatePercent: postDiscExtract.cessRatePercent,
+          cessAmount: postDiscExtract.cessAmount,
+          totalGstAmount: postDiscExtract.totalGstAmount,
+          totalTaxAmount: postDiscExtract.totalTaxWithCessAmount,
+          lineTotal: postDiscExtract.inclusiveTotal,
+          taxRuleId: sellerTax.ruleId,
+          taxRuleCode: sellerTax.ruleCode,
+          appliedDiscounts: cand.appliedDiscounts,
+        });
+      } else {
+        const taxableAmtBn = netCatalogLineBn;
+        const gstResult = taxEngine.calculateGst({
+          taxableAmount: taxableAmtBn,
+          taxRule: {
+            gst_rate_percent: sellerTax.gstRatePercent,
+            rule_code: sellerTax.ruleCode,
+            id: sellerTax.ruleId,
+          },
+          cessRatePercent: sellerTax.cessRatePercent,
+          taxCategory: sellerTax.taxCategory,
+          merchantStateCode,
+          placeOfSupplyStateCode,
+        });
+
+        const lineTotalBn = add(taxableAmtBn, gstResult.totalTaxWithCessAmount);
+
+        preDiscountTaxableSubtotalBn = add(preDiscountTaxableSubtotalBn, grossCatalogLineBn);
+        totalItemDiscountTaxableBn = add(totalItemDiscountTaxableBn, inclusiveDiscBn);
+
+        calculatedItems.push({
+          productId: itm.productId,
+          productName: p.name,
+          sku: p.sku,
+          category: p.category,
+          hsnCode: sellerTax.hsnCode,
+          quantity: itm.quantity,
+          unitPrice: roundCurrency(unitPriceBn),
+          grossAmount: roundCurrency(grossCatalogLineBn),
+          inclusiveGrossAmount: roundCurrency(grossCatalogLineBn),
+          discountAmount: roundCurrency(inclusiveDiscBn),
+          inclusiveDiscountAmount: roundCurrency(inclusiveDiscBn),
+          taxableAmount: roundCurrency(taxableAmtBn),
+          taxCategory: sellerTax.taxCategory,
+          taxInclusive: false,
+          taxBucket: 'SELLER_GOODS',
+          taxRateSource: sellerTax.taxRateSource,
+          gstRatePercent: gstResult.gstRatePercent,
+          cgstRatePercent: gstResult.cgstRatePercent,
+          cgstAmount: gstResult.cgstAmount,
+          sgstRatePercent: gstResult.sgstRatePercent,
+          sgstAmount: gstResult.sgstAmount,
+          igstRatePercent: gstResult.igstRatePercent,
+          igstAmount: gstResult.igstAmount,
+          cessRatePercent: gstResult.cessRatePercent,
+          cessAmount: gstResult.cessAmount,
+          totalGstAmount: gstResult.totalGstAmount,
+          totalTaxAmount: gstResult.totalTaxWithCessAmount,
+          lineTotal: roundCurrency(lineTotalBn),
+          taxRuleId: sellerTax.ruleId,
+          taxRuleCode: sellerTax.ruleCode,
+          appliedDiscounts: cand.appliedDiscounts,
+        });
+      }
+    }
+
+    // 7. Compute Final Service Charges (Delivery post FREE_DELIVERY promo + Handling + Platform)
+    const deliveryDiscountBn = toDecimal(discountEval.deliveryDiscountAmount);
+    const deliveryTaxableBn = max(subtract(rawDeliveryTaxableBn, deliveryDiscountBn), 0);
+
+    const deliveryTaxRule = await taxEngine.resolveServiceTaxRule('DELIVERY_GST', txnDate, runner);
     const deliveryGst = taxEngine.calculateGst({
       taxableAmount: deliveryTaxableBn,
       taxRule: deliveryTaxRule,
       merchantStateCode,
-      placeOfSupplyStateCode: placeOfSupplyStateCode || merchantStateCode || '29',
+      placeOfSupplyStateCode,
     });
-
     const deliveryTotalBn = add(deliveryTaxableBn, deliveryGst.totalGstAmount);
 
     const calculatedCharges: PricingCharge[] = [
       {
         chargeType: 'DELIVERY',
         description: `Express Delivery Fee (${distanceKm.toFixed(1)} km)`,
+        grossTaxableAmount: roundCurrency(rawDeliveryTaxableBn),
+        discountAmount: roundCurrency(deliveryDiscountBn),
         taxableAmount: roundCurrency(deliveryTaxableBn),
         taxBucket: 'QCOM_SERVICE_FEES',
         taxRateSource: 'QCOM_STATUTORY_RULE',
@@ -459,22 +508,15 @@ export class PricingEngine {
       },
     ];
 
-    // Handling Charge dynamically from statutory_tax_rules table
     const handlingTaxableBn = toDecimal(deliveryRule.handling_fee_inr);
     if (handlingTaxableBn.isGreaterThan(0)) {
-      const handlingTaxRule = await taxEngine.resolveServiceTaxRule(
-        'HANDLING_GST',
-        txnDate,
-        runner
-      );
-
+      const handlingTaxRule = await taxEngine.resolveServiceTaxRule('HANDLING_GST', txnDate, runner);
       const handlingGst = taxEngine.calculateGst({
         taxableAmount: handlingTaxableBn,
         taxRule: handlingTaxRule,
         merchantStateCode,
-        placeOfSupplyStateCode: placeOfSupplyStateCode || merchantStateCode || '29',
+        placeOfSupplyStateCode,
       });
-
       const handlingTotalBn = add(handlingTaxableBn, handlingGst.totalGstAmount);
 
       calculatedCharges.push({
@@ -494,23 +536,24 @@ export class PricingEngine {
       });
     }
 
-    // 6. Aggregate Totals — STRICT SEPARATION OF 3 TAX BUCKETS
-    // Bucket A: Seller's Goods GST
+    // 8. Aggregate Totals — STRICT SEPARATION OF 3 TAX BUCKETS
     let totalItemsTaxableBn = new BigNumber(0);
     let sellerCgstBn = new BigNumber(0);
     let sellerSgstBn = new BigNumber(0);
     let sellerIgstBn = new BigNumber(0);
+    let sellerCessBn = new BigNumber(0);
 
     for (const itm of calculatedItems) {
       totalItemsTaxableBn = totalItemsTaxableBn.plus(toDecimal(itm.taxableAmount));
       sellerCgstBn = sellerCgstBn.plus(toDecimal(itm.cgstAmount));
       sellerSgstBn = sellerSgstBn.plus(toDecimal(itm.sgstAmount));
       sellerIgstBn = sellerIgstBn.plus(toDecimal(itm.igstAmount));
+      sellerCessBn = sellerCessBn.plus(toDecimal(itm.cessAmount));
     }
     const sellerGstBn = add(sellerCgstBn, sellerSgstBn, sellerIgstBn);
-    const totalSellerPayableBn = add(totalItemsTaxableBn, sellerGstBn);
+    const sellerTotalTaxWithCessBn = add(sellerGstBn, sellerCessBn);
+    const totalSellerPayableBn = add(totalItemsTaxableBn, sellerTotalTaxWithCessBn);
 
-    // Bucket B: QCOM's Own Service Charges GST
     let qcomCgstBn = new BigNumber(0);
     let qcomSgstBn = new BigNumber(0);
     let qcomIgstBn = new BigNumber(0);
@@ -524,14 +567,14 @@ export class PricingEngine {
     }
     const qcomGstBn = add(qcomCgstBn, qcomSgstBn, qcomIgstBn);
 
-    // Combined Platform Aggregates for Invoicing & Payment
     const totalCgstBn = add(sellerCgstBn, qcomCgstBn);
     const totalSgstBn = add(sellerSgstBn, qcomSgstBn);
     const totalIgstBn = add(sellerIgstBn, qcomIgstBn);
-    const totalTaxBn = add(totalCgstBn, totalSgstBn, totalIgstBn);
+    const totalCessBn = sellerCessBn;
+    const totalTaxBn = add(totalCgstBn, totalSgstBn, totalIgstBn, totalCessBn);
     const grandTotalBn = add(totalSellerPayableBn, totalChargesAmountBn);
 
-    // 7. Bucket C: Statutory Collections (GST-TCS Section 52 & Direct-Tax TDS Section 393)
+    // 9. Bucket C: Statutory Collections
     const gstTcs = await taxEngine.resolveGstTcs({
       netTaxableSupplies: totalItemsTaxableBn,
       isInterState,
@@ -547,7 +590,6 @@ export class PricingEngine {
       poolOverride: runner,
     });
 
-    // 8. Generate Quote Snapshot and Expiration
     const quoteId = uuidv4();
     const expiresAt = new Date(Date.now() + QUOTE_TTL_MINUTES * 60 * 1000);
 
@@ -559,31 +601,39 @@ export class PricingEngine {
       currency: CURRENCY_CODE,
       merchantId: input.merchantId,
       storeId,
-      placeOfSupplyStateCode: placeOfSupplyStateCode || merchantStateCode || '29',
+      placeOfSupplyStateCode,
+      placeOfSupplyStateName: posResolution.stateName,
+      placeOfSupplySource: posResolution.source,
       merchantStateCode,
+      merchantStateName: merchantStateInfo.name,
       isInterState,
       items: calculatedItems,
       charges: calculatedCharges,
-      itemsSubtotal: roundCurrency(grossSubtotalBn),
-      discountAmount: roundCurrency(totalDiscountBn),
+      itemsSubtotal: roundCurrency(preDiscountTaxableSubtotalBn),
+      discountAmount: roundCurrency(totalItemDiscountTaxableBn),
+      deliveryDiscountAmount: discountEval.deliveryDiscountAmount,
+      platformDiscountSubsidy: discountEval.platformDiscountSubsidy,
+      sellerDiscountAmount: discountEval.sellerDiscountAmount,
       taxableAmount: roundCurrency(totalItemsTaxableBn),
       totalCgst: roundCurrency(totalCgstBn),
       totalSgst: roundCurrency(totalSgstBn),
       totalIgst: roundCurrency(totalIgstBn),
+      totalCess: roundCurrency(totalCessBn),
       totalTax: roundCurrency(totalTaxBn),
       totalCharges: roundCurrency(totalChargesAmountBn),
       grandTotal: roundCurrency(grandTotalBn),
 
-      // Explicit 3-Bucket Architecture
       sellerGoodsBreakdown: {
         taxBucket: 'SELLER_GOODS',
-        itemsSubtotal: roundCurrency(grossSubtotalBn),
-        discountAmount: roundCurrency(totalDiscountBn),
+        itemsSubtotal: roundCurrency(preDiscountTaxableSubtotalBn),
+        discountAmount: roundCurrency(totalItemDiscountTaxableBn),
         taxableAmount: roundCurrency(totalItemsTaxableBn),
         cgstAmount: roundCurrency(sellerCgstBn),
         sgstAmount: roundCurrency(sellerSgstBn),
         igstAmount: roundCurrency(sellerIgstBn),
+        cessAmount: roundCurrency(sellerCessBn),
         totalGst: roundCurrency(sellerGstBn),
+        totalTaxWithCess: roundCurrency(sellerTotalTaxWithCessBn),
         totalSellerPayable: roundCurrency(totalSellerPayableBn),
       },
       qcomFeesBreakdown: {
@@ -607,10 +657,10 @@ export class PricingEngine {
       withholding,
       roundingPolicy: ROUNDING_POLICY,
       expiresAt: expiresAt.toISOString(),
-      appliedCoupon: appliedCouponInfo,
+      appliedPromotions: discountEval.appliedPromotions,
+      appliedCoupon: discountEval.appliedCoupon,
     };
 
-    // 10. Persist Immutable Calculation Snapshot to PostgreSQL
     const deliveryCharge = calculatedCharges.find(c => c.chargeType === 'DELIVERY');
     const handlingCharge = calculatedCharges.find(c => c.chargeType === 'HANDLING');
     const platformCharge = calculatedCharges.find(c => c.chargeType === 'PLATFORM');
@@ -653,17 +703,14 @@ export class PricingEngine {
     return quote;
   }
 
-  /**
-   * Retrieves an immutable calculation snapshot by its quote ID from PostgreSQL
-   */
   async getQuoteById(
     quoteId: string,
     poolOverride?: pg.Pool | pg.PoolClient
   ): Promise<PricingQuote | null> {
     const runner = poolOverride || getPool();
     const res = await runner.query(
-      `SELECT snapshot_data, expires_at, is_converted_to_order 
-         FROM pricing_calculation_snapshots 
+      `SELECT snapshot_data, expires_at, is_converted_to_order
+         FROM pricing_calculation_snapshots
         WHERE id = $1`,
       [quoteId]
     );
@@ -673,11 +720,9 @@ export class PricingEngine {
     }
 
     const row = res.rows[0];
-    const data = typeof row.snapshot_data === 'string'
+    return typeof row.snapshot_data === 'string'
       ? JSON.parse(row.snapshot_data)
       : row.snapshot_data;
-
-    return data;
   }
 }
 

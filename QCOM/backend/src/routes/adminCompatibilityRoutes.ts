@@ -9,6 +9,7 @@ import { realtimeGateway } from '../modules/realtime/websocketServer.js';
 import { toDecimal, roundCurrency, add } from '../modules/pricing/money.js';
 import { isCodPaymentMethod } from '../modules/ledger/ledgerService.js';
 import { codCashAccountabilityService } from '../modules/settlements/codCashAccountabilityService.js';
+import { couponPromotionService, CouponPromotionError } from '../modules/pricing/couponPromotionService.js';
 
 export const adminCompatibilityRouter = Router();
 
@@ -1053,31 +1054,107 @@ adminCompatibilityRouter.post('/support/tickets/:id/update', authenticate, requi
 });
 
 // ---------------------------------------------------------------------------
-// Promotions & Dynamic Coupons
+// Promotions & Dynamic Coupons (Audit-Logged Governance)
 // ---------------------------------------------------------------------------
 
 adminCompatibilityRouter.get('/promotions', authenticate, requireRole(PROMO_ROLES), async (_req: Request, res: Response): Promise<void> => {
-  const pool = getPool();
   try {
-    const promoRes = await pool.query('SELECT * FROM coupons ORDER BY created_at DESC');
-    res.status(200).json({ success: true, promotions: promoRes.rows });
+    const [promotions, coupons] = await Promise.all([
+      couponPromotionService.listPromotions(),
+      couponPromotionService.listCoupons(),
+    ]);
+    res.status(200).json({ success: true, promotions, coupons });
   } catch (err: any) {
     res.status(500).json({ success: false, error: 'PROMOTIONS_FETCH_FAILED', message: safeErrorMessage(err, 'Failed to query promotions.') });
   }
 });
 
+adminCompatibilityRouter.post('/promotions', authenticate, requireRole(PROMO_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const promotion = await couponPromotionService.createPromotion({
+      ...req.body,
+      actorId: req.auth!.userId,
+    });
+    res.status(201).json({ success: true, message: 'Promotion created successfully', promotion });
+  } catch (err: any) {
+    const status = err instanceof CouponPromotionError ? err.statusCode : 500;
+    res.status(status).json({ success: false, error: err.code || 'PROMOTION_CREATE_FAILED', message: safeErrorMessage(err, 'Failed to create promotion.') });
+  }
+});
+
 adminCompatibilityRouter.post('/promotions/create', authenticate, requireRole(PROMO_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
-  const { code, title, discountType, discountValue, minOrderValue, maxDiscount } = req.body;
+  try {
+    if (req.body.promotionType) {
+      const promotion = await couponPromotionService.createPromotion({
+        ...req.body,
+        actorId: req.auth!.userId,
+      });
+      res.status(201).json({ success: true, message: 'Promotion created successfully', promotion });
+      return;
+    }
+
+    const { code, title, discountType, discountValue, minOrderValue, minOrderValueInr, maxDiscount, maxDiscountInr, fundingSource, sellerSharePercent, usageLimit, perUserLimit, firstOrderOnly, applicableCategories, applicableProductIds, applicableMerchantId, isStackable } = req.body;
+    const normalizedType = String(discountType || 'FLAT_AMOUNT').toUpperCase() === 'FLAT' ? 'FLAT_AMOUNT' : String(discountType || 'FLAT_AMOUNT').toUpperCase();
+    const coupon = await couponPromotionService.createCoupon({
+      code: code || `PROMO_${Date.now()}`,
+      title: title || 'Special Discount',
+      discountType: normalizedType as any,
+      discountValue: Number(discountValue ?? 50),
+      minOrderValueInr: Number(minOrderValueInr ?? minOrderValue ?? 0),
+      maxDiscountInr: maxDiscountInr ?? maxDiscount ?? null,
+      applicableMerchantId,
+      usageLimit,
+      perUserLimit,
+      firstOrderOnly,
+      applicableCategories,
+      applicableProductIds,
+      isStackable,
+      fundingSource,
+      sellerSharePercent,
+      actorId: req.auth!.userId,
+    });
+    res.status(201).json({ success: true, message: 'Coupon promotion created successfully', promotion: coupon, coupon });
+  } catch (err: any) {
+    const status = err instanceof CouponPromotionError ? err.statusCode : 500;
+    res.status(status).json({ success: false, error: err.code || 'PROMOTION_CREATE_FAILED', message: safeErrorMessage(err, 'Failed to create promotion.') });
+  }
+});
+
+adminCompatibilityRouter.patch('/promotions/:id', authenticate, requireRole(PROMO_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  const { id } = req.params;
+  const { isActive, priority, usageLimit, validTo } = req.body;
   const pool = getPool();
   try {
-    const ins = await pool.query(`
-      INSERT INTO coupons (code, title, discount_type, discount_value, min_order_value, max_discount, is_active, start_date, end_date)
-      VALUES ($1, $2, $3, $4, $5, $6, true, NOW(), NOW() + INTERVAL '30 days')
-      RETURNING id, code
-    `, [code || `PROMO_${Date.now()}`, title || 'Special Discount', discountType || 'FLAT', discountValue || 50, minOrderValue || 500, maxDiscount || 100]);
-    res.status(200).json({ success: true, message: 'Promotion created successfully', promotion: ins.rows[0] });
+    const prevRes = await pool.query(`SELECT * FROM promotions WHERE id = $1`, [id]);
+    if (prevRes.rows.length === 0) {
+      res.status(404).json({ success: false, error: 'PROMOTION_NOT_FOUND', message: 'Promotion not found.' });
+      return;
+    }
+    const updRes = await pool.query(
+      `UPDATE promotions
+          SET is_active = COALESCE($1, is_active),
+              priority = COALESCE($2, priority),
+              usage_limit = CASE WHEN $3::boolean THEN $4::int ELSE usage_limit END,
+              valid_to = CASE WHEN $5::boolean THEN $6::timestamptz ELSE valid_to END,
+              updated_at = NOW()
+        WHERE id = $7
+        RETURNING *`,
+      [isActive ?? null, priority ?? null, usageLimit !== undefined, usageLimit ?? null, validTo !== undefined, validTo ?? null, id]
+    );
+    await recordAuditEvent({
+      actorId: req.auth!.userId,
+      actorType: 'ADMIN',
+      action: 'PROMOTION_UPDATED',
+      entityType: 'PROMOTION',
+      entityId: id,
+      oldState: prevRes.rows[0],
+      newState: updRes.rows[0],
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'] as string | undefined,
+    });
+    res.status(200).json({ success: true, promotion: updRes.rows[0] });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: 'PROMOTION_CREATE_FAILED', message: safeErrorMessage(err, 'Failed to create promotion.') });
+    res.status(500).json({ success: false, error: 'PROMOTION_UPDATE_FAILED', message: safeErrorMessage(err, 'Failed to update promotion.') });
   }
 });
 
@@ -1085,10 +1162,63 @@ adminCompatibilityRouter.delete('/promotions/:id', authenticate, requireRole(PRO
   const { id } = req.params;
   const pool = getPool();
   try {
-    await pool.query('UPDATE coupons SET is_active = false WHERE id = $1', [id]);
+    const promoUpd = await pool.query('UPDATE promotions SET is_active = false, updated_at = NOW() WHERE id = $1 RETURNING id', [id]);
+    if (promoUpd.rowCount === 0) {
+      await couponPromotionService.updateCoupon(id, { isActive: false }, req.auth!.userId).catch(() => {});
+    } else {
+      await recordAuditEvent({
+        actorId: req.auth!.userId,
+        actorType: 'ADMIN',
+        action: 'PROMOTION_DISABLED',
+        entityType: 'PROMOTION',
+        entityId: id,
+        ipAddress: req.ip,
+      });
+    }
     res.status(200).json({ success: true, message: 'Promotion disabled successfully', promotionId: id });
   } catch (err: any) {
     res.status(500).json({ success: false, error: 'PROMOTION_DELETE_FAILED', message: safeErrorMessage(err, 'Failed to disable promotion.') });
+  }
+});
+
+adminCompatibilityRouter.get('/coupons', authenticate, requireRole(PROMO_ROLES), async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const coupons = await couponPromotionService.listCoupons();
+    res.status(200).json({ success: true, coupons });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: 'COUPONS_FETCH_FAILED', message: safeErrorMessage(err, 'Failed to query coupons.') });
+  }
+});
+
+adminCompatibilityRouter.post('/coupons', authenticate, requireRole(PROMO_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const coupon = await couponPromotionService.createCoupon({
+      ...req.body,
+      actorId: req.auth!.userId,
+    });
+    res.status(201).json({ success: true, coupon });
+  } catch (err: any) {
+    const status = err instanceof CouponPromotionError ? err.statusCode : 500;
+    res.status(status).json({ success: false, error: err.code || 'COUPON_CREATE_FAILED', message: safeErrorMessage(err, 'Failed to create coupon.') });
+  }
+});
+
+adminCompatibilityRouter.patch('/coupons/:id', authenticate, requireRole(PROMO_ROLES), adminSensitiveRateLimiter, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const coupon = await couponPromotionService.updateCoupon(req.params.id, req.body, req.auth!.userId);
+    res.status(200).json({ success: true, coupon });
+  } catch (err: any) {
+    const status = err instanceof CouponPromotionError ? err.statusCode : 500;
+    res.status(status).json({ success: false, error: err.code || 'COUPON_UPDATE_FAILED', message: safeErrorMessage(err, 'Failed to update coupon.') });
+  }
+});
+
+adminCompatibilityRouter.get('/discounts/report', authenticate, requireRole(FINANCE_ROLES.concat(['MARKETING_ADMIN'])), async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const report = await couponPromotionService.getDiscountFundingReport();
+    res.status(200).json({ success: true, report });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: 'DISCOUNT_REPORT_FAILED', message: safeErrorMessage(err, 'Failed to compute discount funding report.') });
   }
 });
 

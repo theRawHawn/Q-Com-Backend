@@ -27,15 +27,23 @@
 | Path | Method | Auth / Role Required | Description |
 | :--- | :--- | :--- | :--- |
 | `/catalog/products` | GET | None | Browse geofenced catalog products |
-| `/checkout/quote` | POST | Optional Auth | Calculates itemized quotation (delivery, handling, taxes) |
+| `/v1/cart` | GET | Bearer | Retrieves authenticated customer's DB-backed cart with authoritative GST/discount pricing preview |
+| `/v1/cart/items` | POST | Bearer | Upserts/sets item quantity in customer's persistent cart |
+| `/v1/cart/items/:productId` | DELETE | Bearer | Removes product from persistent cart |
+| `/v1/cart/coupon` | POST / DELETE | Bearer | Attaches or clears coupon code on persistent cart |
+| `/v1/cart` | DELETE | Bearer | Clears customer's persistent cart |
+| `/v1/pricing/coupons/validate` | POST | Bearer | Validates coupon applicability, user/global eligibility & discount preview without burning usage slot |
+| `/v1/pricing/promotions/active` | GET | Optional Auth | Lists currently active promotions (slabs, BOGO, category/free-delivery rules) |
+| `/checkout/quote` | POST | Optional Auth | Calculates itemized quotation (`tax_inclusive`/`tax_exclusive`, Cess, dynamic POS, promotions, coupon) |
 | `/checkout/pricing-config` / `/pricing/pricing-config` | POST | Bearer (`SUPER_ADMIN`, `FINANCE_ADMIN`, `OPERATIONS`) | Updates platform pricing rules |
 | `/checkout/sellers-geofence/:sellerId` | POST | Bearer (`requireMerchantOwnership`) | Updates store availability & geofence radius |
 | `/orders/delivery-economics/config` | POST | Bearer (`SUPER_ADMIN`, `FINANCE_ADMIN`, `OPERATIONS`) | Updates delivery economics configuration |
-| `/orders/create` | POST | Bearer | Places order with reserved inventory (Idempotency-Key support) |
+| `/orders/create` | POST | Bearer | Places order with server-recomputed pricing, atomic `FOR UPDATE` coupon reservation, and `409 PRICE_CHANGED`/`QUOTE_EXPIRED` protection |
 | `/orders` | GET | Bearer | Retrieves authenticated customer's order history |
 | `/orders/:orderId` | GET | Bearer (`requireOrderOwnership`) | Retrieves single order details (customer, merchant staff, assigned rider, or admin only) |
-| `/orders/:orderId/cancel` | POST | Bearer (`requireOrderOwnership`) | Cancels unassigned/unpacked order with stock restitution |
-| `/invoices/order/:orderId` & `/text` | GET | Bearer (`requireOrderOwnership`) | Downloads GST tax invoice JSON or formatted text |
+| `/orders/:orderId/cancel` | POST | Bearer (`requireOrderOwnership`) | Cancels unassigned/unpacked order with stock restitution and coupon/promo reservation release |
+| `/invoices/order/:orderId` & `/text` | GET | Bearer (`requireOrderOwnership`) | Downloads GST tax invoice JSON/text (dynamic Indian FY, honest `irn: null` when IRP disabled) |
+| `/invoices/order/:orderId/credit-notes` & `/text` | GET | Bearer (`requireOrderOwnership`) | Lists/prints GST Credit Notes issued against partial or full order returns |
 
 ---
 
@@ -99,6 +107,9 @@ All `/api/admin/*` endpoints require valid JWT `Authorization: Bearer <token>`; 
 | `/admin/employees/list`, `/create`, `/:id/assign-roles` | GET/POST | List: Ops/Admin; Create/Assign: `SUPER_ADMIN` only | Manages internal employee RBAC roles (self-mutation blocked) |
 | `/admin/audit-logs` | GET | Admin / Finance / Ops | Redacted immutable security and transaction audit trail |
 | `/admin/riders/:id/release-payout`| POST | `SUPER_ADMIN`, `FINANCE_ADMIN` | Idempotently releases rider payout batch |
+| `/v1/admin/coupons` (`GET`, `POST`, `PATCH /:id`) | GET/POST/PATCH | `SUPER_ADMIN`, `FINANCE_ADMIN`, `OPERATIONS` | Manages coupon definitions, usage limits, funding splits & conflict groups (audited) |
+| `/v1/admin/promotions` (`GET`, `POST`, `PATCH /:id`, `DELETE /:id`) | GET/POST/PATCH/DELETE | `SUPER_ADMIN`, `FINANCE_ADMIN`, `OPERATIONS` | Manages promotional rules (`CART_SLAB`, `BOGO`, `CATEGORY_DISCOUNT`, `FREE_DELIVERY`) |
+| `/v1/admin/discounts/report` | GET | `SUPER_ADMIN`, `FINANCE_ADMIN`, `OPERATIONS` | Aggregated seller vs. platform discount funding & COA `5040` subsidy report |
 
 ---
 

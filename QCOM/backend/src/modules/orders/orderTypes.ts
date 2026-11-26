@@ -11,6 +11,7 @@ export type OrderStatus =
   | 'return_approved'
   | 'return_rejected'
   | 'return_picked_up'
+  | 'partially_returned'
   | 'returned';
 
 export interface OrderItemInput {
@@ -52,6 +53,10 @@ export interface CreateOrderInput {
   jobSite?: DeliveryLocationAddress;
   paymentMethod: string;
   couponCode?: string;
+  placeOfSupplyStateCode?: string;
+  deliveryAddressId?: string;
+  expectedTotal?: number | string;
+  quoteId?: string;
   isGstEnabled?: boolean;
   gstin?: string;
   businessName?: string;
@@ -74,9 +79,16 @@ export interface OrderRecord {
   cgstAmount: number;
   sgstAmount: number;
   igstAmount: number;
+  cessAmount: number;
   totalAmount: number;
   withholdingAmount: number;
   gstTcsAmount: number;
+  couponId?: string;
+  couponCode?: string;
+  appliedPromotions?: any[];
+  quoteId?: string;
+  platformDiscountSubsidy?: number;
+  sellerDiscountAmount?: number;
   paymentMethod: string;
   paymentStatus: 'PENDING' | 'PAID' | 'FAILED' | 'REFUNDED' | 'PARTIALLY_REFUNDED' | 'REFUND_PENDING';
   deliveryOtp: string;
@@ -98,11 +110,18 @@ export interface OrderRecord {
     unitPrice: number;
     quantity: number;
     totalPrice: number;
+    discountAmount?: number;
     hsnCode: string;
     taxableAmount: number;
     gstRatePercent: number;
     cgstAmount: number;
     sgstAmount: number;
     igstAmount: number;
+    cessAmount?: number;
+    taxInclusive?: boolean;
+    taxCategory?: string;
+    lineTotalPayable?: number;
+    refundedQuantity?: number;
+    refundedAmount?: number;
   }[];
 }

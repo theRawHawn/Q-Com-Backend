@@ -2,7 +2,7 @@
 
 **Engine Requirement:** PostgreSQL 16+  
 **Migration Tool:** Custom Idempotent Advisory-Locked Migrator (`scripts/migrate.ts`)  
-**Migrations Applied:** 001 through 030 (Verified & Tested)  
+**Migrations Applied:** 001 through 031 (Verified & Tested)  
 
 ---
 
@@ -40,6 +40,7 @@
 | **028** | `028_sprint15_7_transaction_cod_reverse_trip_integrity.sql` | Partial unique trip indexes (`uq_delivery_trips_forward_order`, `uq_delivery_trips_reverse_return`, `uq_delivery_trips_active_reverse_order`), GPS candidate index `idx_riders_dispatch_candidates` |
 | **029** | `029_sprint15_8_gateway_agnostic_payment_integrity.sql` | Normalized payment integrity indexes (`uq_payment_intents_single_active_per_order`, `uq_payment_intents_single_captured_per_order`, `uq_payment_attempts_single_active_per_order`, `uq_payment_attempts_single_succeeded_per_order`, `uq_payment_tx_single_capture_per_order`, `uq_payment_receipts_order_success`), `reconciliation_runs`, `reconciliation_discrepancies` |
 | **030** | `030_sprint15_9_cod_cash_accountability.sql` | `cod_collections` (1:1 per COD order), `cod_remittances` with DB `CHECK` separation of duties (`submitted_by <> received_by <> verified_by`), `cod_remittance_allocations`, `cod_cash_disputes`, `riders.cod_restricted` & ceiling override columns, and COA accounts `1050`, `2080`, `5030` |
+| **031** | `031_sprint16_0_pricing_gst_coupons_promotions.sql` | `indian_states` (36+ state/UT codes), `tax_rate_configs`, `pricing_calculation_snapshots`, `promotions`, `promotion_applications`, `coupon_redemptions` (`RESERVED`/`REDEEMED`/`RELEASED`/`REVERSED`), `carts`, `cart_items`, `credit_notes`, `credit_note_line_items`, COA `5040` (`Platform Promotion Subsidy`), `products.pricing_mode`/`cess_rate`/`tax_category`/`is_tax_classification_verified`, `merchants.state_code`, `orders` Place of Supply & price-drift columns, `gst_invoices` honest `irn` (`NULL` default) & `e_invoicing_status` |
 
 ---
 
@@ -62,4 +63,6 @@
    PostgreSQL triggers (`fn_prevent_gl_mutation` on `general_ledger_entries`/`ledger_journal_batches`, `fn_prevent_subledger_mutation` on `seller_ledgers`/`rider_ledgers`, and `fn_prevent_ledger_truncate` on all four tables) block historical `UPDATE`, `DELETE`, and `TRUNCATE` mutations with `LEDGER_IMMUTABLE`, reinforced by `REVOKE UPDATE, DELETE, TRUNCATE ... FROM PUBLIC`. Monotonic `seq_no` triggers guarantee deterministic balance snapshot reads even under identical millisecond timestamps. *(Security boundary: while triggers fire for normal SQL sessions, PostgreSQL database owners and superusers technically retain DDL/trigger-disable privileges, so production deployments must connect using a dedicated `NOSUPERUSER` non-owner application role.)*
 7. **COD Cash Custody & Separation-of-Duties Constraints (Migration 030):**  
    `cod_collections` enforces `UNIQUE (order_id)` and `allocated_amount + cleared_amount <= collected_amount`. `cod_remittances` enforces `chk_cod_remit_receiver_not_submitter`, `chk_cod_remit_verifier_not_submitter`, and `chk_cod_remit_verifier_not_receiver` at the database layer alongside partial idempotency uniqueness `uq_cod_remittances_idempotency`. `cod_cash_disputes` enforces single open shortage/excess dispute per remittance (`uq_cod_disputes_remit_type_open`).
+8. **Pricing Snapshot Immutability, Coupon Slot Integrity & GST Credit Notes (Migration 031):**  
+   `coupons` enforces `usage_limit IS NULL OR usage_count <= usage_limit` and `usage_count >= 0`, mutated atomically under `SELECT ... FOR UPDATE` with `coupon_redemptions` (`RESERVED` -> `REDEEMED` / `RELEASED` / `REVERSED`). `carts` / `cart_items` enforce single active cart per customer and positive quantities (`> 0`). `pricing_calculation_snapshots`, `orders`, `gst_invoices`, and `credit_notes` persist immutable BigNumber-rounded tax, Place of Supply (`indian_states`), discount allocation, and prorated refund credit-note breakdowns without altering historical records.
 

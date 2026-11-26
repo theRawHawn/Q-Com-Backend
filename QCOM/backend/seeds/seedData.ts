@@ -146,6 +146,7 @@ export async function runSeeds(poolOverride?: pg.Pool): Promise<void> {
       { code: '5010', name: 'Delivery Rider Logistics Expense', category: 'EXPENSE', normal: 'DEBIT', desc: 'Delivery fare paid to delivery partners' },
       { code: '5020', name: 'Payment Gateway Interchange Fees', category: 'EXPENSE', normal: 'DEBIT', desc: 'Gateway processing costs' },
       { code: '5030', name: 'COD Cash Variance & Authorized Write-Off Expense', category: 'EXPENSE', normal: 'DEBIT', desc: 'Formally authorized finance write-offs for unrecoverable COD cash shortages' },
+      { code: '5040', name: 'Platform Promotional & Coupon Subsidy Expense', category: 'EXPENSE', normal: 'DEBIT', desc: 'Platform-funded coupon and promotion discount subsidy granted to customers' },
     ];
     for (const a of accounts) {
       await client.query(
@@ -634,9 +635,9 @@ export async function runSeeds(poolOverride?: pg.Pool): Promise<void> {
 
     await client.query(
       `INSERT INTO saved_addresses 
-       (user_id, address, landmark, site_contact_name, site_phone, trade_type, latitude, longitude) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [userId, 'Tower 4 Construction Gate, Palm Heights, Koramangala', 'Opposite Sony Signal', 'Rahul Site Supervisor', '+91-9876543210', 'electrical', 12.9380, 77.6290]
+       (user_id, address, landmark, site_contact_name, site_phone, trade_type, latitude, longitude, state_code) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [userId, 'Tower 4 Construction Gate, Palm Heights, Koramangala', 'Opposite Sony Signal', 'Rahul Site Supervisor', '+91-9876543210', 'electrical', 12.9380, 77.6290, '29']
     );
 
     // 14. Demo Admin & Super Admin Users (Non-production seeded credentials)
@@ -704,12 +705,13 @@ export async function runSeeds(poolOverride?: pg.Pool): Promise<void> {
     console.log('[Seeds] Seeding Dynamic Coupons...');
     await client.query(
       `INSERT INTO coupons
-        (code, description, discount_type, discount_value, min_order_value_inr, max_discount_inr, valid_from)
+        (code, title, description, discount_type, discount_value, min_order_value_inr, max_discount_inr, valid_from)
        VALUES
-        ('WELCOME50', 'First order welcome flat ₹50 discount', 'FLAT_AMOUNT', 50.00, 200.00, NULL, '2024-01-01'),
-        ('BUILDER10', 'Contractor trade 10% volume discount', 'PERCENTAGE', 10.00, 0.00, 100.00, '2024-01-01'),
-        ('PROBUILD', 'Pro builder 15% discount for bulk trade orders', 'PERCENTAGE', 15.00, 100.00, 300.00, '2024-01-01')
+        ('WELCOME50', 'Welcome Flat ₹50 Off', 'First order welcome flat ₹50 discount', 'FLAT_AMOUNT', 50.00, 200.00, NULL, '2024-01-01'),
+        ('BUILDER10', 'Builder 10% Trade Discount', 'Contractor trade 10% volume discount', 'PERCENTAGE', 10.00, 0.00, 100.00, '2024-01-01'),
+        ('PROBUILD', 'ProBuild 15% Bulk Discount', 'Pro builder 15% discount for bulk trade orders', 'PERCENTAGE', 15.00, 100.00, 300.00, '2024-01-01')
        ON CONFLICT (code) DO UPDATE SET
+        title = COALESCE(coupons.title, EXCLUDED.title),
         discount_value = EXCLUDED.discount_value,
         min_order_value_inr = EXCLUDED.min_order_value_inr,
         max_discount_inr = EXCLUDED.max_discount_inr`

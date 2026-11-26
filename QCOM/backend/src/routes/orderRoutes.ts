@@ -9,6 +9,9 @@ import { getPool } from '../database/connection.js';
 import { checkoutRateLimiter, sellerActionRateLimiter, adminSensitiveRateLimiter } from '../middleware/rateLimiter.js';
 import { inventoryService } from '../modules/inventory/inventoryService.js';
 import { outboxService } from '../modules/outbox/outboxService.js';
+import { PricingEngineError } from '../modules/pricing/pricingEngine.js';
+import { TaxEngineError } from '../modules/pricing/taxEngine.js';
+import { CouponPromotionError } from '../modules/pricing/couponPromotionService.js';
 
 export const orderRouter = Router();
 
@@ -91,6 +94,10 @@ orderRouter.post('/create', authenticate, checkoutRateLimiter, async (req: Reque
     items, 
     deliveryLocation, 
     deliveryAddress, 
+    deliveryAddressId,
+    placeOfSupplyStateCode,
+    expectedTotal,
+    quoteId,
     jobSite: rawJobSite, 
     paymentMethod, 
     couponCode, 
@@ -348,6 +355,10 @@ orderRouter.post('/create', authenticate, checkoutRateLimiter, async (req: Reque
       items: items.map((i: any) => ({ productId: i.id || i.productId, quantity: Number(i.quantity || 1) })),
       jobSite: normalizedDeliveryLocation,
       deliveryLocation: normalizedDeliveryLocation,
+      deliveryAddressId: deliveryAddressId ? String(deliveryAddressId) : undefined,
+      placeOfSupplyStateCode: placeOfSupplyStateCode ? String(placeOfSupplyStateCode) : undefined,
+      expectedTotal: expectedTotal !== undefined ? Number(expectedTotal) : undefined,
+      quoteId: quoteId ? String(quoteId) : undefined,
       paymentMethod: paymentMethod || 'Instant UPI',
       couponCode,
       isGstEnabled,
@@ -413,11 +424,50 @@ orderRouter.post('/create', authenticate, checkoutRateLimiter, async (req: Reque
       return;
     }
 
-    if (err.message && (err.message.includes('INSUFFICIENT_STOCK') || err.message.toLowerCase().includes('insufficient stock'))) {
+    if (err instanceof PricingEngineError || err instanceof TaxEngineError || err instanceof CouponPromotionError) {
+      res.status(err.statusCode).json({
+        success: false,
+        error: err.code,
+        message: err.message,
+        requestId,
+      });
+      return;
+    }
+
+    const errMsg = String(err.message || '');
+    if (errMsg.includes('PRICE_CHANGED') || errMsg.includes('QUOTE_EXPIRED')) {
+      res.status(409).json({
+        success: false,
+        error: errMsg.includes('QUOTE_EXPIRED') ? 'QUOTE_EXPIRED' : 'PRICE_CHANGED',
+        message: errMsg,
+        requestId,
+      });
+      return;
+    }
+
+    if (
+      errMsg.includes('MISSING_TAX_CLASSIFICATION') ||
+      errMsg.includes('INVALID_TAX_CLASSIFICATION') ||
+      errMsg.includes('INVALID_STATE_CODE') ||
+      errMsg.includes('COUPON_') ||
+      errMsg.includes('INVALID_COUPON') ||
+      errMsg.includes('PROMOTION_') ||
+      errMsg.includes('MERCHANT_NOT_ACTIVE')
+    ) {
+      res.status(422).json({
+        success: false,
+        error: errMsg.split(':')[0]?.trim() || 'UNPROCESSABLE_ENTITY',
+        message: errMsg,
+        requestId,
+      });
+      return;
+    }
+
+    if (errMsg && (errMsg.includes('INSUFFICIENT_STOCK') || errMsg.toLowerCase().includes('insufficient stock'))) {
       res.status(400).json({
         success: false,
         error: 'INSUFFICIENT_STOCK',
-        message: err.message,
+        message: errMsg,
         requestId,
       });
       return;
@@ -426,7 +476,7 @@ orderRouter.post('/create', authenticate, checkoutRateLimiter, async (req: Reque
     res.status(400).json({
       success: false,
       error: 'ORDER_CREATION_FAILED',
-      message: err.message || 'Failed to create order.',
+      message: errMsg || 'Failed to create order.',
     });
   }
 });

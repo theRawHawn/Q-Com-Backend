@@ -87,6 +87,21 @@ const envSchema = z.object({
     (val) => val ?? process.env.CHECKOUT_RESERVATION_TTL_MINUTES ?? process.env.QCOM_RESERVATION_TTL_MINUTES,
     z.coerce.number().int().min(1).max(120).default(15)
   ),
+
+  // Sprint 16.0: Supplier Tax Identity & E-Invoicing Feature Gate (never fabricate GSTIN/IRN)
+  QCOM_GSTIN: z.preprocess(
+    (val) => (typeof val === 'string' && val.trim() === '' ? undefined : val),
+    z.string().trim().regex(/^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$/, 'QCOM_GSTIN must be a valid 15-character GSTIN').optional()
+  ),
+  QCOM_LEGAL_NAME: z.string().trim().default('QCOM Logistics & Platform Services'),
+  QCOM_STATE_CODE: z.preprocess(
+    (val) => (typeof val === 'string' && val.trim() === '' ? undefined : val),
+    z.string().trim().regex(/^[0-9]{2}$/).optional()
+  ),
+  EINVOICING_ENABLED: z.preprocess(
+    (val) => (val === true || val === 'true' || val === '1'),
+    z.boolean().default(false)
+  ),
 });
 
 export type EnvConfig = z.infer<typeof envSchema>;
