@@ -247,7 +247,7 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS seller_discount_amount NUMERIC(10,2)
 ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_status_check;
 ALTER TABLE orders ADD CONSTRAINT orders_status_check CHECK (
     status IN (
-        'placed', 'picking', 'packed', 'out_for_delivery', 'arriving', 'delivered',
+        'placed', 'accepted', 'picking', 'packed', 'out_for_delivery', 'arriving', 'delivered',
         'cancelled', 'return_requested', 'return_approved', 'return_rejected',
         'return_picked_up', 'partially_returned', 'returned'
     )

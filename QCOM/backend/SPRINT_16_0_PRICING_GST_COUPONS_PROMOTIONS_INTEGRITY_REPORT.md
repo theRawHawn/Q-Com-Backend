@@ -47,6 +47,8 @@ Key outcomes:
    Added typed config keys to `EnvConfig`, `.env.example`, and test env fixture.
 8. **Checkout Concurrency `INSUFFICIENT_STOCK` Error Prefix (`pricingEngine.ts` & `orderRoutes.ts`):**  
    Moving authoritative `pricingEngine.calculate()` inside `orderService.createOrder()`'s database transaction caused serialized competing checkouts to throw `PricingEngineError('INSUFFICIENT_STOCK', ...)` (`422` for `/api/pricing/quote`) prior to `inventoryService.reserveStock()` (`400` for `/api/orders/create`). Prefixed `INSUFFICIENT_STOCK: ` to the `PricingEngineError` message at `pricingEngine.ts:241` and preserved HTTP `400` mapping for `err.code === 'INSUFFICIENT_STOCK'` in `orderRoutes.ts` so quote (`422`) and checkout (`400`) HTTP contracts remain backward-compatible.
+9. **Migration `031` `orders_status_check` Preservation (`031_sprint16_0_pricing_gst_coupons_promotions.sql`):**  
+   Extended `orders_status_check` to include `'accepted'` (introduced in Migration `026`) alongside `'partially_returned'` and `'returned'` so concurrent seller order acceptance (`POST /api/orders/:orderId/accept-seller`) preserves full constraint compatibility.
 
 ---
 
