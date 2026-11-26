@@ -45,8 +45,8 @@ Key outcomes:
    PostgreSQL `HAVING c.usage_count <> COALESCE(COUNT(...) FILTER (...), 0)` failed under `pg-mem` AST parser. Rewrote Check 14D using ANSI-compliant `COALESCE(SUM(CASE WHEN ... THEN 1 ELSE 0 END), 0)` and exact JS comparison (`actual !== expected`) compatible with both PostgreSQL 16 and `pg-mem`.
 7. **Missing `QCOM_LEGAL_NAME` & `EINVOICING_ENABLED` in `env.ts` & Test Fixture (`tests/sprint14-staging-validation.test.ts`):**  
    Added typed config keys to `EnvConfig`, `.env.example`, and test env fixture.
-8. **Checkout Concurrency `INSUFFICIENT_STOCK` Error Prefix (`pricingEngine.ts`):**  
-   Moving authoritative `pricingEngine.calculate()` inside `orderService.createOrder()`'s database transaction caused serialized competing checkouts to throw `PricingEngineError('INSUFFICIENT_STOCK', ...)` prior to `inventoryService.reserveStock()`. Prefixed `INSUFFICIENT_STOCK: ` to the `PricingEngineError` message at `pricingEngine.ts:241` so concurrency and HTTP error assertions behave identically regardless of whether the quote check or inventory reservation catches the shortage first.
+8. **Checkout Concurrency `INSUFFICIENT_STOCK` Error Prefix (`pricingEngine.ts` & `orderRoutes.ts`):**  
+   Moving authoritative `pricingEngine.calculate()` inside `orderService.createOrder()`'s database transaction caused serialized competing checkouts to throw `PricingEngineError('INSUFFICIENT_STOCK', ...)` (`422` for `/api/pricing/quote`) prior to `inventoryService.reserveStock()` (`400` for `/api/orders/create`). Prefixed `INSUFFICIENT_STOCK: ` to the `PricingEngineError` message at `pricingEngine.ts:241` and preserved HTTP `400` mapping for `err.code === 'INSUFFICIENT_STOCK'` in `orderRoutes.ts` so quote (`422`) and checkout (`400`) HTTP contracts remain backward-compatible.
 
 ---
 

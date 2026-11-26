@@ -313,7 +313,12 @@ async function runPostgresChecks(): Promise<void> {
   }
 
   const pg = await import('pg');
+  const ignoreShutdownPoolError = (label: string) => (err: Error & { code?: string }) => {
+    if (err?.code === '57P01') return;
+    console.warn(`[real-services ${label} pool error]`, err?.message || err);
+  };
   const adminPool = new pg.default.Pool({ connectionString: adminUrl.toString(), max: 2 });
+  adminPool.on('error', ignoreShutdownPoolError('admin'));
   const createdDatabases: string[] = [];
   let migrationDirectory: string | undefined;
   try {
@@ -335,7 +340,9 @@ async function runPostgresChecks(): Promise<void> {
 
     const { Pool } = pg.default;
     const freshPool = new Pool({ connectionString: withDatabase(adminUrl, freshName), max: 12 });
+    freshPool.on('error', ignoreShutdownPoolError('fresh'));
     const upgradePool = new Pool({ connectionString: withDatabase(adminUrl, upgradeName), max: 4 });
+    upgradePool.on('error', ignoreShutdownPoolError('upgrade'));
     const { runMigrations, getMigrationFiles } = await import('../../src/database/migrator.js');
     const { setPool } = await import('../../src/database/connection.js');
     setPool(freshPool);

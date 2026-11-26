@@ -425,7 +425,8 @@ orderRouter.post('/create', authenticate, checkoutRateLimiter, async (req: Reque
     }
 
     if (err instanceof PricingEngineError || err instanceof TaxEngineError || err instanceof CouponPromotionError) {
-      res.status(err.statusCode).json({
+      const httpStatus = err.code === 'INSUFFICIENT_STOCK' ? 400 : err.statusCode;
+      res.status(httpStatus).json({
         success: false,
         error: err.code,
         message: err.message,
