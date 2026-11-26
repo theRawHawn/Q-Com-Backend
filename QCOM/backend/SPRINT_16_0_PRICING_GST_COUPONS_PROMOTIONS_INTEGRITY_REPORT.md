@@ -3,8 +3,8 @@
 **Repository:** `https://github.com/theRawHawn/Q-Com-Backend.git`  
 **Branch:** `main`  
 **Backend:** `QCOM/backend`  
-**Baseline Commit:** `e52f09e`  
-**Final Commit:** _Recorded in git log on `main` upon push & CI verification_  
+**Baseline Commit:** `e52f09e49a3c548713abfbd9c9ffe62fba49fed6`  
+**Verified Code Commit:** `007a3653ce8d515637ef08d8efa3755ca3034121` (CI Run `45834260969` — both jobs `success`)  
 **Scope Gate:** Backend (`QCOM/backend`) + `.github/workflows/ci.yml` only. Zero modifications to `QCOM/customer-app/src/**`, `QCOM/delivery-app/**`, `QCOM/admin-portal/src/**`, root `src/**`, or historical migrations `001`–`030`.
 
 ---
@@ -24,7 +24,8 @@ Key outcomes:
 
 ## 2. Baseline & Final Commit
 
-- **Expected & Verified Baseline Commit:** `e52f09e` on `main`.
+- **Expected & Verified Baseline Commit:** `e52f09e49a3c548713abfbd9c9ffe62fba49fed6` on `main`.
+- **Verified Code Implementation Commit:** `007a3653ce8d515637ef08d8efa3755ca3034121` on `main` (verified green in GitHub Actions Run `45834260969`).
 - **Forward-Only Schema Principle:** Historical migrations `001` through `030` remain untouched; all schema extensions live in forward migration `031_sprint16_0_pricing_gst_coupons_promotions.sql`.
 
 ---
@@ -250,8 +251,9 @@ Added Check 14 to `paymentReconciliationService.ts`:
 
 ## 21. GitHub Actions CI Run IDs
 
-- Triggered automatically upon push to `main` via `.github/workflows/ci.yml` (Jobs: `All 60 Test Suites & Infrastructure Verification` and `Real-Services Integration Harness (PG 16 & Redis 7.0.15)`).
-- _CI Run ID and status verified post-push in final closure._
+- **Passing Run ID:** `45834260969` (`https://github.com/theRawHawn/Q-Com-Backend/actions/runs/45834260969`) on commit `007a3653ce8d515637ef08d8efa3755ca3034121` (`main`):
+  - **Job `139958813496` — `All 60 Test Suites & Infrastructure Verification`:** **`success`** (`ALL TESTS & FOUR-APPLICATION COMPATIBILITY PASSED in 53.02s`, `ALL 8/8 SPRINT 16.0 PRICING, GST, COUPONS & PROMOTION GROUPS PASSED`, `npx tsc --noEmit`, `npm run lint`, `npm --prefix QCOM/backend run build`, `npm run build`).
+  - **Job `139958813751` — `Real-Services Integration Harness (PG 16 & Redis 7.0.15)`:** **`success`** (`PostgreSQL 16 Sprint 16.0 checks (Migration 031 schema, 200-way coupon race against limit=100, cancellation release, Check 14) passed`, `Real PostgreSQL 16 and Redis 7 integration checks passed`).
 
 ---
 
