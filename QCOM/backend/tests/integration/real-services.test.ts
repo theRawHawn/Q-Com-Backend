@@ -1535,12 +1535,12 @@ async function runSprint16_0PostgresChecks(freshPool: import('pg').Pool): Promis
     `SELECT table_name FROM information_schema.tables
      WHERE table_schema = current_schema()
        AND table_name IN (
-         'indian_states', 'tax_rate_configs', 'pricing_calculation_snapshots',
+         'indian_states', 'coupon_redemptions', 'pricing_calculation_snapshots',
          'promotions', 'promotion_applications', 'carts', 'cart_items',
          'credit_notes', 'credit_note_line_items'
        )`
   );
-  assert.equal(tblRes.rowCount, 9, 'Migration 031 must create all 9 pricing/GST/promotion/cart/credit-note tables.');
+  assert.equal(tblRes.rowCount, 9, 'Migration 031 must ensure all 9 pricing/GST/coupon/promotion/cart/credit-note tables exist.');
 
   const statesCount = Number((await freshPool.query(`SELECT COUNT(*) AS cnt FROM indian_states`)).rows[0].cnt);
   assert.ok(statesCount >= 36, 'indian_states must contain >= 36 Indian states and Union Territories.');

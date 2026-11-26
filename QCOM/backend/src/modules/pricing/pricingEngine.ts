@@ -238,7 +238,7 @@ export class PricingEngine {
       if (available < itm.quantity) {
         throw new PricingEngineError(
           'INSUFFICIENT_STOCK',
-          `Insufficient stock for '${p.name}'. Requested ${itm.quantity}, but only ${Math.max(0, available)} available. Please reduce quantity or remove item.`,
+          `INSUFFICIENT_STOCK: Insufficient stock for '${p.name}'. Requested ${itm.quantity}, but only ${Math.max(0, available)} available. Please reduce quantity or remove item.`,
           422
         );
       }
