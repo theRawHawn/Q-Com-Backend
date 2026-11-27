@@ -3,7 +3,12 @@ import { getPool } from '../database/connection.js';
 import { authenticate, optionalAuthenticate } from '../middleware/auth.js';
 import { requirePermission, requireRole } from '../middleware/rbac.js';
 import { requireMerchantOwnership } from '../middleware/resourceOwnership.js';
-import { adminSensitiveRateLimiter, sellerActionRateLimiter } from '../middleware/rateLimiter.js';
+import {
+  adminSensitiveRateLimiter,
+  couponValidationRateLimiter,
+  pricingQuoteRateLimiter,
+  sellerActionRateLimiter,
+} from '../middleware/rateLimiter.js';
 import { pricingEngine, PricingEngineError } from '../modules/pricing/pricingEngine.js';
 import { taxEngine, TaxEngineError } from '../modules/pricing/taxEngine.js';
 import { CouponPromotionError, couponPromotionService } from '../modules/pricing/couponPromotionService.js';
@@ -374,9 +379,9 @@ const quoteAuthMiddleware = (req: Request, res: Response, next: NextFunction) =>
   return authenticate(req, res, next);
 };
 
-pricingRouter.post('/quote', quoteAuthMiddleware, handleCheckoutCalculation);
-pricingRouter.post('/calculate', optionalAuthenticate, handleCheckoutCalculation);
-pricingRouter.post('/checkout-calculation', optionalAuthenticate, handleCheckoutCalculation);
+pricingRouter.post('/quote', quoteAuthMiddleware, pricingQuoteRateLimiter, handleCheckoutCalculation);
+pricingRouter.post('/calculate', optionalAuthenticate, pricingQuoteRateLimiter, handleCheckoutCalculation);
+pricingRouter.post('/checkout-calculation', optionalAuthenticate, pricingQuoteRateLimiter, handleCheckoutCalculation);
 
 /**
  * GET /api/v1/pricing/quote/:quoteId
@@ -1013,7 +1018,7 @@ pricingRouter.post(
  * POST /api/v1/pricing/coupons/validate
  * Authoritative server-side coupon validation and discount calculation preview.
  */
-pricingRouter.post('/coupons/validate', optionalAuthenticate, async (req: Request, res: Response): Promise<void> => {
+pricingRouter.post('/coupons/validate', optionalAuthenticate, couponValidationRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const { merchantId, items, couponCode, placeOfSupplyStateCode, deliveryAddressId, distanceKm } = req.body;
   const requestId = (req as any).requestId || req.headers['x-request-id'] || 'req-coupon';
 

@@ -52,3 +52,11 @@ All system logs must sanitize authorization headers and sensitive payload fields
 - `503 RATE_LIMIT_UNAVAILABLE`: Redis could not enforce a security-sensitive distributed limit. Check Redis connectivity and latency; do not disable the fail-closed route policy to restore traffic.
 - `X-RateLimit-Status: unavailable`: Redis is unavailable for the general availability guard, which is intentionally fail-open. Sensitive endpoint guards still reject requests if their distributed check fails.
 - Check `TRUST_PROXY_CIDRS` against the actual ingress peer addresses. If unset, `X-Forwarded-For` is ignored and rate limiting uses the direct peer address.
+
+## 5. Pricing, GST, Return QC & Check 14 Diagnostics (Sprint 16.1)
+
+- **`409 QUOTE_ALREADY_USED` / `PRICE_CHANGED` / `QUOTE_EXPIRED`:** Quotes are single-use (`pricing_calculation_snapshots.converted_at`) and ownership-checked (`403 QUOTE_ACCESS_DENIED`). Re-fetch `/api/v1/pricing/quote` and retry with a fresh `Idempotency-Key`.
+- **`422 TAX_RULE_NOT_FOUND` / `UNVERIFIED_TAX_CLASSIFICATION`:** Fail-closed guard indicating missing active rows in `statutory_tax_rules` (`DELIVERY_GST` / `HANDLING_GST`) or unverified `products.is_tax_classification_verified`. Configure statutory rules via SQL migration/seed — never hardcode rates.
+- **`409 RETURN_QC_IN_PROGRESS`:** A 3-phase QC refund is currently `PROCESSING` for that return. Wait or inspect `refunds` by `order_returns.refund_id`; safe retry with the same returnId reuses a `COMPLETED` refund without double-refunding.
+- **Check `14E–14J` (`ORDER_INVOICE_TOTAL_DRIFT`, `INVOICE_LINE_ITEMS_DRIFT`, `CREDIT_NOTE_INTEGRITY_DRIFT`, `COA_5040_SUBSIDY_DRIFT`, `UNBALANCED_JOURNAL_BATCH`):** Reconciliation is strictly read-only. Never mutate historical GL or credit-note rows directly; post an authorized adjusting entry or resolve after reviewing `reconciliation_discrepancies`.
+

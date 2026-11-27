@@ -278,7 +278,59 @@ async function runRedisChecks(redisModule: typeof import('../../src/database/red
       await new Promise<void>((resolve, reject) => codServer.close((err) => (err ? reject(err) : resolve())));
     }
 
-    console.log('Redis 7 atomic boundary, independent processes, source-IP trust, Retry-After, COD remittance limiter, and fail-open/fail-closed behavior passed.');
+    // Verify Sprint 16.1 couponValidationRateLimiter (20 req/min fail-closed) on real Redis 7.0.15
+    const cpnRateUserId = `it_cpn_${randomUUID()}`;
+    createdRedisKeys.add(`ratelimit:pricing:coupon_validate:user:${cpnRateUserId}`);
+    createdRedisKeys.add(`ratelimit:pricing:coupon_validate:ip:127.0.0.1`);
+    const { couponValidationRateLimiter } = await import('../../src/middleware/rateLimiter.js');
+    const cpnApp = express();
+    cpnApp.post(
+      '/validate-coupon',
+      (req, _res, next) => {
+        (req as any).auth = { userId: cpnRateUserId };
+        next();
+      },
+      couponValidationRateLimiter,
+      (_req, res) => res.status(204).end()
+    );
+    const cpnServer = await new Promise<import('node:http').Server>((resolve) => {
+      const srv = cpnApp.listen(0, '127.0.0.1', () => resolve(srv));
+    });
+    const cpnAddr = cpnServer.address();
+    assert.ok(cpnAddr && typeof cpnAddr !== 'string');
+    try {
+      const cpnUrl = `http://127.0.0.1:${cpnAddr.port}/validate-coupon`;
+      const cpnAdmissions = await Promise.all(
+        Array.from({ length: 23 }, () =>
+          fetch(cpnUrl, { method: 'POST', headers: { 'x-test-rate-limit': '1' } })
+        )
+      );
+      assert.equal(
+        cpnAdmissions.filter((r) => r.status === 204).length,
+        20,
+        'couponValidationRateLimiter must admit strictly 20 requests per minute on real Redis 7.'
+      );
+      assert.equal(
+        cpnAdmissions.filter((r) => r.status === 429).length,
+        3,
+        'Requests 21-23 to couponValidationRateLimiter must fail with HTTP 429.'
+      );
+
+      await client.del(`ratelimit:pricing:coupon_validate:user:${cpnRateUserId}`);
+      await client.set(`ratelimit:pricing:coupon_validate:user:${cpnRateUserId}`, 'corrupt-type');
+      const prevNodeEnvCpn = env.NODE_ENV;
+      env.NODE_ENV = 'production';
+      try {
+        const cpnFault = await fetch(cpnUrl, { method: 'POST', headers: { 'x-test-rate-limit': '1' } });
+        assert.equal(cpnFault.status, 503, 'couponValidationRateLimiter must fail closed (503) on Redis error.');
+      } finally {
+        env.NODE_ENV = prevNodeEnvCpn;
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => cpnServer.close((err) => (err ? reject(err) : resolve())));
+    }
+
+    console.log('Redis 7 atomic boundary, independent processes, source-IP trust, Retry-After, COD & coupon limiters, and fail-open/fail-closed behavior passed.');
   } finally {
     await client.del(...createdRedisKeys);
   }
@@ -359,6 +411,7 @@ async function runPostgresChecks(): Promise<void> {
       assert.ok(applied.some((name) => name.startsWith('029_')), 'Fresh database must apply migration 029.');
       assert.ok(applied.some((name) => name.startsWith('030_')), 'Fresh database must apply migration 030.');
       assert.ok(applied.some((name) => name.startsWith('031_')), 'Fresh database must apply migration 031.');
+      assert.ok(applied.some((name) => name.startsWith('032_')), 'Fresh database must apply migration 032.');
       assert.deepEqual(await runMigrations({ poolOverride: freshPool }), [], 'A migration rerun must apply no changes.');
 
       const previousFiles = migrationFiles.filter((migration) => Number(migration.version) < 25);
@@ -386,6 +439,7 @@ async function runPostgresChecks(): Promise<void> {
       assert.ok(upgradeApplied.some((name) => name.startsWith('029_')), 'Upgrade must apply migration 029.');
       assert.ok(upgradeApplied.some((name) => name.startsWith('030_')), 'Upgrade must apply migration 030.');
       assert.ok(upgradeApplied.some((name) => name.startsWith('031_')), 'Upgrade must apply migration 031.');
+      assert.ok(upgradeApplied.some((name) => name.startsWith('032_')), 'Upgrade must apply migration 032.');
       const upgradedTripIndexes = await upgradePool.query<{ indexname: string }>(
         `SELECT indexname FROM pg_indexes
          WHERE schemaname = current_schema()
@@ -538,8 +592,9 @@ async function runPostgresChecks(): Promise<void> {
       await runSprint15_8PostgresChecks(freshPool);
       await runSprint15_9PostgresChecks(freshPool);
       await runSprint16_0PostgresChecks(freshPool);
+      await runSprint16_1PostgresChecks(freshPool);
 
-      console.log('PostgreSQL 16 fresh/upgrade migrations, Sprint 15.7/15.8/15.9/16.0 integrity/concurrency/pg_locks checks, outbox claims, fencing, and rollback checks passed.');
+      console.log('PostgreSQL 16 fresh/upgrade migrations, Sprint 15.7/15.8/15.9/16.0/16.1 integrity/concurrency/pg_locks checks, outbox claims, fencing, and rollback checks passed.');
     } finally {
       setPool(null);
       await Promise.all([freshPool.end(), upgradePool.end()]);
@@ -1640,6 +1695,230 @@ async function runSprint16_0PostgresChecks(freshPool: import('pg').Pool): Promis
   assert.equal(s16Drift.length, 0, `Expected 0 Sprint 16.0 reconciliation drift discrepancies, found: ${JSON.stringify(s16Drift)}`);
 
   console.log('PostgreSQL 16 Sprint 16.0 checks (Migration 031 schema, 200-way coupon race against limit=100, cancellation release, Check 14) passed.');
+}
+
+async function runSprint16_1PostgresChecks(freshPool: import('pg').Pool): Promise<void> {
+  const crypto = await import('node:crypto');
+  const { transaction } = await import('../../src/database/connection.js');
+  const { orderService } = await import('../../src/modules/orders/orderService.js');
+  const { cancellationService } = await import('../../src/modules/orders/cancellationService.js');
+  const { returnService } = await import('../../src/modules/orders/returnService.js');
+  const { invoiceService } = await import('../../src/modules/invoices/invoiceService.js');
+  const { ledgerService } = await import('../../src/modules/ledger/ledgerService.js');
+  const { settlementAllocationService } = await import('../../src/modules/settlements/settlementAllocationService.js');
+  const { couponPromotionService } = await import('../../src/modules/pricing/couponPromotionService.js');
+  const { paymentReconciliationService } = await import('../../src/modules/reconciliation/paymentReconciliationService.js');
+
+  console.log('[PG16-16.1] Verifying Migration 032 schema objects & SQLSTATE 23505/23514 constraints...');
+  const snapCol = await freshPool.query(
+    `SELECT column_name FROM information_schema.columns
+     WHERE table_schema = current_schema() AND table_name = 'pricing_calculation_snapshots' AND column_name = 'converted_at'`
+  );
+  assert.equal(snapCol.rowCount, 1, 'Migration 032 must add converted_at to pricing_calculation_snapshots.');
+
+  const allocCol = await freshPool.query(
+    `SELECT column_name FROM information_schema.columns
+     WHERE table_schema = current_schema() AND table_name = 'order_settlement_allocations' AND column_name = 'reversed_platform_subsidy'`
+  );
+  assert.equal(allocCol.rowCount, 1, 'Migration 032 must add reversed_platform_subsidy to order_settlement_allocations.');
+
+  const cnIdx = await freshPool.query(
+    `SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'uq_credit_notes_return_type'`
+  );
+  assert.equal(cnIdx.rowCount, 1, 'Migration 032 must enforce uq_credit_notes_return_type.');
+
+  // SQLSTATE 23514 on coupons usage_count > usage_limit
+  await assert.rejects(
+    () => freshPool.query(`UPDATE coupons SET usage_count = usage_limit + 1 WHERE code = 'PG16RACE100'`),
+    (err: any) => err?.code === '23514'
+  );
+
+  const merchRow = (
+    await freshPool.query(`SELECT id, latitude, longitude FROM merchants WHERE merchant_code = 'MERCH-BLR-01' LIMIT 1`)
+  ).rows[0];
+  const merchantId = merchRow.id as string;
+  const storeLat = Number(merchRow.latitude);
+  const storeLng = Number(merchRow.longitude);
+  const prodRow = (
+    await freshPool.query(
+      `SELECT p.id FROM products p JOIN store_inventory si ON si.product_id = p.id
+       WHERE si.merchant_id = $1 AND si.is_available = TRUE LIMIT 1`,
+      [merchantId]
+    )
+  ).rows[0];
+  const productId = prodRow.id as string;
+  const adminUserId = (await freshPool.query(`SELECT id FROM users ORDER BY created_at ASC LIMIT 1`)).rows[0].id as string;
+
+  // Multi-connection first_order_only cross-coupon concurrency race (two DIFFERENT coupons simultaneously for one new user)
+  console.log('[PG16-16.1] Verifying multi-connection first_order_only serialization & zero deadlock...');
+  const foUserId = crypto.randomUUID();
+  await freshPool.query(
+    `INSERT INTO users (id, name, phone, email, role) VALUES ($1, 'PG16 FO User', $2, $3, 'customer')`,
+    [foUserId, `+9190${Math.floor(10000000 + Math.random() * 89999999)}`, `pg16_fo_${Date.now()}@qcom.local`]
+  );
+  const foCpn1 = `PG16FO1_${Date.now().toString().slice(-4)}`;
+  const foCpn2 = `PG16FO2_${Date.now().toString().slice(-4)}`;
+  await couponPromotionService.createCoupon({
+    code: foCpn1,
+    title: 'PG16 First Order A',
+    discountType: 'FLAT_AMOUNT',
+    discountValue: 30,
+    minOrderValueInr: 10,
+    firstOrderOnly: true,
+    fundingSource: 'PLATFORM',
+    actorId: adminUserId,
+  });
+  await couponPromotionService.createCoupon({
+    code: foCpn2,
+    title: 'PG16 First Order B',
+    discountType: 'FLAT_AMOUNT',
+    discountValue: 30,
+    minOrderValueInr: 10,
+    firstOrderOnly: true,
+    fundingSource: 'PLATFORM',
+    actorId: adminUserId,
+  });
+
+  const foRace = await Promise.allSettled([
+    orderService.createOrder({
+      userId: foUserId,
+      merchantId,
+      items: [{ productId, quantity: 1 }],
+      couponCode: foCpn1,
+      placeOfSupplyStateCode: '29',
+      paymentMethod: 'Instant UPI',
+      jobSite: { address: 'PG16 FO A', latitude: storeLat + 0.01, longitude: storeLng + 0.01 },
+      idempotencyKey: `pg16_fo1_${Date.now()}`,
+    }),
+    orderService.createOrder({
+      userId: foUserId,
+      merchantId,
+      items: [{ productId, quantity: 1 }],
+      couponCode: foCpn2,
+      placeOfSupplyStateCode: '29',
+      paymentMethod: 'Instant UPI',
+      jobSite: { address: 'PG16 FO B', latitude: storeLat + 0.01, longitude: storeLng + 0.01 },
+      idempotencyKey: `pg16_fo2_${Date.now()}`,
+    }),
+  ]);
+  const foWon = foRace.filter((r) => r.status === 'fulfilled') as Array<PromiseFulfilledResult<any>>;
+  const foLost = foRace.filter((r) => r.status === 'rejected');
+  assert.equal(foWon.length, 1, 'Strictly 1 checkout may consume a first_order_only coupon under dual-coupon concurrency.');
+  assert.equal(foLost.length, 1, 'Second concurrent first_order_only checkout must fail cleanly without deadlock.');
+
+  // Delayed webhook / redemption arrival after cancellation release must NOT flip RELEASED back to REDEEMED
+  const delayOrd = await orderService.createOrder({
+    userId: adminUserId,
+    merchantId,
+    items: [{ productId, quantity: 1 }],
+    couponCode: 'PG16RACE100',
+    placeOfSupplyStateCode: '29',
+    paymentMethod: 'Instant UPI',
+    jobSite: { address: 'PG16 Delay Hook', latitude: storeLat + 0.01, longitude: storeLng + 0.01 },
+    idempotencyKey: `pg16_delay_${Date.now()}`,
+  });
+  await cancellationService.cancelByCustomer({
+    orderId: delayOrd.order.id,
+    userId: adminUserId,
+    reason: 'Cancel before delayed markRedeemed webhook',
+  });
+  await transaction(async (txClient) => {
+    await couponPromotionService.markRedeemedForOrder(txClient, delayOrd.order.id);
+  });
+  const redPostDelay = await freshPool.query(`SELECT status FROM coupon_redemptions WHERE order_id = $1`, [delayOrd.order.id]);
+  assert.equal(redPostDelay.rows[0].status, 'RELEASED', 'Delayed webhook must never revive a RELEASED coupon slot.');
+
+  // Concurrent qcInspectAndResolve + COA 5040 full return unwind on PG 16
+  console.log('[PG16-16.1] Verifying concurrent qcInspectAndResolve single-refund/CN & COA 5040 full return unwind...');
+  const winOrd = foWon[0].value.order;
+  await ledgerService.recordOrderPayment({
+    orderId: winOrd.id,
+    merchantId,
+    grossAmount: winOrd.totalAmount,
+    taxableAmount: winOrd.taxableAmount,
+    cgstAmount: winOrd.cgstAmount,
+    sgstAmount: winOrd.sgstAmount,
+    deliveryFee: winOrd.deliveryFee,
+    handlingFee: winOrd.handlingFee,
+  });
+  await transaction(async (txClient) => {
+    await couponPromotionService.markRedeemedForOrder(txClient, winOrd.id);
+  });
+  await freshPool.query(`UPDATE orders SET status = 'delivered', payment_status = 'PAID', delivered_at = NOW() WHERE id = $1`, [winOrd.id]);
+  await settlementAllocationService.allocateFulfilledOrder(winOrd.id);
+
+  const oiId = winOrd.items[0].id as string;
+  const retReq = await returnService.requestReturn({
+    orderId: winOrd.id,
+    userId: foUserId,
+    items: [{ orderItemId: oiId, quantity: 1 }],
+    reasonCode: 'DEFECTIVE',
+  });
+  await returnService.reviewReturn({ returnId: retReq.returnRequest.id, merchantId, adminId: adminUserId, action: 'APPROVE' });
+  await returnService.receiveAtStore({ returnId: retReq.returnRequest.id, merchantId });
+
+  const qcRace = await Promise.allSettled([
+    returnService.qcInspectAndResolve({
+      returnId: retReq.returnRequest.id,
+      merchantId,
+      itemDecisions: [{ returnItemId: retReq.returnRequest.items[0].id, qcPassed: true }],
+    }),
+    returnService.qcInspectAndResolve({
+      returnId: retReq.returnRequest.id,
+      merchantId,
+      itemDecisions: [{ returnItemId: retReq.returnRequest.items[0].id, qcPassed: true }],
+    }),
+  ]);
+  const qcFulfilled = qcRace.filter((r) => r.status === 'fulfilled');
+  assert.ok(qcFulfilled.length >= 1, 'At least one QC worker must complete return inspection.');
+  const refundsCnt = Number((await freshPool.query(`SELECT COUNT(*) AS cnt FROM refunds WHERE order_id = $1`, [winOrd.id])).rows[0].cnt);
+  const cnCnt = Number((await freshPool.query(`SELECT COUNT(*) AS cnt FROM credit_notes WHERE order_id = $1`, [winOrd.id])).rows[0].cnt);
+  assert.equal(refundsCnt, 1, 'Concurrent QC must produce strictly 1 refund row.');
+  assert.equal(cnCnt, 1, 'Concurrent QC must produce strictly 1 credit note row.');
+
+  // SQLSTATE 23505 on duplicate credit note for same return_id + type
+  const existingCn = (await freshPool.query(`SELECT * FROM credit_notes WHERE return_id = $1 LIMIT 1`, [retReq.returnRequest.id])).rows[0];
+  await assert.rejects(
+    () =>
+      freshPool.query(
+        `INSERT INTO credit_notes (
+           credit_note_number, credit_note_type, order_id, return_id, invoice_id, financial_year,
+           taxable_amount, cgst_amount, sgst_amount, igst_amount, cess_amount, total_amount, reason
+         ) VALUES ($1, 'SELLER_CREDIT_NOTE', $2, $3, $4, $5, 0, 0, 0, 0, 0, 0, 'dup test')`,
+        [`CN-DUP-${Date.now()}`, winOrd.id, retReq.returnRequest.id, existingCn.invoice_id, existingCn.financial_year]
+      ),
+    (err: any) => err?.code === '23505'
+  );
+
+  // Verify COA 5040 netted cleanly on PG 16 and invoices match line totals
+  const gl5040 = (
+    await freshPool.query(
+      `SELECT
+         COALESCE(SUM(CASE WHEN entry_side = 'DEBIT' THEN amount ELSE 0 END), 0) AS dr,
+         COALESCE(SUM(CASE WHEN entry_side = 'CREDIT' THEN amount ELSE 0 END), 0) AS cr
+       FROM general_ledger_entries
+       WHERE order_id = $1 AND account_code = '5040'`,
+      [winOrd.id]
+    )
+  ).rows[0];
+  assert.equal(Number(gl5040.dr).toFixed(2), Number(gl5040.cr).toFixed(2), 'PG16 full return of subsidized order must net COA 5040 to 0.00');
+
+  await invoiceService.getOrCreateOrderInvoices(winOrd.id);
+  const reconPost = await paymentReconciliationService.runReconciliation({ orderId: winOrd.id, triggeredBy: 'pg16_s161' });
+  const bad161 = reconPost.discrepancies.filter((d) =>
+    [
+      'ORDER_ITEM_TOTALS_DRIFT',
+      'ORDER_INVOICE_TOTAL_DRIFT',
+      'INVOICE_LINE_ITEMS_DRIFT',
+      'CREDIT_NOTE_INTEGRITY_DRIFT',
+      'COUPON_CANCELLED_ORDER_UNRELEASED',
+      'COA_5040_SUBSIDY_DRIFT',
+      'UNBALANCED_JOURNAL_BATCH',
+    ].includes(d.category)
+  );
+  assert.equal(bad161.length, 0, `PG16 Check 14E-14J must report 0 discrepancies on clean return+invoice flow, found ${JSON.stringify(bad161)}`);
+
+  console.log('PostgreSQL 16 Sprint 16.1 checks (Migration 032 schema/constraints, dual first_order_only race, delayed webhook guard, concurrent QC single refund/CN, COA 5040 unwind & Check 14E-14J) passed.');
 }
 
 async function runSuite(): Promise<void> {

@@ -27,23 +27,23 @@
 | Path | Method | Auth / Role Required | Description |
 | :--- | :--- | :--- | :--- |
 | `/catalog/products` | GET | None | Browse geofenced catalog products |
-| `/v1/cart` | GET | Bearer | Retrieves authenticated customer's DB-backed cart with authoritative GST/discount pricing preview |
-| `/v1/cart/items` | POST | Bearer | Upserts/sets item quantity in customer's persistent cart |
-| `/v1/cart/items/:productId` | DELETE | Bearer | Removes product from persistent cart |
-| `/v1/cart/coupon` | POST / DELETE | Bearer | Attaches or clears coupon code on persistent cart |
-| `/v1/cart` | DELETE | Bearer | Clears customer's persistent cart |
-| `/v1/pricing/coupons/validate` | POST | Bearer | Validates coupon applicability, user/global eligibility & discount preview without burning usage slot |
+| `/v1/cart` | GET | Bearer (`cartRateLimiter` — 60/min open) | Retrieves authenticated customer's DB-backed cart with authoritative GST/discount pricing preview |
+| `/v1/cart/items` | POST | Bearer (`cartRateLimiter` — 60/min open) | Upserts/sets item quantity in customer's persistent cart |
+| `/v1/cart/items/:productId` | DELETE | Bearer (`cartRateLimiter` — 60/min open) | Removes product from persistent cart |
+| `/v1/cart/coupon` | POST / DELETE | Bearer (`cartRateLimiter` — 60/min open) | Attaches or clears coupon code on persistent cart |
+| `/v1/cart` | DELETE | Bearer (`cartRateLimiter` — 60/min open) | Clears customer's persistent cart |
+| `/v1/pricing/coupons/validate` | POST | Bearer (`couponValidationRateLimiter` — 20/min fail-closed) | Validates coupon applicability, user/global eligibility & discount preview without burning usage slot |
 | `/v1/pricing/promotions/active` | GET | Optional Auth | Lists currently active promotions (slabs, BOGO, category/free-delivery rules) |
-| `/checkout/quote` | POST | Optional Auth | Calculates itemized quotation (`tax_inclusive`/`tax_exclusive`, Cess, dynamic POS, promotions, coupon) |
+| `/checkout/quote` | POST | Optional Auth (`pricingQuoteRateLimiter` — 60/min open) | Calculates itemized quotation (duplicate-line merged, `distanceKm >= 0`, `tax_inclusive`/`tax_exclusive`, Cess, dynamic POS) |
 | `/checkout/pricing-config` / `/pricing/pricing-config` | POST | Bearer (`SUPER_ADMIN`, `FINANCE_ADMIN`, `OPERATIONS`) | Updates platform pricing rules |
 | `/checkout/sellers-geofence/:sellerId` | POST | Bearer (`requireMerchantOwnership`) | Updates store availability & geofence radius |
 | `/orders/delivery-economics/config` | POST | Bearer (`SUPER_ADMIN`, `FINANCE_ADMIN`, `OPERATIONS`) | Updates delivery economics configuration |
-| `/orders/create` | POST | Bearer | Places order with server-recomputed pricing, atomic `FOR UPDATE` coupon reservation, and `409 PRICE_CHANGED`/`QUOTE_EXPIRED` protection |
+| `/orders/create` | POST | Bearer (`checkoutRateLimiter`) | Places order with server-recomputed pricing, single-use quote (`403`/`409 QUOTE_ALREADY_USED`/`PRICE_CHANGED`/`QUOTE_EXPIRED`), canonical payload fingerprint, and atomic `users FOR UPDATE` + coupon locks |
 | `/orders` | GET | Bearer | Retrieves authenticated customer's order history |
 | `/orders/:orderId` | GET | Bearer (`requireOrderOwnership`) | Retrieves single order details (customer, merchant staff, assigned rider, or admin only) |
 | `/orders/:orderId/cancel` | POST | Bearer (`requireOrderOwnership`) | Cancels unassigned/unpacked order with stock restitution and coupon/promo reservation release |
-| `/invoices/order/:orderId` & `/text` | GET | Bearer (`requireOrderOwnership`) | Downloads GST tax invoice JSON/text (dynamic Indian FY, honest `irn: null` when IRP disabled) |
-| `/invoices/order/:orderId/credit-notes` & `/text` | GET | Bearer (`requireOrderOwnership`) | Lists/prints GST Credit Notes issued against partial or full order returns |
+| `/invoices/order/:orderId` & `/text` | GET | Bearer (`requireOrderOwnership`) | Downloads GST tax invoice JSON/text (dynamic Indian FY, fail-closed GST, honest `irn: null` when IRP disabled) |
+| `/invoices/order/:orderId/credit-notes` & `/text` | GET | Bearer (`requireOrderOwnership`) | Lists/prints GST Credit Notes (unique per return & type, sequential rounding parity) |
 
 ---
 
@@ -56,7 +56,7 @@
 | `/merchants/:id/orders/:orderId/pack` | POST | Bearer (`requireMerchantOwnership`) | Marks order packed and ready for rider pickup |
 | `/orders/:orderId/returns` | GET | Bearer (`requireOrderOwnership`) | Lists return requests for an order |
 | `/returns/:returnId` | GET | Bearer (Order owner / Merchant / Admin) | Reads specific return record |
-| `/returns/:returnId/review` / `receive` / `qc-inspect` | POST | Bearer (Return merchant / Admin) | Processes merchant return workflow (forged `body.merchantId` rejected) |
+| `/returns/:returnId/review` / `receive` / `qc-inspect` | POST | Bearer (Return merchant / Admin, `returnActionRateLimiter` — 30/min fail-closed) | Processes merchant return workflow with deterministic QC refund idempotency & crash recovery |
 | `/settlements/allocate` | POST | Bearer (`SUPER_ADMIN`, `FINANCE_ADMIN`, `OPERATIONS`) | Computes and stores post-delivery settlement allocation |
 | `/settlements/order/:orderId/allocation` | GET | Bearer (Merchant / Rider / Admin) | Reads order settlement breakdown |
 | `/settlements/cod/remit` | POST | Bearer (`requireRiderOwnership`, `codRemittanceRateLimiter`) | Submits rider COD remittance (`SUBMITTED`; does not clear liability until receipt + verification) |

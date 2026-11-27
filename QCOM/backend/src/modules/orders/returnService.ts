@@ -134,10 +134,23 @@ export class ReturnService {
       const returnRow = insReturnRes.rows[0];
       const returnItemsCreated: any[] = [];
 
+      // Aggregate duplicate orderItemId lines upfront so return ceiling cannot be bypassed
+      const mergedReturnMap = new Map<string, { orderItemId: string; quantity: number }>();
       for (const itemInput of params.items) {
-        if (!itemInput.quantity || itemInput.quantity <= 0) {
-          throw new Error(`INVALID_RETURN_QUANTITY: Requested return quantity must be greater than zero.`);
+        if (!itemInput.orderItemId || typeof itemInput.orderItemId !== 'string') {
+          throw new Error('INVALID_RETURN_ITEM: Valid orderItemId is required.');
         }
+        if (!Number.isInteger(itemInput.quantity) || itemInput.quantity <= 0) {
+          throw new Error(`INVALID_RETURN_QUANTITY: Requested return quantity must be a positive integer.`);
+        }
+        const prev = mergedReturnMap.get(itemInput.orderItemId);
+        mergedReturnMap.set(itemInput.orderItemId, {
+          orderItemId: itemInput.orderItemId,
+          quantity: (prev ? prev.quantity : 0) + itemInput.quantity,
+        });
+      }
+
+      for (const itemInput of mergedReturnMap.values()) {
 
         // Fetch original order item
         const oiRes = await client.query(`
@@ -540,6 +553,7 @@ export class ReturnService {
             amount: totalRefundAmount,
             reasonCode: `RETURN_${ret.reason_code}`,
             reasonDescription: params.qcNotes || 'Return QC inspection passed.',
+            idempotencyKey: `ret_qc_${ret.id}`,
             clientOverride: client,
           });
           refundRecord = refRes.refund;
@@ -662,6 +676,7 @@ export class ReturnService {
       totalRefundAmount: number;
       reasonCode: string;
       preparedRefund?: PreparedRefundIntent;
+      reusedCompletedRefund?: RefundRecord;
       passedItemIds: { id: string; orderItemId: string; productId: string; qty: number; refundAmount: number }[];
       failedItemIds: string[];
     }
@@ -771,24 +786,85 @@ export class ReturnService {
       }
 
       const reasonCode = `RETURN_${ret.reason_code}`;
-      const preparedRefund =
-        totalRefundAmount > 0
-          ? await refundService.prepareRefundIntent(
-              {
-                orderId: ret.order_id,
-                amount: totalRefundAmount,
-                reasonCode,
-                reasonDescription: params.qcNotes || 'Return QC inspection passed.',
-              },
-              client
-            )
-          : undefined;
+      let preparedRefund: PreparedRefundIntent | undefined;
+      let reusedCompletedRefund: RefundRecord | undefined;
+
+      if (totalRefundAmount > 0) {
+        let refundIdempKey = `ret_qc_${ret.id}`;
+
+        if (ret.refund_id) {
+          const existingRefRes = await client.query(
+            `SELECT * FROM refunds WHERE id = $1 FOR UPDATE`,
+            [ret.refund_id]
+          );
+          if (existingRefRes.rows.length > 0) {
+            const exRef = existingRefRes.rows[0];
+            if (['REQUESTED', 'PENDING', 'PROCESSING', 'UNKNOWN'].includes(exRef.status)) {
+              throw new Error(
+                `RETURN_QC_IN_PROGRESS: Refund '${exRef.refund_number}' for return '${ret.id}' is already in progress (${exRef.status}).`
+              );
+            }
+            if (exRef.status === 'COMPLETED') {
+              const exAmt = Number(roundCurrency(exRef.amount));
+              if (Math.abs(exAmt - totalRefundAmount) > 0.02) {
+                throw new Error(
+                  `RETURN_REFUND_MISMATCH: Completed refund '${exRef.refund_number}' (₹${exAmt.toFixed(2)}) does not match requested QC amount (₹${totalRefundAmount.toFixed(2)}).`
+                );
+              }
+              reusedCompletedRefund = {
+                id: exRef.id,
+                refundNumber: exRef.refund_number,
+                orderId: exRef.order_id,
+                paymentId: exRef.payment_id || undefined,
+                amount: parseFloat(exRef.amount),
+                currency: exRef.currency || 'INR',
+                reasonCode: exRef.reason_code,
+                reasonDescription: exRef.reason_description || undefined,
+                refundType: exRef.refund_type,
+                status: exRef.status,
+                providerRefundId: exRef.provider_refund_id || undefined,
+                idempotencyKey: exRef.idempotency_key || undefined,
+                createdBy: exRef.created_by || undefined,
+                processedAt: exRef.processed_at ? new Date(exRef.processed_at).toISOString() : undefined,
+                createdAt: new Date(exRef.created_at).toISOString(),
+                updatedAt: new Date(exRef.updated_at || exRef.created_at).toISOString(),
+              };
+            } else if (exRef.status === 'FAILED') {
+              const failCntRes = await client.query(
+                `SELECT COUNT(*) AS cnt FROM refunds WHERE order_id = $1 AND status = 'FAILED' AND idempotency_key LIKE $2`,
+                [ret.order_id, `ret_qc_${ret.id}%`]
+              );
+              const attempt = parseInt(String(failCntRes.rows[0]?.cnt || '1'), 10) + 1;
+              refundIdempKey = `ret_qc_${ret.id}_r${attempt}`;
+            }
+          }
+        }
+
+        if (!reusedCompletedRefund) {
+          preparedRefund = await refundService.prepareRefundIntent(
+            {
+              orderId: ret.order_id,
+              amount: totalRefundAmount,
+              reasonCode,
+              reasonDescription: params.qcNotes || 'Return QC inspection passed.',
+              idempotencyKey: refundIdempKey,
+            },
+            client
+          );
+
+          await client.query(
+            `UPDATE order_returns SET refund_id = $1 WHERE id = $2`,
+            [preparedRefund.refundRow.id, ret.id]
+          );
+        }
+      }
 
       return {
         ret,
         totalRefundAmount,
         reasonCode,
         preparedRefund,
+        reusedCompletedRefund,
         passedItemIds,
         failedItemIds,
       };
@@ -799,8 +875,8 @@ export class ReturnService {
     }
 
     // Phase 2 (OUTSIDE any DB TX): call payment gateway and persist refund state
-    let refundRecord: RefundRecord | undefined;
-    if (prep.preparedRefund) {
+    let refundRecord: RefundRecord | undefined = prep.reusedCompletedRefund;
+    if (!refundRecord && prep.preparedRefund) {
       const refExec = await refundService.executePreparedRefund({
         prepared: prep.preparedRefund,
         orderId: prep.ret.order_id,

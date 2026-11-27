@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { returnService } from '../modules/orders/returnService.js';
 import { authenticate } from '../middleware/auth.js';
+import { returnActionRateLimiter } from '../middleware/rateLimiter.js';
 import { requireOrderOwnership } from '../middleware/resourceOwnership.js';
 import { bloomFilterService } from '../modules/resilience/bloomFilterService.js';
 import { recordAuditEvent } from '../modules/audit/auditService.js';
@@ -83,7 +84,7 @@ export const returnRouter = Router();
  * POST /api/v1/orders/:orderId/returns
  * Customer requests return for delivered order
  */
-returnRouter.post('/orders/:orderId/returns', authenticate, async (req: Request, res: Response): Promise<void> => {
+returnRouter.post('/orders/:orderId/returns', authenticate, returnActionRateLimiter, async (req: Request, res: Response): Promise<void> => {
   try {
     const { orderId } = req.params;
     const { items, reasonCode, customerNotes } = req.body;
@@ -210,7 +211,7 @@ returnRouter.get('/returns/:returnId', authenticate, async (req: Request, res: R
  * POST /api/v1/returns/:returnId/review
  * Merchant or Admin reviews return request: APPROVE or REJECT
  */
-returnRouter.post('/returns/:returnId/review', authenticate, async (req: Request, res: Response): Promise<void> => {
+returnRouter.post('/returns/:returnId/review', authenticate, returnActionRateLimiter, async (req: Request, res: Response): Promise<void> => {
   try {
     const { returnId } = req.params;
     const { action, reasonNotes } = req.body;
@@ -250,7 +251,7 @@ returnRouter.post('/returns/:returnId/review', authenticate, async (req: Request
  * POST /api/v1/returns/:returnId/receive
  * Merchant confirms receipt of return items at store
  */
-returnRouter.post('/returns/:returnId/receive', authenticate, async (req: Request, res: Response): Promise<void> => {
+returnRouter.post('/returns/:returnId/receive', authenticate, returnActionRateLimiter, async (req: Request, res: Response): Promise<void> => {
   try {
     const { returnId } = req.params;
     const authz = await authorizeReturnMerchantAction(req, res, returnId);
@@ -279,7 +280,7 @@ returnRouter.post('/returns/:returnId/receive', authenticate, async (req: Reques
  * POST /api/v1/returns/:returnId/qc-inspect
  * Merchant inspects return items, triggers selective restock and refund
  */
-returnRouter.post('/returns/:returnId/qc-inspect', authenticate, async (req: Request, res: Response): Promise<void> => {
+returnRouter.post('/returns/:returnId/qc-inspect', authenticate, returnActionRateLimiter, async (req: Request, res: Response): Promise<void> => {
   try {
     const { returnId } = req.params;
     const { itemDecisions, qcNotes } = req.body;

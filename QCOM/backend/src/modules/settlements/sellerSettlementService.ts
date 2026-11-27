@@ -932,6 +932,10 @@ export class SellerSettlementService {
 
       const refundAmountBn = toDecimal(refundAmount);
       const grossGmvBn = toDecimal(alloc.gross_gmv || '0');
+      const allocSubsidyBn = toDecimal(alloc.platform_discount_subsidy || '0');
+      const alreadyRevSubsidyBn = toDecimal(alloc.reversed_platform_subsidy || '0');
+      const remainingSubsidyBn = BigNumber.max(0, allocSubsidyBn.minus(alreadyRevSubsidyBn));
+
       const allocCommBn = toDecimal(alloc.platform_commission || '0');
       const allocCommGstBn = toDecimal(alloc.commission_gst || '0');
       const allocTcsBn = toDecimal(alloc.gst_tcs_amount || '0');
@@ -948,6 +952,11 @@ export class SellerSettlementService {
         : refundAmountBn.gte(remainingReversibleNetBn);
 
       const ratioBn = grossGmvBn.gt(0) ? BigNumber.min(1, divide(refundAmountBn, grossGmvBn)) : new BigNumber(1);
+      const revSubsidyBn = isFullRemaining
+        ? remainingSubsidyBn
+        : BigNumber.min(remainingSubsidyBn, toDecimal(roundCurrency(multiply(allocSubsidyBn, ratioBn))));
+      const totalReversalValueBn = refundAmountBn.plus(revSubsidyBn);
+
       let revCommBn = toDecimal(roundCurrency(multiply(allocCommBn, ratioBn)));
       let revCommGstBn = toDecimal(roundCurrency(multiply(allocCommGstBn, ratioBn)));
       let revTcsBn = toDecimal(roundCurrency(multiply(allocTcsBn, ratioBn)));
@@ -955,9 +964,9 @@ export class SellerSettlementService {
       let revDelayPenaltyBn = toDecimal(roundCurrency(multiply(allocDelayPenaltyBn, ratioBn)));
       let revFeeTotalBn = add(revCommBn, revCommGstBn, revTcsBn, revTdsBn, revDelayPenaltyBn);
 
-      // Ensure revFeeTotal never exceeds refundAmount
-      if (revFeeTotalBn.gt(refundAmountBn) && revFeeTotalBn.gt(0)) {
-        const capScaleBn = divide(refundAmountBn, revFeeTotalBn);
+      // Ensure revFeeTotal never exceeds total return value (customer refund + subsidy unwind)
+      if (revFeeTotalBn.gt(totalReversalValueBn) && revFeeTotalBn.gt(0)) {
+        const capScaleBn = divide(totalReversalValueBn, revFeeTotalBn);
         revCommBn = toDecimal(roundCurrency(multiply(revCommBn, capScaleBn)));
         revCommGstBn = toDecimal(roundCurrency(multiply(revCommGstBn, capScaleBn)));
         revTcsBn = toDecimal(roundCurrency(multiply(revTcsBn, capScaleBn)));
@@ -967,18 +976,18 @@ export class SellerSettlementService {
       }
 
       let debitAmountBn: BigNumber;
-      if (isFullRemaining && totalOrigFeesBn.plus(remainingReversibleNetBn).lte(refundAmountBn.plus('0.05'))) {
+      if (isFullRemaining && totalOrigFeesBn.plus(remainingReversibleNetBn).lte(totalReversalValueBn.plus('0.05'))) {
         debitAmountBn = remainingReversibleNetBn;
       } else {
         debitAmountBn = min(
           remainingReversibleNetBn,
-          BigNumber.max(0, toDecimal(roundCurrency(refundAmountBn.minus(revFeeTotalBn))))
+          BigNumber.max(0, toDecimal(roundCurrency(totalReversalValueBn.minus(revFeeTotalBn))))
         );
       }
       const debitAmount = Number(roundCurrency(debitAmountBn));
 
-      // Align proportional fee if rounding pushed debitAmount + revFeeTotal != refundAmount
-      const remainderForFeesBn = BigNumber.max(0, refundAmountBn.minus(debitAmountBn));
+      // Align proportional fee if rounding pushed debitAmount + revFeeTotal != totalReversalValueBn
+      const remainderForFeesBn = BigNumber.max(0, totalReversalValueBn.minus(debitAmountBn));
       const feeGapBn = remainderForFeesBn.minus(revFeeTotalBn);
       if (!feeGapBn.isZero() && feeGapBn.abs().lte('0.05') && revCommBn.plus(feeGapBn).gte(0)) {
         revCommBn = toDecimal(roundCurrency(revCommBn.plus(feeGapBn)));
@@ -1033,11 +1042,12 @@ export class SellerSettlementService {
       const ordMethodRes = await client.query(`SELECT payment_method FROM orders WHERE id = $1 LIMIT 1`, [params.orderId]);
       const isCodOrder = isCodPaymentMethod(ordMethodRes.rows[0]?.payment_method);
 
-      // Record balanced General Ledger Entry (Reversal of fees + delay penalty + 2020 and/or 1040 vs Cr 1010/1020)
+      // Record balanced General Ledger Entry (Reversal of fees + delay penalty + 2020/1040 vs Cr 1010/1020 + 5040)
       await ledgerService.recordReturnRefund({
         orderId: params.orderId,
         merchantId: params.merchantId,
         refundAmount,
+        platformSubsidyReversal: Number(roundCurrency(revSubsidyBn)),
         payableReductionAmount: payableReduction,
         clawbackReceivableAmount: clawbackReceivable,
         commissionAmount: Number(roundCurrency(revCommBn)),
@@ -1052,14 +1062,21 @@ export class SellerSettlementService {
       });
 
       const updatedRefundedNetBn = toDecimal(roundCurrency(alreadyRefundedNetBn.plus(debitAmountBn)));
+      const updatedRevSubsidyBn = toDecimal(roundCurrency(alreadyRevSubsidyBn.plus(revSubsidyBn)));
       const markFullyReversed = isFullRemaining || updatedRefundedNetBn.gte(netSellerPayableBn.minus('0.01'));
 
       await client.query(`
         UPDATE order_settlement_allocations
         SET refunded_amount = $1,
-            status = CASE WHEN $2 THEN 'REVERSED' ELSE status END
-        WHERE order_id = $3
-      `, [Number(roundCurrency(updatedRefundedNetBn)), markFullyReversed, params.orderId]);
+            reversed_platform_subsidy = $2,
+            status = CASE WHEN $3 THEN 'REVERSED' ELSE status END
+        WHERE order_id = $4
+      `, [
+        Number(roundCurrency(updatedRefundedNetBn)),
+        Number(roundCurrency(updatedRevSubsidyBn)),
+        markFullyReversed,
+        params.orderId,
+      ]);
 
       return { isPostPayout, debitAmount, newBalance };
     };

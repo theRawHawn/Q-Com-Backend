@@ -126,6 +126,14 @@ export class PricingEngine {
       throw new PricingEngineError('EMPTY_CART', 'Cart must contain at least one line item.', 400);
     }
 
+    if (input.distanceKm !== undefined && input.distanceKm !== null) {
+      const distNum = Number(input.distanceKm);
+      if (!Number.isFinite(distNum) || distNum < 0) {
+        throw new PricingEngineError('INVALID_DISTANCE', 'distanceKm must be a finite non-negative number.', 400);
+      }
+    }
+
+    const mergedItemMap = new Map<string, { productId: string; quantity: number }>();
     for (const itm of input.items) {
       if (!itm.productId || typeof itm.productId !== 'string') {
         throw new PricingEngineError('INVALID_ITEM', 'Each line item must have a valid productId.', 400);
@@ -133,10 +141,14 @@ export class PricingEngine {
       if (!Number.isInteger(itm.quantity) || itm.quantity <= 0) {
         throw new PricingEngineError('INVALID_QUANTITY', `Quantity for product '${itm.productId}' must be a positive integer.`, 400);
       }
-      if (itm.quantity > 500) {
+      const prev = mergedItemMap.get(itm.productId);
+      const nextQty = (prev ? prev.quantity : 0) + itm.quantity;
+      if (nextQty > 500) {
         throw new PricingEngineError('EXCESSIVE_QUANTITY', `Quantity for product '${itm.productId}' exceeds maximum order limit of 500.`, 400);
       }
+      mergedItemMap.set(itm.productId, { productId: itm.productId, quantity: nextQty });
     }
+    const normalizedItems = Array.from(mergedItemMap.values());
 
     // 2. Load Authoritative Merchant and Validate Statutory State Codes
     const merchRes = await runner.query(
@@ -203,7 +215,7 @@ export class PricingEngine {
     }
 
     // 3. Load Authoritative Product Data, Inventory, and Verified Tax Classification (ZERO TRUST)
-    const productIds = input.items.map(i => i.productId);
+    const productIds = normalizedItems.map(i => i.productId);
     const prodRes = await runner.query(
       `SELECT p.id as product_id, p.sku, p.name, p.category, p.hsn_code, p.gst_rate_percent,
               si.selling_price, si.original_mrp, si.stock_count, si.reserved_count, si.is_available
@@ -220,7 +232,7 @@ export class PricingEngine {
     const sellerTaxMap = new Map<string, Awaited<ReturnType<typeof taxEngine.resolveSellerProductTax>>>();
     let grossCatalogTotalBn = new BigNumber(0);
 
-    for (const itm of input.items) {
+    for (const itm of normalizedItems) {
       if (!productMap.has(itm.productId)) {
         throw new PricingEngineError(
           'PRODUCT_NOT_AVAILABLE',
@@ -323,7 +335,7 @@ export class PricingEngine {
         {
           merchantId: input.merchantId,
           userId: input.userId,
-          items: input.items.map((itm) => {
+          items: normalizedItems.map((itm) => {
             const p = productMap.get(itm.productId);
             return {
               productId: itm.productId,
@@ -351,8 +363,8 @@ export class PricingEngine {
     let preDiscountTaxableSubtotalBn = new BigNumber(0);
     let totalItemDiscountTaxableBn = new BigNumber(0);
 
-    for (let idx = 0; idx < input.items.length; idx++) {
-      const itm = input.items[idx];
+    for (let idx = 0; idx < normalizedItems.length; idx++) {
+      const itm = normalizedItems[idx];
       const p = productMap.get(itm.productId);
       const cand = discountEval.items[idx];
       const sellerTax = sellerTaxMap.get(itm.productId)!;

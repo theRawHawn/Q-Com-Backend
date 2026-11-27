@@ -768,8 +768,8 @@ export async function runSprint16_0PricingGstCouponsPromotionsTests(): Promise<v
         [fakeInvId, `INV-FAKE-${Date.now()}`, anyOrdId, 'a'.repeat(64)]
       );
 
-      // 1b. Coupon usage_count drift -> COUPON_USAGE_COUNT_DRIFT
-      await pool.query(`UPDATE coupons SET usage_count = usage_count + 5 WHERE code = 'S16RACE3'`);
+      // 1b. Coupon usage_count drift -> COUPON_USAGE_COUNT_DRIFT (keep within usage_limit so DB CHECK holds)
+      await pool.query(`UPDATE coupons SET usage_count = usage_count - 1 WHERE code = 'S16RACE3'`);
 
       const reconRes = await paymentReconciliationService.runReconciliation({ triggeredBy: adminUserId });
       const cats = reconRes.discrepancies.map((d) => d.category);
@@ -778,7 +778,7 @@ export async function runSprint16_0PricingGstCouponsPromotionsTests(): Promise<v
 
       // Clean synthetic defects
       await pool.query(`DELETE FROM invoices WHERE id = $1`, [fakeInvId]);
-      await pool.query(`UPDATE coupons SET usage_count = usage_count - 5 WHERE code = 'S16RACE3'`);
+      await pool.query(`UPDATE coupons SET usage_count = usage_count + 1 WHERE code = 'S16RACE3'`);
 
       // 2. Admin Discount Funding Report + RBAC check (customer blocked 403)
       const custBlock = await apiCall('/api/v1/admin/discounts/report', { token: custAToken });

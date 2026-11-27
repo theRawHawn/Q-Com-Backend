@@ -1,11 +1,13 @@
 import { Router, Request, Response } from 'express';
 import { authenticate } from '../middleware/auth.js';
+import { cartRateLimiter } from '../middleware/rateLimiter.js';
 import { cartService } from '../modules/pricing/cartService.js';
 import { PricingEngineError } from '../modules/pricing/pricingEngine.js';
 import { TaxEngineError } from '../modules/pricing/taxEngine.js';
 import { CouponPromotionError } from '../modules/pricing/couponPromotionService.js';
 
 export const cartRouter = Router();
+cartRouter.use(cartRateLimiter);
 
 function handleCartError(res: Response, err: any, fallbackCode: string) {
   if (err instanceof PricingEngineError || err instanceof TaxEngineError || err instanceof CouponPromotionError) {

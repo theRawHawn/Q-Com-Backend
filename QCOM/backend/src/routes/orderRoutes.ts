@@ -138,14 +138,26 @@ orderRouter.post('/create', authenticate, checkoutRateLimiter, async (req: Reque
   };
 
   // 1. Deterministic Request Fingerprint
+  const canonicalItemsMap = new Map<string, number>();
+  for (const i of items) {
+    const pid = String(i.id || i.productId || '');
+    canonicalItemsMap.set(pid, (canonicalItemsMap.get(pid) || 0) + Number(i.quantity || 1));
+  }
   const normalizedPayload = {
     userId: req.auth!.userId,
-    items: items.map((i: any) => ({ productId: i.id || i.productId, quantity: Number(i.quantity || 1) })).sort((a, b) => a.productId.localeCompare(b.productId)),
+    merchantId: merchantId || null,
+    items: Array.from(canonicalItemsMap.entries())
+      .map(([productId, quantity]) => ({ productId, quantity }))
+      .sort((a, b) => a.productId.localeCompare(b.productId)),
     deliveryLocation: {
       latitude: normalizedDeliveryLocation.latitude,
       longitude: normalizedDeliveryLocation.longitude,
       address: normalizedDeliveryLocation.address || '',
     },
+    deliveryAddressId: deliveryAddressId || null,
+    placeOfSupplyStateCode: placeOfSupplyStateCode || null,
+    quoteId: quoteId || null,
+    expectedTotal: expectedTotal !== undefined && expectedTotal !== null ? Number(expectedTotal) : null,
     paymentMethod: paymentMethod || 'Instant UPI',
     couponCode: couponCode || null,
     isGstEnabled: !!isGstEnabled,

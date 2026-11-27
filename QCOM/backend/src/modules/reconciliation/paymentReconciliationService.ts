@@ -1288,6 +1288,314 @@ export class PaymentReconciliationService {
               }
             }
           }
+
+          // 14E: Order item totals vs pricing snapshot goods breakdown parity
+          const itemTotalsRes = await client.query(
+            `SELECT o.id AS order_id, o.pricing_snapshot,
+                    COALESCE(SUM(oi.taxable_amount), 0) AS sum_taxable,
+                    COALESCE(SUM(oi.cess_amount), 0) AS sum_cess,
+                    COALESCE(SUM(oi.line_total_payable), 0) AS sum_payable,
+                    COUNT(CASE WHEN oi.taxable_amount IS NOT NULL AND oi.line_total_payable IS NOT NULL THEN 1 END) AS priced_items
+             FROM orders o
+             JOIN order_items oi ON oi.order_id = o.id
+             WHERE o.pricing_snapshot IS NOT NULL
+               ${options.orderId ? 'AND o.id = $1' : ''}
+             GROUP BY o.id, o.pricing_snapshot
+             LIMIT 300`,
+            orderFilterParams
+          );
+          for (const r of itemTotalsRes.rows) {
+            if (Number(r.priced_items || 0) === 0) continue;
+            const snap = typeof r.pricing_snapshot === 'string' ? JSON.parse(r.pricing_snapshot) : r.pricing_snapshot;
+            const sgb = snap?.sellerGoodsBreakdown;
+            if (!sgb) continue;
+            const expTaxable = Number(roundCurrency(sgb.taxableAmount || 0));
+            const actTaxable = Number(roundCurrency(r.sum_taxable || 0));
+            const expPayable = Number(roundCurrency(sgb.totalSellerPayable || 0));
+            const actPayable = Number(roundCurrency(r.sum_payable || 0));
+            if (Math.abs(expTaxable - actTaxable) > 0.05 || Math.abs(expPayable - actPayable) > 0.05) {
+              detected.push({
+                discrepancyKey: `ORDER_ITEM_TOTALS_DRIFT:${r.order_id}`,
+                category: 'ORDER_ITEM_TOTALS_DRIFT',
+                severity: 'HIGH',
+                status: 'REQUIRES_REVIEW',
+                orderId: r.order_id,
+                expectedAmount: expPayable,
+                actualAmount: actPayable,
+                currency: 'INR',
+                details: { expectedTaxable: expTaxable, actualTaxable: actTaxable, expectedPayable: expPayable, actualPayable: actPayable },
+              });
+            }
+          }
+
+          // 14F: Invoice header vs invoice_line_items & Seller Invoice vs snapshot sellerGoodsBreakdown parity
+          const invLineRes = await client.query(
+            `SELECT i.id AS invoice_id, i.invoice_number, i.order_id, i.invoice_type, i.total_amount,
+                    COALESCE(SUM(ili.total_line_amount), 0) AS sum_lines,
+                    o.pricing_snapshot
+             FROM invoices i
+             JOIN orders o ON o.id = i.order_id
+             LEFT JOIN invoice_line_items ili ON ili.invoice_id = i.id
+             WHERE 1=1 ${options.orderId ? 'AND i.order_id = $1' : ''}
+             GROUP BY i.id, i.invoice_number, i.order_id, i.invoice_type, i.total_amount, o.pricing_snapshot
+             LIMIT 400`,
+            orderFilterParams
+          );
+          for (const r of invLineRes.rows) {
+            const invTotal = Number(roundCurrency(r.total_amount || 0));
+            const lineSum = Number(roundCurrency(r.sum_lines || 0));
+            if (Math.abs(invTotal - lineSum) > 0.05) {
+              detected.push({
+                discrepancyKey: `INVOICE_LINE_ITEMS_DRIFT:${r.invoice_id}`,
+                category: 'INVOICE_LINE_ITEMS_DRIFT',
+                severity: 'HIGH',
+                status: 'REQUIRES_REVIEW',
+                orderId: r.order_id,
+                expectedAmount: invTotal,
+                actualAmount: lineSum,
+                currency: 'INR',
+                details: { invoiceId: r.invoice_id, invoiceNumber: r.invoice_number, invoiceType: r.invoice_type },
+              });
+            }
+            if (r.invoice_type === 'SELLER_TAX_INVOICE' && r.pricing_snapshot) {
+              const snap = typeof r.pricing_snapshot === 'string' ? JSON.parse(r.pricing_snapshot) : r.pricing_snapshot;
+              const sgbTotal = snap?.sellerGoodsBreakdown?.totalSellerPayable;
+              if (sgbTotal !== undefined && sgbTotal !== null) {
+                const expSellerInv = Number(roundCurrency(sgbTotal));
+                if (Math.abs(expSellerInv - invTotal) > 0.05) {
+                  detected.push({
+                    discrepancyKey: `ORDER_INVOICE_TOTAL_DRIFT:${r.order_id}`,
+                    category: 'ORDER_INVOICE_TOTAL_DRIFT',
+                    severity: 'HIGH',
+                    status: 'REQUIRES_REVIEW',
+                    orderId: r.order_id,
+                    expectedAmount: expSellerInv,
+                    actualAmount: invTotal,
+                    currency: 'INR',
+                    details: { invoiceId: r.invoice_id, invoiceNumber: r.invoice_number },
+                  });
+                }
+              }
+            }
+          }
+
+          // 14G: Credit note header vs line sum, cumulative credit note vs invoice ceiling, missing parent invoice link, & refunded_quantity bound
+          const cnIntegrityRes = await client.query(
+            `SELECT cn.id AS cn_id, cn.credit_note_number, cn.order_id, cn.invoice_id, cn.total_amount,
+                    COALESCE(SUM(cnl.total_line_amount), 0) AS sum_lines
+             FROM credit_notes cn
+             LEFT JOIN credit_note_line_items cnl ON cnl.credit_note_id = cn.id
+             WHERE 1=1 ${options.orderId ? 'AND cn.order_id = $1' : ''}
+             GROUP BY cn.id, cn.credit_note_number, cn.order_id, cn.invoice_id, cn.total_amount
+             LIMIT 300`,
+            orderFilterParams
+          );
+          const cnSumByOrder = new Map<string, number>();
+          for (const r of cnIntegrityRes.rows) {
+            const cnTot = Number(roundCurrency(r.total_amount || 0));
+            const cnLines = Number(roundCurrency(r.sum_lines || 0));
+            cnSumByOrder.set(r.order_id, (cnSumByOrder.get(r.order_id) || 0) + cnTot);
+            if (Math.abs(cnTot - cnLines) > 0.05) {
+              detected.push({
+                discrepancyKey: `CREDIT_NOTE_INTEGRITY_DRIFT:${r.cn_id}`,
+                category: 'CREDIT_NOTE_INTEGRITY_DRIFT',
+                severity: 'HIGH',
+                status: 'REQUIRES_REVIEW',
+                orderId: r.order_id,
+                expectedAmount: cnTot,
+                actualAmount: cnLines,
+                currency: 'INR',
+                details: { creditNoteId: r.cn_id, creditNoteNumber: r.credit_note_number },
+              });
+            }
+          }
+          for (const [oid, cumCnTotal] of cnSumByOrder.entries()) {
+            const sInvRes = await client.query(
+              `SELECT id, total_amount FROM invoices WHERE order_id = $1 AND invoice_type = 'SELLER_TAX_INVOICE' LIMIT 1`,
+              [oid]
+            );
+            if (sInvRes.rows.length > 0) {
+              const invMax = Number(roundCurrency(sInvRes.rows[0].total_amount || 0));
+              if (cumCnTotal > invMax + 0.05) {
+                detected.push({
+                  discrepancyKey: `CREDIT_NOTE_EXCEEDS_INVOICE:${oid}`,
+                  category: 'CREDIT_NOTE_EXCEEDS_INVOICE',
+                  severity: 'CRITICAL',
+                  status: 'REQUIRES_REVIEW',
+                  orderId: oid,
+                  expectedAmount: invMax,
+                  actualAmount: Number(roundCurrency(cumCnTotal)),
+                  currency: 'INR',
+                  details: { invoiceId: sInvRes.rows[0].id },
+                });
+              }
+            }
+          }
+
+          const badRefundQtyRes = await client.query(
+            `SELECT id AS order_item_id, order_id, quantity, COALESCE(refunded_quantity, 0) AS refunded_quantity
+             FROM order_items
+             WHERE COALESCE(refunded_quantity, 0) > quantity
+               ${options.orderId ? 'AND order_id = $1' : ''}
+             LIMIT 200`,
+            orderFilterParams
+          );
+          for (const r of badRefundQtyRes.rows) {
+            detected.push({
+              discrepancyKey: `ORDER_ITEM_REFUND_QTY_EXCEEDED:${r.order_item_id}`,
+              category: 'ORDER_ITEM_REFUND_QTY_EXCEEDED',
+              severity: 'CRITICAL',
+              status: 'REQUIRES_REVIEW',
+              orderId: r.order_id,
+              expectedAmount: Number(r.quantity),
+              actualAmount: Number(r.refunded_quantity),
+              details: { orderItemId: r.order_item_id },
+            });
+          }
+
+          // 14H: Coupon & promotion limit caps + order-status consistency
+          if (!options.orderId) {
+            const overCapCoupons = await client.query(
+              `SELECT id, code, usage_count, usage_limit FROM coupons WHERE usage_limit IS NOT NULL AND usage_count > usage_limit`
+            );
+            for (const r of overCapCoupons.rows) {
+              detected.push({
+                discrepancyKey: `COUPON_USAGE_LIMIT_EXCEEDED:${r.id}`,
+                category: 'COUPON_USAGE_LIMIT_EXCEEDED',
+                severity: 'CRITICAL',
+                status: 'REQUIRES_REVIEW',
+                expectedAmount: Number(r.usage_limit),
+                actualAmount: Number(r.usage_count),
+                details: { couponId: r.id, code: r.code },
+              });
+            }
+            const overCapPromos = await client.query(
+              `SELECT id, code, usage_count, usage_limit FROM promotions WHERE usage_limit IS NOT NULL AND usage_count > usage_limit`
+            );
+            for (const r of overCapPromos.rows) {
+              detected.push({
+                discrepancyKey: `PROMOTION_USAGE_LIMIT_EXCEEDED:${r.id}`,
+                category: 'PROMOTION_USAGE_LIMIT_EXCEEDED',
+                severity: 'CRITICAL',
+                status: 'REQUIRES_REVIEW',
+                expectedAmount: Number(r.usage_limit),
+                actualAmount: Number(r.usage_count),
+                details: { promotionId: r.id, code: r.code },
+              });
+            }
+          }
+
+          const staleCancelledRedemptions = await client.query(
+            `SELECT cr.id, cr.order_id, cr.coupon_code, cr.status
+             FROM coupon_redemptions cr
+             JOIN orders o ON o.id = cr.order_id
+             WHERE o.status = 'cancelled'
+               AND cr.status IN ('RESERVED', 'REDEEMED')
+               ${options.orderId ? 'AND cr.order_id = $1' : ''}
+             LIMIT 200`,
+            orderFilterParams
+          );
+          for (const r of staleCancelledRedemptions.rows) {
+            detected.push({
+              discrepancyKey: `COUPON_CANCELLED_ORDER_UNRELEASED:${r.id}`,
+              category: 'COUPON_CANCELLED_ORDER_UNRELEASED',
+              severity: 'HIGH',
+              status: 'REQUIRES_REVIEW',
+              orderId: r.order_id,
+              details: { redemptionId: r.id, couponCode: r.coupon_code, redemptionStatus: r.status },
+            });
+          }
+
+          const releasedOnPaid = await client.query(
+            `SELECT cr.id, cr.order_id, cr.coupon_code
+             FROM coupon_redemptions cr
+             JOIN orders o ON o.id = cr.order_id
+             WHERE o.payment_status = 'PAID'
+               AND o.status NOT IN ('cancelled', 'returned')
+               AND cr.status = 'RELEASED'
+               ${options.orderId ? 'AND cr.order_id = $1' : ''}
+             LIMIT 200`,
+            orderFilterParams
+          );
+          for (const r of releasedOnPaid.rows) {
+            detected.push({
+              discrepancyKey: `PAID_ORDER_COUPON_RELEASED:${r.id}`,
+              category: 'PAID_ORDER_COUPON_RELEASED',
+              severity: 'HIGH',
+              status: 'REQUIRES_REVIEW',
+              orderId: r.order_id,
+              details: { redemptionId: r.id, couponCode: r.coupon_code },
+            });
+          }
+
+          // 14I: COA 5040 platform discount subsidy GL & return-reversal parity
+          const subsidyAllocRes = await client.query(
+            `SELECT osa.order_id, osa.status, osa.platform_discount_subsidy,
+                    COALESCE(osa.reversed_platform_subsidy, 0) AS reversed_platform_subsidy
+             FROM order_settlement_allocations osa
+             WHERE osa.platform_discount_subsidy > 0
+               ${options.orderId ? 'AND osa.order_id = $1' : ''}
+             LIMIT 300`,
+            orderFilterParams
+          );
+          for (const r of subsidyAllocRes.rows) {
+            const glRes = await client.query(
+              `SELECT
+                 COALESCE(SUM(CASE WHEN entry_side = 'DEBIT' THEN amount ELSE 0 END), 0) AS debits,
+                 COALESCE(SUM(CASE WHEN entry_side = 'CREDIT' THEN amount ELSE 0 END), 0) AS credits
+               FROM general_ledger_entries
+               WHERE order_id = $1 AND account_code = '5040'`,
+              [r.order_id]
+            );
+            const expectedDebit = Number(roundCurrency(r.platform_discount_subsidy || 0));
+            const actualDebit = Number(roundCurrency(glRes.rows[0]?.debits || 0));
+            const actualCredit = Number(roundCurrency(glRes.rows[0]?.credits || 0));
+            const expectedRev = Number(roundCurrency(r.reversed_platform_subsidy || 0));
+
+            if (Math.abs(expectedDebit - actualDebit) > 0.02 || Math.abs(expectedRev - actualCredit) > 0.02) {
+              detected.push({
+                discrepancyKey: `COA_5040_SUBSIDY_DRIFT:${r.order_id}`,
+                category: 'COA_5040_SUBSIDY_DRIFT',
+                severity: 'HIGH',
+                status: 'REQUIRES_REVIEW',
+                orderId: r.order_id,
+                expectedAmount: expectedDebit,
+                actualAmount: actualDebit,
+                currency: 'INR',
+                details: { allocationStatus: r.status, expectedDebit, actualDebit, expectedCredit: expectedRev, actualCredit },
+              });
+            }
+          }
+
+          // 14J: Journal-batch double-entry Debit == Credit parity audit
+          const batchBalRes = await client.query(
+            `SELECT journal_batch_id,
+                    MIN(order_id::text) AS order_id,
+                    SUM(CASE WHEN entry_side = 'DEBIT' THEN amount ELSE 0 END) AS total_debits,
+                    SUM(CASE WHEN entry_side = 'CREDIT' THEN amount ELSE 0 END) AS total_credits
+             FROM general_ledger_entries
+             WHERE 1=1 ${options.orderId ? 'AND order_id = $1' : ''}
+             GROUP BY journal_batch_id
+             LIMIT 1000`,
+            orderFilterParams
+          );
+          for (const r of batchBalRes.rows) {
+            const debits = Number(roundCurrency(r.total_debits || 0));
+            const credits = Number(roundCurrency(r.total_credits || 0));
+            if (Math.abs(debits - credits) > 0.01) {
+              detected.push({
+                discrepancyKey: `UNBALANCED_JOURNAL_BATCH:${r.journal_batch_id}`,
+                category: 'UNBALANCED_JOURNAL_BATCH',
+                severity: 'CRITICAL',
+                status: 'REQUIRES_REVIEW',
+                orderId: r.order_id || undefined,
+                expectedAmount: debits,
+                actualAmount: credits,
+                currency: 'INR',
+                details: { journalBatchId: r.journal_batch_id },
+              });
+            }
+          }
         } catch (err: any) {
           if (!isMissingSprint16SchemaError(err)) throw err;
         }

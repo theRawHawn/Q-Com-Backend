@@ -60,11 +60,12 @@ import { runSprint15_7TransactionCodReverseTripIntegrityTests } from './sprint15
 import { runSprint15_8GatewayAgnosticPaymentInfrastructureTests } from './sprint15-8-gateway-agnostic-payment-infrastructure.test.js';
 import { runSprint15_9CodCashAccountabilityTests } from './sprint15-9-cod-cash-accountability.test.js';
 import { runSprint16_0PricingGstCouponsPromotionsTests } from './sprint16-0-pricing-gst-coupons-promotions.test.js';
+import { runSprint16_1IndependentFinancialIntegrityTests } from './sprint16-1-independent-financial-integrity.test.js';
 import { verifyRedisExactVersion } from '../scripts/verify-redis-version.js';
 
 async function runAllTests() {
   console.log('===========================================================');
-  console.log('  QCOM Unified Backend Engine — Automated Test Suite (Sprint 1–16.0)');
+  console.log('  QCOM Unified Backend Engine — Automated Test Suite (Sprint 1–16.1)');
   console.log('===========================================================');
   const start = Date.now();
   try {
@@ -215,6 +216,9 @@ async function runAllTests() {
 
     // Sprint 16.0 Pricing, GST, Coupons, Discounts & Promotion Financial Integrity Tests
     await runSprint16_0PricingGstCouponsPromotionsTests();
+
+    // Sprint 16.1 Independent Financial Integrity Verification & Remediation Gate Tests
+    await runSprint16_1IndependentFinancialIntegrityTests();
 
     const duration = ((Date.now() - start) / 1000).toFixed(2);
     console.log('\n===========================================================');

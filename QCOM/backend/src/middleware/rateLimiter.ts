@@ -297,6 +297,48 @@ export const codRemittanceRateLimiter = createSlidingWindowRateLimiter({
   skipInTest: true,
 });
 
+// Pricing & Checkout Quote Computation (60 req / min, failureMode: 'open')
+export const pricingQuoteRateLimiter = createSlidingWindowRateLimiter({
+  limit: 60,
+  windowSec: 60,
+  keyGenerator: (req: Request) => [
+    ...(req.auth?.userId ? [{ key: `user:${req.auth.userId}` }] : []),
+    { key: `ip:${req.ip || req.socket.remoteAddress || '127.0.0.1'}`, limit: 120 },
+  ],
+  scope: 'pricing:quote',
+  errorMessage: 'Pricing calculation rate limit exceeded. Please wait before retrying.',
+  failureMode: 'open',
+  skipInTest: true,
+});
+
+// Coupon Code Validation Brute-Force Protection (20 req / min, failureMode: 'closed')
+export const couponValidationRateLimiter = createSlidingWindowRateLimiter({
+  limit: 20,
+  windowSec: 60,
+  keyGenerator: (req: Request) => [
+    ...(req.auth?.userId ? [{ key: `user:${req.auth.userId}` }] : []),
+    { key: `ip:${req.ip || req.socket.remoteAddress || '127.0.0.1'}`, limit: 40 },
+  ],
+  scope: 'pricing:coupon_validate',
+  errorMessage: 'Too many coupon validation attempts. Please wait before trying again.',
+  failureMode: 'closed',
+  skipInTest: true,
+});
+
+// Return Request, Review, Receipt & QC Actions (30 req / min, failureMode: 'closed')
+export const returnActionRateLimiter = createSlidingWindowRateLimiter({
+  limit: 30,
+  windowSec: 60,
+  keyGenerator: (req: Request) => [
+    ...(req.auth?.userId ? [{ key: `user:${req.auth.userId}` }] : []),
+    { key: `ip:${req.ip || req.socket.remoteAddress || '127.0.0.1'}`, limit: 60 },
+  ],
+  scope: 'return:action',
+  errorMessage: 'Return operation rate limit reached. Please wait before retrying.',
+  failureMode: 'closed',
+  skipInTest: true,
+});
+
 function createHash(value: string): string {
   return hash('sha256').update(value).digest('hex');
 }

@@ -1,7 +1,7 @@
 # QCOM Automated Testing Architecture & Suite Guide (TESTING)
 
 **Test Framework:** Node.js Native Test Runner / `tsx` Execution  
-**Current Test Coverage:** 60 Comprehensive Test Suites  
+**Current Test Coverage:** 61 Comprehensive Test Suites  
 **Required Real Services:** PostgreSQL 16 (`16.x`) & Redis **7.0.15** (`redis:7.0.15-alpine`)  
 
 ---
@@ -38,7 +38,7 @@ Before running `tests/run-all-tests.ts`, a mandatory preflight check (`verifyRed
 
 ---
 
-## 3. Test Battery Organization & Suite Matrix (60 Suites)
+## 3. Test Battery Organization & Suite Matrix (61 Suites)
 
 | Milestone / Sprint | Suite File | Scope Covered |
 | :--- | :--- | :--- |
@@ -63,13 +63,14 @@ Before running `tests/run-all-tests.ts`, a mandatory preflight check (`verifyRed
 | **Gateway-Agnostic Payment Infrastructure** | `sprint15-8-gateway-agnostic-payment-infrastructure.test.ts` | PaymentProvider boundary (`DisabledPaymentProvider`), CAS state machine, PG-backed idempotency keys, multi-partial refund ceilings, reconciliation discrepancies & recovery escalation |
 | **COD Cash Accountability & Reconciliation** | `sprint15-9-cod-cash-accountability.test.ts` | Server-derived `cod_collections`, COD return refund GL (`1020`), decimal metrics A–H, ceiling blocking/overrides, 3-stage remittance SoD (`submitted <> received <> verified`), shortage/excess disputes, reversals, COD reconciliation checks 13–13F, Redis fail-closed rate limiting |
 | **Pricing, GST, Coupons & Promotions Integrity** | `sprint16-0-pricing-gst-coupons-promotions.test.ts` | Decimal-safe `bignumber.js` GST (`tax_inclusive`/`tax_exclusive`, Cess, fail-closed `422`), dynamic POS (`indian_states`), coupon `FOR UPDATE` concurrency & slot release, promotions (`CART_SLAB`, `BOGO`, `FREE_DELIVERY`), DB carts & `409 PRICE_CHANGED`/`QUOTE_EXPIRED`, prorated partial/full returns & GST Credit Notes, honest `irn: null`, COA `5040` GL parity, Check 14 reconciliation & admin RBAC |
+| **Independent Financial Integrity Verification & Remediation** | `sprint16-1-independent-financial-integrity.test.ts` | Duplicate-line merge & `distanceKm` bounds, quote ownership/merchant/single-use/drift checks, canonical POS idempotency fingerprint, discount remainder rounding, under-lock `PROMOTION_INACTIVE`, `FREE_DELIVERY` return safety, auto-linked parent invoice & 3-step sequential partial return ₹0.00 parity, 3-phase QC crash recovery, COA `5040` full unwind, Check `14E–14J` & Redis rate-limiter failure modes |
 
 ---
 
 ## 4. Test Isolation & Database Fixtures
 
 - Test suites execute against real PostgreSQL 16 (`qcom_test` or isolated schemas/databases) and real Redis **7.0.15**.
-- Migrations `001`–`031` are applied in order using PostgreSQL advisory locks (`pg_advisory_lock`).
+- Migrations `001`–`032` are applied in order using PostgreSQL advisory locks (`pg_advisory_lock`).
 - Fixtures and initial seeds (`runSeeds()`) establish baseline roles, permissions, chart of accounts, statutory tax rules, and test merchants (including `EMP-001` with non-production Scrypt seed password `SEED_ADMIN_PASSWORD`).
-- GitHub Actions CI (`.github/workflows/ci.yml`) provisions PostgreSQL 16 and `redis:7.0.15-alpine`, runs `verify-redis-version.ts`, applies migrations `001`–`031`, runs `seed.ts`, executes all 60 backend test suites (`run-all-tests.ts`), executes `npm --prefix QCOM/backend run test:integration:real-services` against isolated containers (`postgres:16.6-alpine` & `redis:7.0.15-alpine`, including 200-way real PG16 concurrent coupon exhaustion race), and validates `tsc --noEmit`, `npm run lint`, and builds.
+- GitHub Actions CI (`.github/workflows/ci.yml`) provisions PostgreSQL 16 and `redis:7.0.15-alpine`, runs `verify-redis-version.ts`, applies migrations `001`–`032`, runs `seed.ts`, executes all 61 backend test suites (`run-all-tests.ts`), executes `npm --prefix QCOM/backend run test:integration:real-services` against isolated containers (`postgres:16.6-alpine` & `redis:7.0.15-alpine`, including 200-way real PG16 coupon race, dual `first_order_only` concurrency, delayed webhook preservation, concurrent QC refund/CN lock, COA `5040` unwind & `couponValidationRateLimiter` verification), and validates `tsc --noEmit`, `npm run lint`, and builds.
 

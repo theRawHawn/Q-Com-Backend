@@ -88,10 +88,11 @@ export class OrderService {
 
     // 2. Authoritative calculation + reservation + persistence inside single PostgreSQL transaction
     const result = await transaction(async (client: pg.PoolClient) => {
-      // If caller passed a quoteId, verify it has not expired
+      // If caller passed a quoteId, verify ownership, merchant scope, single-use & expiry under lock
+      let lockedQuoteTotal: string | null = null;
       if (input.quoteId) {
         const quoteRowRes = await client.query(
-          `SELECT id, grand_total, expires_at, user_id, merchant_id
+          `SELECT id, grand_total, expires_at, user_id, merchant_id, is_converted_to_order, order_id
              FROM pricing_calculation_snapshots
             WHERE id = $1
             FOR UPDATE`,
@@ -101,6 +102,27 @@ export class OrderService {
           throw new PricingEngineError('QUOTE_NOT_FOUND', `Pricing quote '${input.quoteId}' does not exist.`, 404);
         }
         const qRow = quoteRowRes.rows[0];
+        if (qRow.user_id && qRow.user_id !== input.userId) {
+          throw new PricingEngineError(
+            'QUOTE_ACCESS_DENIED',
+            'Access forbidden: This pricing quote belongs to a different customer.',
+            403
+          );
+        }
+        if (qRow.merchant_id && qRow.merchant_id !== merchantId) {
+          throw new PricingEngineError(
+            'QUOTE_MERCHANT_MISMATCH',
+            'Pricing quote belongs to a different merchant than this order.',
+            409
+          );
+        }
+        if (qRow.is_converted_to_order || qRow.order_id) {
+          throw new PricingEngineError(
+            'QUOTE_ALREADY_USED',
+            `Pricing quote '${input.quoteId}' has already been converted to an order.`,
+            409
+          );
+        }
         if (qRow.expires_at && new Date(qRow.expires_at).getTime() <= Date.now()) {
           throw new PricingEngineError(
             'QUOTE_EXPIRED',
@@ -108,6 +130,7 @@ export class OrderService {
             409
           );
         }
+        lockedQuoteTotal = roundCurrency(qRow.grand_total);
       }
 
       // Compute fresh authoritative pricing inside this transaction BEFORE stock reservation
@@ -130,6 +153,14 @@ export class OrderService {
         client
       );
 
+      if (lockedQuoteTotal !== null && !toDecimal(lockedQuoteTotal).eq(toDecimal(pricingQuote.grandTotal))) {
+        throw new PricingEngineError(
+          'PRICE_CHANGED',
+          `Checkout total changed since quote creation from ₹${lockedQuoteTotal} to ₹${pricingQuote.grandTotal}. Please review the updated pricing before confirming.`,
+          409
+        );
+      }
+
       if (input.expectedTotal !== undefined && input.expectedTotal !== null) {
         const expectedStr = roundCurrency(input.expectedTotal);
         if (!toDecimal(expectedStr).eq(toDecimal(pricingQuote.grandTotal))) {
@@ -141,11 +172,11 @@ export class OrderService {
         }
       }
 
-      // Reserve stock with transactional locking
+      // Reserve stock with transactional locking (using merged authoritative quantities)
       await inventoryService.reserveStock(
         orderId,
         merchantId!,
-        input.items,
+        pricingQuote.items.map(i => ({ productId: i.productId, quantity: i.quantity })),
         env.RESERVATION_TTL_MINUTES,
         client
       );
@@ -277,12 +308,16 @@ export class OrderService {
 
       // Mark pricing snapshot(s) converted
       await client.query(
-        `UPDATE pricing_calculation_snapshots SET is_converted_to_order = TRUE, order_id = $1 WHERE id = $2`,
+        `UPDATE pricing_calculation_snapshots
+            SET is_converted_to_order = TRUE, order_id = $1, converted_at = NOW()
+          WHERE id = $2`,
         [orderId, pricingQuote.quoteId]
       );
       if (input.quoteId && input.quoteId !== pricingQuote.quoteId) {
         await client.query(
-          `UPDATE pricing_calculation_snapshots SET is_converted_to_order = TRUE, order_id = $1 WHERE id = $2`,
+          `UPDATE pricing_calculation_snapshots
+              SET is_converted_to_order = TRUE, order_id = $1, converted_at = NOW()
+            WHERE id = $2`,
           [orderId, input.quoteId]
         );
       }

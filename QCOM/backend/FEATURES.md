@@ -10,21 +10,21 @@
 | **RBAC** | Multi-Role & Tenant Isolation | **IMPLEMENTED** | `src/modules/rbac/rbacService.ts`, permission guards |
 | **Catalog** | Geofenced Product Browsing | **IMPLEMENTED** | `src/routes/pricingRoutes.ts`, coordinate bounding |
 | **Pricing Engine** | Decimal-Safe Indian GST, Cess & Dynamic POS | **IMPLEMENTED** | `src/modules/pricing/taxEngine.ts`, `money.ts` (`bignumber.js`), `indian_states`, `tax_inclusive`/`tax_exclusive`, fail-closed `422` |
-| **Pricing Engine** | Concurrency-Safe Coupons & Promotions | **IMPLEMENTED** | `couponPromotionService.ts`, `FOR UPDATE` slots, `CART_SLAB`/`BOGO`/`FREE_DELIVERY`, conflict groups, `SELLER`/`PLATFORM`/`SHARED` splits |
-| **Pricing Engine** | DB Cart & Checkout Price-Drift Guard | **IMPLEMENTED** | `cartService.ts` (`/api/v1/cart`), `409 PRICE_CHANGED` / `QUOTE_EXPIRED` in `orderService.ts` |
-| **Invoices & Returns** | GST Credit Notes & Prorated Return Refunds | **IMPLEMENTED** | `invoiceService.ts`, `returnService.ts` (`credit_notes` against `line_total_payable`, dynamic Apr–Mar FY) |
+| **Pricing Engine** | Concurrency-Safe Coupons & Promotions | **IMPLEMENTED** | `couponPromotionService.ts`, `users` + coupon/promo `FOR UPDATE` slots, `PROMOTION_INACTIVE` guard, deterministic remainder sweep, `FREE_DELIVERY` preservation |
+| **Pricing Engine** | DB Cart & Checkout Price-Drift Guard | **IMPLEMENTED** | `cartService.ts` (`/api/v1/cart`), single-use `quoteId` (`converted_at`), ownership/merchant/`409 PRICE_CHANGED`/`QUOTE_EXPIRED` in `orderService.ts` |
+| **Invoices & Returns** | GST Credit Notes & Prorated Return Refunds | **IMPLEMENTED** | `invoiceService.ts`, `returnService.ts` (`uq_credit_notes_return_type`, parent invoice auto-link, final-step sequential clamp, crash-safe QC refund idempotency) |
 | **Inventory** | Selective Stock Reservation | **IMPLEMENTED** | `inventory_reservations` table with expiration TTL |
-| **Inventory** | Zero-Oversell Serialization | **IMPLEMENTED** | Row-level locks (`SELECT ... FOR UPDATE`), check constraints |
+| **Inventory** | Zero-Oversell Serialization | **IMPLEMENTED** | Row-level locks (`SELECT ... FOR UPDATE`), check constraints, duplicate-line merge before stock check |
 | **Inventory** | Back-in-Stock Alerts | **IMPLEMENTED** | Outbox events, `stockNotificationConsumer.ts` |
-| **Orders** | Full Order Lifecycle | **IMPLEMENTED** | `src/modules/orders/orderService.ts`, state machine |
-| **Orders** | Idempotent Cancellation | **IMPLEMENTED** | Single-release stock restoration, terminal state locks, atomic coupon/promo slot release |
-| **Payments** | Provider-Agnostic Abstraction | **IMPLEMENTED** | `PaymentProvider` interface, `MockPaymentProvider` sandbox |
+| **Orders** | Full Order Lifecycle | **IMPLEMENTED** | `src/modules/orders/orderService.ts`, canonical idempotency payload fingerprint, state machine |
+| **Orders** | Idempotent Cancellation | **IMPLEMENTED** | Single-release stock restoration, terminal state locks, atomic coupon/promo slot release (`RELEASED` irreversible by late webhooks) |
+| **Payments** | Provider-Agnostic Abstraction | **IMPLEMENTED** | `PaymentProvider` interface, no gateway selected (by design), `MockPaymentProvider` sandbox |
 | **Payments** | Webhook Deduplication | **IMPLEMENTED** | `financialWebhookService.ts`, unique `event_id` constraints |
 | **Payments** | Distributed Recovery Worker | **IMPLEMENTED** | `financialRecoveryWorker.ts`, lease fencing |
-| **Settlement** | Double-Entry General Ledger | **IMPLEMENTED** | `ledgerService.ts`, balanced `journal_entries`, COA `5040` platform subsidy, Migration 027 `LEDGER_IMMUTABLE` triggers |
+| **Settlement** | Double-Entry General Ledger | **IMPLEMENTED** | `ledgerService.ts`, balanced `journal_entries`, COA `5040` grant + proportional return reversal (`reversed_platform_subsidy`), `LEDGER_IMMUTABLE` triggers |
 | **Settlement** | Statutory Withholding (TDS/TCS)| **IMPLEMENTED**| Section 194-O / Sec 393 & Section 52 GST-TCS |
 | **Settlement** | Idempotent Payout, FIFO & Reversal | **IMPLEMENTED** | `sellerSettlementService.ts`, `riderPayoutService.ts`, FIFO `settled_amount`/`refunded_amount`, post-`PAID` reversal webhooks & `1040->2020` clawback offset |
-| **Reconciliation** | Automated Audit Checks (1–14) | **IMPLEMENTED** | `paymentReconciliationService.ts` (payments, COD checks 13–13F, pricing/GST/coupon checks 14A–14D) |
+| **Reconciliation** | Automated Audit Checks (1–14J) | **IMPLEMENTED** | `paymentReconciliationService.ts` (payments, COD `13–13F`, pricing/GST/coupons `14A–14D`, invoice/CN/refund/COA5040/GL `14E–14J`) |
 | **Dispatch** | Trip Broadcasting & Claiming | **IMPLEMENTED** | Atomic `UPDATE ... WHERE status = 'BROADCASTING'` |
 | **Delivery** | Doorstep OTP Handshake | **IMPLEMENTED** | Constant-time verification via `orders.delivery_otp`, server-derived COD collection (`partnerCompatibilityRoutes.ts`) |
 | **Realtime** | WebSocket Event Streaming | **IMPLEMENTED** | `/ws/v1`, channel authorization (`order:<id>`) |

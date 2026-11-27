@@ -120,59 +120,91 @@ function allocateDiscountProportionally(
     };
   }
 
-  const { sellerShare, platformShare } = splitFundingShares(
-    cappedTotal,
-    fundingSource,
-    sellerSharePercent
-  );
-
-  let remainingDiscount = cappedTotal;
-  let remainingSeller = sellerShare;
-  let remainingPlatform = platformShare;
+  let allocatedSoFar = new BigNumber(0);
+  const perItemAlloc: Array<{ it: DiscountCandidateItem; share: BigNumber }> = [];
 
   for (let i = 0; i < eligibleItems.length; i++) {
     const it = eligibleItems[i];
     const isLast = i === eligibleItems.length - 1;
     let share: BigNumber;
-    let itemSeller: BigNumber;
-    let itemPlatform: BigNumber;
 
     if (isLast) {
-      share = BigNumber.min(remainingDiscount, it.remainingLine);
-      itemSeller = BigNumber.min(remainingSeller, share);
-      itemPlatform = subtract(share, itemSeller);
+      share = BigNumber.min(subtract(cappedTotal, allocatedSoFar), it.remainingLine);
     } else {
       const ratio = divide(it.remainingLine, totalRemaining);
-      share = BigNumber.min(toDecimal(roundCurrency(multiply(cappedTotal, ratio))), it.remainingLine);
-      remainingDiscount = subtract(remainingDiscount, share);
-
-      if (cappedTotal.isGreaterThan(0)) {
-        itemSeller = toDecimal(roundCurrency(multiply(sellerShare, divide(share, cappedTotal))));
-        itemSeller = BigNumber.min(itemSeller, remainingSeller, share);
-        itemPlatform = subtract(share, itemSeller);
-        remainingSeller = subtract(remainingSeller, itemSeller);
-        remainingPlatform = subtract(remainingPlatform, itemPlatform);
-      } else {
-        itemSeller = new BigNumber(0);
-        itemPlatform = new BigNumber(0);
-      }
+      share = BigNumber.min(
+        subtract(cappedTotal, allocatedSoFar),
+        toDecimal(roundCurrency(multiply(cappedTotal, ratio))),
+        it.remainingLine
+      );
     }
+    share = BigNumber.max(0, share);
+    allocatedSoFar = add(allocatedSoFar, share);
+    perItemAlloc.push({ it, share });
+  }
 
-    if (share.isGreaterThan(0)) {
-      it.remainingLine = subtract(it.remainingLine, share);
-      it.appliedDiscounts.push({
-        sourceType,
-        sourceId,
-        code,
-        discountAmount: roundCurrency(share),
-        sellerShareAmount: roundCurrency(itemSeller),
-        platformShareAmount: roundCurrency(itemPlatform),
-        fundingSource,
-      });
+  // Sweep any 1-paisa cap remainder onto other eligible items with headroom so sum(items) === actualDiscount
+  let residual = subtract(cappedTotal, allocatedSoFar);
+  if (residual.gt(0)) {
+    for (const entry of perItemAlloc) {
+      if (residual.lte(0)) break;
+      const headroom = subtract(entry.it.remainingLine, entry.share);
+      if (headroom.gt(0)) {
+        const extra = BigNumber.min(residual, headroom);
+        entry.share = add(entry.share, extra);
+        allocatedSoFar = add(allocatedSoFar, extra);
+        residual = subtract(residual, extra);
+      }
     }
   }
 
-  return { actualDiscount: cappedTotal, sellerShare, platformShare };
+  const actualDiscount = toDecimal(roundCurrency(allocatedSoFar));
+  const { sellerShare: targetSellerShare } = splitFundingShares(
+    actualDiscount,
+    fundingSource,
+    sellerSharePercent
+  );
+
+  let remainingSeller = targetSellerShare;
+  let actualSellerSum = new BigNumber(0);
+  let actualPlatformSum = new BigNumber(0);
+
+  for (let i = 0; i < perItemAlloc.length; i++) {
+    const { it, share } = perItemAlloc[i];
+    if (share.lte(0)) continue;
+
+    const isLastPositive = perItemAlloc.slice(i + 1).every((e) => e.share.lte(0));
+    let itemSeller: BigNumber;
+    if (isLastPositive) {
+      itemSeller = BigNumber.min(remainingSeller, share);
+    } else if (actualDiscount.gt(0)) {
+      itemSeller = toDecimal(roundCurrency(multiply(targetSellerShare, divide(share, actualDiscount))));
+      itemSeller = BigNumber.min(itemSeller, remainingSeller, share);
+    } else {
+      itemSeller = new BigNumber(0);
+    }
+    const itemPlatform = subtract(share, itemSeller);
+    remainingSeller = subtract(remainingSeller, itemSeller);
+    actualSellerSum = add(actualSellerSum, itemSeller);
+    actualPlatformSum = add(actualPlatformSum, itemPlatform);
+
+    it.remainingLine = subtract(it.remainingLine, share);
+    it.appliedDiscounts.push({
+      sourceType,
+      sourceId,
+      code,
+      discountAmount: roundCurrency(share),
+      sellerShareAmount: roundCurrency(itemSeller),
+      platformShareAmount: roundCurrency(itemPlatform),
+      fundingSource,
+    });
+  }
+
+  return {
+    actualDiscount,
+    sellerShare: toDecimal(roundCurrency(actualSellerSum)),
+    platformShare: toDecimal(roundCurrency(actualPlatformSum)),
+  };
 }
 
 export class CouponPromotionService {
@@ -599,10 +631,20 @@ export class CouponPromotionService {
     const { client, orderId, userId, merchantId, appliedCoupon, appliedPromotions } = params;
     const targetCouponStatus = params.initialStatus === 'REDEEMED' ? 'REDEEMED' : 'RESERVED';
     const targetPromoStatus = params.initialStatus === 'REDEEMED' ? 'APPLIED' : 'RESERVED';
+    const hasDiscounts = Boolean((appliedCoupon && appliedCoupon.code) || (appliedPromotions && appliedPromotions.length > 0));
+
+    // Lock user row upfront before locking coupons/promotions to serialize per-user limit & first-order checks
+    // with a canonical lock hierarchy (users -> coupons -> promotions) that prevents cross-coupon deadlocks.
+    if (hasDiscounts && userId) {
+      await client.query(`SELECT id FROM users WHERE id = $1 FOR UPDATE`, [userId]);
+    }
+
+    const nowMs = Date.now();
 
     if (appliedCoupon && appliedCoupon.code) {
       const lockRes = await client.query(
-        `SELECT id, code, usage_limit, usage_count, per_user_limit, first_order_only, is_active, valid_from, valid_to
+        `SELECT id, code, usage_limit, usage_count, per_user_limit, first_order_only, is_active,
+                valid_from, valid_to, applicable_merchant_id
            FROM coupons
           WHERE UPPER(code) = $1
           FOR UPDATE`,
@@ -614,6 +656,20 @@ export class CouponPromotionService {
       }
 
       const c = lockRes.rows[0];
+      if (c.valid_from && new Date(c.valid_from).getTime() > nowMs) {
+        throw new CouponPromotionError('COUPON_NOT_YET_VALID', `Coupon '${c.code}' is not active yet.`, 422);
+      }
+      if (c.valid_to && new Date(c.valid_to).getTime() < nowMs) {
+        throw new CouponPromotionError('COUPON_EXPIRED', `Coupon '${c.code}' has expired.`, 422);
+      }
+      if (c.applicable_merchant_id && c.applicable_merchant_id !== merchantId) {
+        throw new CouponPromotionError(
+          'COUPON_MERCHANT_MISMATCH',
+          `Coupon '${c.code}' is not valid for this merchant.`,
+          422
+        );
+      }
+
       if (c.usage_limit !== null && Number(c.usage_count) >= Number(c.usage_limit)) {
         throw new CouponPromotionError(
           'COUPON_USAGE_LIMIT_EXCEEDED',
@@ -697,16 +753,38 @@ export class CouponPromotionService {
     }
 
     if (appliedPromotions && appliedPromotions.length > 0) {
-      for (const promo of appliedPromotions) {
+      const sortedPromos = [...appliedPromotions].sort((a, b) => a.sourceId.localeCompare(b.sourceId));
+      for (const promo of sortedPromos) {
         const pLock = await client.query(
-          `SELECT id, code, usage_limit, usage_count, per_user_limit, first_order_only, is_active
+          `SELECT id, code, usage_limit, usage_count, per_user_limit, first_order_only, is_active,
+                  valid_from, valid_to, applicable_merchant_id
              FROM promotions
             WHERE id = $1
             FOR UPDATE`,
           [promo.sourceId]
         );
-        if (pLock.rows.length === 0 || !pLock.rows[0].is_active) continue;
+        if (pLock.rows.length === 0 || !pLock.rows[0].is_active) {
+          throw new CouponPromotionError(
+            'PROMOTION_INACTIVE',
+            `Promotion '${promo.code}' was deactivated concurrently before checkout confirmation.`,
+            409
+          );
+        }
         const p = pLock.rows[0];
+
+        if (p.valid_from && new Date(p.valid_from).getTime() > nowMs) {
+          throw new CouponPromotionError('PROMOTION_INACTIVE', `Promotion '${p.code}' is not active yet.`, 409);
+        }
+        if (p.valid_to && new Date(p.valid_to).getTime() < nowMs) {
+          throw new CouponPromotionError('PROMOTION_EXPIRED', `Promotion '${p.code}' has expired.`, 409);
+        }
+        if (p.applicable_merchant_id && p.applicable_merchant_id !== merchantId) {
+          throw new CouponPromotionError(
+            'PROMOTION_MERCHANT_MISMATCH',
+            `Promotion '${p.code}' does not apply to this merchant.`,
+            409
+          );
+        }
 
         if (p.usage_limit !== null && Number(p.usage_count) >= Number(p.usage_limit)) {
           throw new CouponPromotionError(
@@ -726,6 +804,20 @@ export class CouponPromotionService {
             throw new CouponPromotionError(
               'PROMOTION_USER_LIMIT_EXCEEDED',
               `Per-user limit reached for promotion '${p.code}'.`,
+              422
+            );
+          }
+        }
+
+        if (p.first_order_only) {
+          const priorOrders = await client.query(
+            `SELECT COUNT(*) AS cnt FROM orders WHERE user_id = $1 AND id != $2 AND status != 'cancelled'`,
+            [userId, orderId]
+          );
+          if (Number(priorOrders.rows[0]?.cnt || 0) > 0) {
+            throw new CouponPromotionError(
+              'PROMOTION_FIRST_ORDER_ONLY',
+              `Promotion '${p.code}' is valid exclusively for a customer's first order.`,
               422
             );
           }
@@ -869,10 +961,19 @@ export class CouponPromotionService {
     }
 
     const promoRows = await client.query(
-      `SELECT id, discount_amount, reversed_amount, status FROM promotion_applications WHERE order_id = $1 FOR UPDATE`,
+      `SELECT id, discount_amount, reversed_amount, status, metadata
+         FROM promotion_applications
+        WHERE order_id = $1
+        FOR UPDATE`,
       [orderId]
     );
     for (const row of promoRows.rows) {
+      const meta = typeof row.metadata === 'string' ? JSON.parse(row.metadata) : row.metadata || {};
+      // Delivery-fee promotions are NOT refunded on item returns, so never mark FREE_DELIVERY reversed on returns.
+      if (meta?.discountTarget === 'DELIVERY') {
+        continue;
+      }
+
       const totalDisc = toDecimal(row.discount_amount);
       const currRev = toDecimal(row.reversed_amount || 0);
       const addRev = isFullReturn

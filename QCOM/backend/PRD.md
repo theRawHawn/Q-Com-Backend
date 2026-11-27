@@ -1,7 +1,7 @@
 # QCOM Platform — Product Requirements Document (PRD)
 
-**Document Version:** 1.0.0 (Sprint 14.6 Release Baseline)  
-**Status:** Approved / Active Baseline  
+**Document Version:** 1.2.0 (Sprint 16.1 Staging Verified Baseline)  
+**Status:** Approved for Staging (Gateway & Statutory Tax Counsel Sign-offs Pending Production)  
 **Audience:** Engineering, Architecture, Product, Operations  
 
 ---
@@ -59,18 +59,17 @@ The core mandate is **zero-inventory-oversell, tamper-proof statutory tax compli
 
 ## 4. Core Business Workflows
 
-1. **Checkout & Quoting:** Calculate distance-based delivery fees, rain/night surge, handling fees, and GST rates (CGST + SGST for intra-state; IGST for inter-state) with sub-cent BigNumber rounding.
-2. **Order Placement & Stock Commitment:** Row-level locking (`SELECT ... FOR UPDATE`) prevents overselling. Stock reservations transition atomically to committed upon successful checkout.
+1. **Checkout & Quoting:** Calculate distance-based delivery fees, handling fees, coupon/promotion splits, and GST/Cess (`tax_inclusive`/`tax_exclusive`; CGST + SGST intra-state vs. IGST inter-state via `indian_states`) with `bignumber.js` rounding and single-use quote (`409 PRICE_CHANGED`/`QUOTE_EXPIRED`) validation.
+2. **Order Placement & Stock Commitment:** Row-level locking (`SELECT ... FOR UPDATE`) serializes inventory stock, user `first_order_only` constraints, and coupon/promotion redemption slots without overselling or over-redemption.
 3. **Dispatch & Assignment:** Proximity-based delivery trip broadcasting. Concurrency-safe atomic updates ensure a single rider claims the trip without race conditions.
-4. **Fulfillment Handshake:** Dual-confirmation model: store handover token followed by customer delivery OTP verification.
-5. **Settlement & Payouts:** Post-delivery financial posting into immutable double-entry ledgers (`journal_entries`), statutory withholding calculation (1% TDS u/s 194-O, 0.5% GST-TCS u/s 52), and idempotent payout release.
+4. **Fulfillment Handshake & COD Custody:** Dual-confirmation customer delivery OTP handshake with server-derived COD collection tracking and 3-stage separation-of-duties cash remittance (`SUBMITTED -> RECEIVED -> VERIFIED`).
+5. **Settlement, Returns & Credit Notes:** Post-delivery posting into immutable double-entry ledgers (`LEDGER_IMMUTABLE`, including COA `5040` subsidy grant and return reversal), statutory withholding (Sec 194-O / 393 & Sec 52 GST-TCS), sequential prorated partial/full returns with crash-safe QC recovery, and GST Credit Notes (`irn: null` unless IRP enabled).
 
 ---
 
 ## 5. Non-Functional Requirements & Invariants
 
-- **Zero-Oversell Invariant:** Stock deductions and selective reservations are strictly serialized in PostgreSQL transactions.
-- **Statutory Financial Integrity:** Every transaction adheres to double-entry bookkeeping (Debits == Credits). Ledger entries are append-only.
-- **Idempotent Webhook Processing:** Webhooks from payment or banking gateways are recorded durably with unique constraints on `event_id` and idempotent state transitions.
-- **Fail-Safe Offline Mode:** In the absence of live third-party gateway credentials, payments fail safely (`HTTP 400 Bad Request`) without ghost authorizations or false captures.
+- **Zero-Oversell & Single-Use Slot Invariants:** Stock deductions, coupon/promotion slots, and checkout quotes are strictly serialized in PostgreSQL 16 transactions.
+- **Statutory Financial Integrity:** Every transaction adheres to double-entry bookkeeping (Debits == Credits), append-only immutable ledgers, and read-only Checks 1–14J reconciliation.
+- **Gateway-Neutral & Fail-Closed Tax Compliance:** No payment gateway is hardcoded by design; products/services missing verified HSN/SAC or active `statutory_tax_rules` fail closed (`422`) with zero guessed tax rates or fabricated IRNs.
 - **Data Protection & Privacy:** No plaintext tokens, OTPs, or credentials in browser `localStorage`, URLs, or application logs.

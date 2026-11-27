@@ -1074,6 +1074,7 @@ export class LedgerService {
     gstTcsAmount?: number;
     sellerTdsAmount?: number;
     storeDelayPenalty?: number;
+    platformSubsidyReversal?: number;
     returnId?: string;
     refundId?: string;
     refundNumber?: string;
@@ -1085,6 +1086,7 @@ export class LedgerService {
     const refundOutAccount = params.creditAccountCode || '1010';
 
     const refundTotal = assertPositiveMoney(params.refundAmount, 'refundAmount');
+    const platformSubsidyReversal = assertNonNegativeMoney(params.platformSubsidyReversal || 0, 'platformSubsidyReversal');
     const targetAccount = params.isPostPayout ? '1040' : '2020';
 
     const comm = assertNonNegativeMoney(params.commissionAmount || 0, 'commissionAmount');
@@ -1205,6 +1207,18 @@ export class LedgerService {
           : `Gateway refund disbursed to customer for order ${params.orderId}`,
       orderId: params.orderId,
     });
+
+    // 4. Credit COA 5040 (Promotional Subsidy Expense Reversal) when platform-funded discount is clawed back on return
+    if (platformSubsidyReversal > 0) {
+      entries.push({
+        account: '5040',
+        side: 'CREDIT',
+        amount: platformSubsidyReversal,
+        narration: `Reversal of platform-funded promotional subsidy upon return for order ${params.orderId}`,
+        orderId: params.orderId,
+        merchantId: params.merchantId,
+      });
+    }
 
     let totalDebitsBn = entries
       .filter((e) => e.side === 'DEBIT')

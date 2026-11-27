@@ -31,10 +31,10 @@ export class InvoiceService {
   /**
    * Generates or retrieves statutory GST invoices for an order
    */
-  public async getOrCreateOrderInvoices(orderId: string): Promise<InvoiceData[]> {
-    const pool = getPool();
+  public async getOrCreateOrderInvoices(orderId: string, clientOverride?: pg.PoolClient): Promise<InvoiceData[]> {
+    const runner: pg.Pool | pg.PoolClient = clientOverride || getPool();
 
-    const existingRes = await pool.query(
+    const existingRes = await runner.query(
       `SELECT * FROM invoices WHERE order_id = $1 ORDER BY created_at ASC`,
       [orderId]
     );
@@ -42,12 +42,12 @@ export class InvoiceService {
     if (existingRes.rows.length > 0) {
       const invoices: InvoiceData[] = [];
       for (const inv of existingRes.rows) {
-        const lineItemsRes = await pool.query(
+        const lineItemsRes = await runner.query(
           `SELECT * FROM invoice_line_items WHERE invoice_id = $1`,
           [inv.id]
         );
         const posName = inv.place_of_supply_state_code
-          ? await taxEngine.getStateName(inv.place_of_supply_state_code, pool)
+          ? await taxEngine.getStateName(inv.place_of_supply_state_code, runner)
           : null;
 
         invoices.push({
@@ -95,7 +95,7 @@ export class InvoiceService {
       return invoices;
     }
 
-    const orderRes = await pool.query(
+    const orderRes = await runner.query(
       `SELECT o.*, m.name as merchant_name, m.business_name as merchant_business_name,
               m.gstin as merchant_gstin, m.state_code as merchant_state_code
          FROM orders o
@@ -110,7 +110,7 @@ export class InvoiceService {
     }
 
     const o = orderRes.rows[0];
-    const itemsRes = await pool.query(`SELECT * FROM order_items WHERE order_id = $1`, [orderId]);
+    const itemsRes = await runner.query(`SELECT * FROM order_items WHERE order_id = $1`, [orderId]);
     const snapshot = typeof o.pricing_snapshot === 'string'
       ? JSON.parse(o.pricing_snapshot)
       : o.pricing_snapshot || {};
@@ -181,88 +181,83 @@ export class InvoiceService {
       `EINV:${eInvoicingStatus}`,
     ].join('|');
 
-    // Bucket B: QCOM Platform Service Invoice (BigNumber + Dynamic State Rules)
+    // Bucket B: QCOM Platform Service Invoice (Read frozen pricing snapshot charges first; fail closed on missing tax rule)
     const deliveryFeeBn = toDecimal(o.delivery_fee || '0.00');
     const handlingFeeBn = toDecimal(o.handling_fee || '0.00');
     const qcomTaxableBn = add(deliveryFeeBn, handlingFeeBn);
+    const snapshotCharges: any[] = Array.isArray(snapshot.charges) ? snapshot.charges : [];
+    const snapDelivery = snapshotCharges.find((c) => c.chargeType === 'DELIVERY');
+    const snapHandling = snapshotCharges.find((c) => c.chargeType === 'HANDLING');
 
     let deliveryLineCalc = {
-      gstRatePercent: '18.00',
-      cgstAmount: '0.00',
-      sgstAmount: '0.00',
-      igstAmount: '0.00',
-      totalGstAmount: '0.00',
-      sacCode: '996813',
+      gstRatePercent: snapDelivery?.gstRatePercent ?? '0.00',
+      cgstAmount: snapDelivery?.cgstAmount ?? '0.00',
+      sgstAmount: snapDelivery?.sgstAmount ?? '0.00',
+      igstAmount: snapDelivery?.igstAmount ?? '0.00',
+      totalGstAmount: snapDelivery
+        ? roundCurrency(
+            snapDelivery.taxAmount ??
+              snapDelivery.totalGstAmount ??
+              add(snapDelivery.cgstAmount ?? '0', snapDelivery.sgstAmount ?? '0', snapDelivery.igstAmount ?? '0')
+          )
+        : '0.00',
+      sacCode: snapDelivery?.sacCode ?? '996813',
     };
     let handlingLineCalc = {
-      gstRatePercent: '18.00',
-      cgstAmount: '0.00',
-      sgstAmount: '0.00',
-      igstAmount: '0.00',
-      totalGstAmount: '0.00',
-      sacCode: '998319',
+      gstRatePercent: snapHandling?.gstRatePercent ?? '0.00',
+      cgstAmount: snapHandling?.cgstAmount ?? '0.00',
+      sgstAmount: snapHandling?.sgstAmount ?? '0.00',
+      igstAmount: snapHandling?.igstAmount ?? '0.00',
+      totalGstAmount: snapHandling
+        ? roundCurrency(
+            snapHandling.taxAmount ??
+              snapHandling.totalGstAmount ??
+              add(snapHandling.cgstAmount ?? '0', snapHandling.sgstAmount ?? '0', snapHandling.igstAmount ?? '0')
+          )
+        : '0.00',
+      sacCode: snapHandling?.sacCode ?? '998319',
     };
 
-    if (deliveryFeeBn.gt(0) && qcomStateCode && placeOfSupplyStateCode) {
-      try {
-        const rule = await taxEngine.resolveServiceTaxRule('DELIVERY_GST', new Date(txnDate), pool);
-        const calc = taxEngine.calculateGst({
-          taxableAmount: deliveryFeeBn,
-          taxRule: rule,
-          merchantStateCode: qcomStateCode,
-          placeOfSupplyStateCode,
-        });
-        deliveryLineCalc = {
-          gstRatePercent: calc.gstRatePercent,
-          cgstAmount: calc.cgstAmount,
-          sgstAmount: calc.sgstAmount,
-          igstAmount: calc.igstAmount,
-          totalGstAmount: calc.totalGstAmount,
-          sacCode: rule.hsn_or_sac_code,
-        };
-      } catch {
-        const gst = roundCurrency(multiply(deliveryFeeBn, '0.18'));
-        const half = roundCurrency(divide(gst, 2));
-        deliveryLineCalc = {
-          gstRatePercent: '18.00',
-          cgstAmount: qcomInterState ? '0.00' : half,
-          sgstAmount: qcomInterState ? '0.00' : roundCurrency(subtract(gst, half)),
-          igstAmount: qcomInterState ? gst : '0.00',
-          totalGstAmount: gst,
-          sacCode: '996813',
-        };
+    if (deliveryFeeBn.gt(0) && !snapDelivery) {
+      if (!qcomStateCode || !placeOfSupplyStateCode) {
+        throw new Error(`MISSING_TAX_JURISDICTION: Cannot compute delivery fee GST for order ${orderId} without supplier and place-of-supply state codes.`);
       }
+      const rule = await taxEngine.resolveServiceTaxRule('DELIVERY_GST', new Date(txnDate), runner);
+      const calc = taxEngine.calculateGst({
+        taxableAmount: deliveryFeeBn,
+        taxRule: rule,
+        merchantStateCode: qcomStateCode,
+        placeOfSupplyStateCode,
+      });
+      deliveryLineCalc = {
+        gstRatePercent: calc.gstRatePercent,
+        cgstAmount: calc.cgstAmount,
+        sgstAmount: calc.sgstAmount,
+        igstAmount: calc.igstAmount,
+        totalGstAmount: calc.totalGstAmount,
+        sacCode: rule.hsn_or_sac_code,
+      };
     }
 
-    if (handlingFeeBn.gt(0) && qcomStateCode && placeOfSupplyStateCode) {
-      try {
-        const rule = await taxEngine.resolveServiceTaxRule('HANDLING_GST', new Date(txnDate), pool);
-        const calc = taxEngine.calculateGst({
-          taxableAmount: handlingFeeBn,
-          taxRule: rule,
-          merchantStateCode: qcomStateCode,
-          placeOfSupplyStateCode,
-        });
-        handlingLineCalc = {
-          gstRatePercent: calc.gstRatePercent,
-          cgstAmount: calc.cgstAmount,
-          sgstAmount: calc.sgstAmount,
-          igstAmount: calc.igstAmount,
-          totalGstAmount: calc.totalGstAmount,
-          sacCode: rule.hsn_or_sac_code,
-        };
-      } catch {
-        const gst = roundCurrency(multiply(handlingFeeBn, '0.18'));
-        const half = roundCurrency(divide(gst, 2));
-        handlingLineCalc = {
-          gstRatePercent: '18.00',
-          cgstAmount: qcomInterState ? '0.00' : half,
-          sgstAmount: qcomInterState ? '0.00' : roundCurrency(subtract(gst, half)),
-          igstAmount: qcomInterState ? gst : '0.00',
-          totalGstAmount: gst,
-          sacCode: '998319',
-        };
+    if (handlingFeeBn.gt(0) && !snapHandling) {
+      if (!qcomStateCode || !placeOfSupplyStateCode) {
+        throw new Error(`MISSING_TAX_JURISDICTION: Cannot compute handling fee GST for order ${orderId} without supplier and place-of-supply state codes.`);
       }
+      const rule = await taxEngine.resolveServiceTaxRule('HANDLING_GST', new Date(txnDate), runner);
+      const calc = taxEngine.calculateGst({
+        taxableAmount: handlingFeeBn,
+        taxRule: rule,
+        merchantStateCode: qcomStateCode,
+        placeOfSupplyStateCode,
+      });
+      handlingLineCalc = {
+        gstRatePercent: calc.gstRatePercent,
+        cgstAmount: calc.cgstAmount,
+        sgstAmount: calc.sgstAmount,
+        igstAmount: calc.igstAmount,
+        totalGstAmount: calc.totalGstAmount,
+        sacCode: rule.hsn_or_sac_code,
+      };
     }
 
     const qcomCgstStr = roundCurrency(add(deliveryLineCalc.cgstAmount, handlingLineCalc.cgstAmount));
@@ -270,7 +265,7 @@ export class InvoiceService {
     const qcomIgstStr = roundCurrency(add(deliveryLineCalc.igstAmount, handlingLineCalc.igstAmount));
     const qcomTotalStr = roundCurrency(add(qcomTaxableBn, qcomCgstStr, qcomSgstStr, qcomIgstStr));
 
-    await transaction(async (client) => {
+    const writeInvoices = async (client: pg.PoolClient) => {
       // 1. Seller Goods Tax Invoice (Form GST INV-1)
       const insSellerInv = await client.query(
         `INSERT INTO invoices (
@@ -422,9 +417,15 @@ export class InvoiceService {
           ]
         );
       }
-    });
+    };
 
-    return this.getOrCreateOrderInvoices(orderId);
+    if (clientOverride) {
+      await writeInvoices(clientOverride);
+    } else {
+      await transaction(writeInvoices);
+    }
+
+    return this.getOrCreateOrderInvoices(orderId, clientOverride);
   }
 
   /**
@@ -476,10 +477,17 @@ export class InvoiceService {
         return null;
       }
 
-      const sellerInvRes = await client.query(
+      let sellerInvRes = await client.query(
         `SELECT id FROM invoices WHERE order_id = $1 AND invoice_type = 'SELLER_TAX_INVOICE' LIMIT 1`,
         [params.orderId]
       );
+      if (sellerInvRes.rows.length === 0) {
+        await this.getOrCreateOrderInvoices(params.orderId, client);
+        sellerInvRes = await client.query(
+          `SELECT id FROM invoices WHERE order_id = $1 AND invoice_type = 'SELLER_TAX_INVOICE' LIMIT 1`,
+          [params.orderId]
+        );
+      }
       const sellerInvId: string | null = sellerInvRes.rows[0]?.id || null;
 
       const sellerStateCode: string | null = o.merchant_state_code || null;
@@ -521,12 +529,41 @@ export class InvoiceService {
           row.taxable_amount !== null && row.taxable_amount !== undefined
             ? toDecimal(row.taxable_amount)
             : toDecimal(row.line_total_payable ?? row.total_price ?? '0');
+        const baseCgst = toDecimal(row.cgst_amount || '0');
+        const baseSgst = toDecimal(row.sgst_amount || '0');
+        const baseIgst = toDecimal(row.igst_amount || '0');
+        const baseCess = toDecimal(row.cess_amount || '0');
 
-        const lineTaxable = roundCurrency(multiply(baseTaxable, ratio));
-        const lineCgst = roundCurrency(multiply(toDecimal(row.cgst_amount || '0'), ratio));
-        const lineSgst = roundCurrency(multiply(toDecimal(row.sgst_amount || '0'), ratio));
-        const lineIgst = roundCurrency(multiply(toDecimal(row.igst_amount || '0'), ratio));
-        const lineCess = roundCurrency(multiply(toDecimal(row.cess_amount || '0'), ratio));
+        const priorCnRes = await client.query(
+          `SELECT COALESCE(SUM(cnl.quantity), 0) AS prior_qty,
+                  COALESCE(SUM(cnl.taxable_value), 0) AS prior_taxable,
+                  COALESCE(SUM(cnl.cgst_amount), 0) AS prior_cgst,
+                  COALESCE(SUM(cnl.sgst_amount), 0) AS prior_sgst,
+                  COALESCE(SUM(cnl.igst_amount), 0) AS prior_igst,
+                  COALESCE(SUM(cnl.cess_amount), 0) AS prior_cess
+             FROM credit_note_line_items cnl
+             JOIN credit_notes cn ON cnl.credit_note_id = cn.id
+            WHERE cnl.order_item_id = $1
+              AND cn.order_id = $2`,
+          [row.order_item_id, params.orderId]
+        );
+        const prior = priorCnRes.rows[0] || {};
+        const priorQty = parseInt(String(prior.prior_qty || '0'), 10);
+        const isFinalItemReturn = priorQty + retQty >= origQty;
+
+        const clampComponent = (totalBn: BigNumber, priorVal: any) => {
+          const remainingBn = BigNumber.max(0, totalBn.minus(toDecimal(priorVal || '0')));
+          if (isFinalItemReturn) {
+            return roundCurrency(remainingBn);
+          }
+          return roundCurrency(BigNumber.min(remainingBn, toDecimal(roundCurrency(multiply(totalBn, ratio)))));
+        };
+
+        const lineTaxable = clampComponent(baseTaxable, prior.prior_taxable);
+        const lineCgst = clampComponent(baseCgst, prior.prior_cgst);
+        const lineSgst = clampComponent(baseSgst, prior.prior_sgst);
+        const lineIgst = clampComponent(baseIgst, prior.prior_igst);
+        const lineCess = clampComponent(baseCess, prior.prior_cess);
         const lineTotal = roundCurrency(add(lineTaxable, lineCgst, lineSgst, lineIgst, lineCess));
 
         sumTaxableBn = add(sumTaxableBn, lineTaxable);
