@@ -633,10 +633,10 @@ export class CouponPromotionService {
     const targetPromoStatus = params.initialStatus === 'REDEEMED' ? 'APPLIED' : 'RESERVED';
     const hasDiscounts = Boolean((appliedCoupon && appliedCoupon.code) || (appliedPromotions && appliedPromotions.length > 0));
 
-    // Lock user row upfront before locking coupons/promotions to serialize per-user limit & first-order checks
-    // with a canonical lock hierarchy (users -> coupons -> promotions) that prevents cross-coupon deadlocks.
+    // Lock user row with FOR NO KEY UPDATE (never FOR UPDATE, which conflicts with FK FOR KEY SHARE locks
+    // from pricing_calculation_snapshots/orders in concurrent transactions) in canonical order: users -> coupons -> promotions.
     if (hasDiscounts && userId) {
-      await client.query(`SELECT id FROM users WHERE id = $1 FOR UPDATE`, [userId]);
+      await client.query(`SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, [userId]);
     }
 
     const nowMs = Date.now();
@@ -647,7 +647,7 @@ export class CouponPromotionService {
                 valid_from, valid_to, applicable_merchant_id
            FROM coupons
           WHERE UPPER(code) = $1
-          FOR UPDATE`,
+          FOR NO KEY UPDATE`,
         [appliedCoupon.code.trim().toUpperCase()]
       );
 
@@ -760,7 +760,7 @@ export class CouponPromotionService {
                   valid_from, valid_to, applicable_merchant_id
              FROM promotions
             WHERE id = $1
-            FOR UPDATE`,
+            FOR NO KEY UPDATE`,
           [promo.sourceId]
         );
         if (pLock.rows.length === 0 || !pLock.rows[0].is_active) {

@@ -145,7 +145,6 @@ orderRouter.post('/create', authenticate, checkoutRateLimiter, async (req: Reque
   }
   const normalizedPayload = {
     userId: req.auth!.userId,
-    merchantId: merchantId || null,
     items: Array.from(canonicalItemsMap.entries())
       .map(([productId, quantity]) => ({ productId, quantity }))
       .sort((a, b) => a.productId.localeCompare(b.productId)),
@@ -154,14 +153,15 @@ orderRouter.post('/create', authenticate, checkoutRateLimiter, async (req: Reque
       longitude: normalizedDeliveryLocation.longitude,
       address: normalizedDeliveryLocation.address || '',
     },
-    deliveryAddressId: deliveryAddressId || null,
-    placeOfSupplyStateCode: placeOfSupplyStateCode || null,
-    quoteId: quoteId || null,
-    expectedTotal: expectedTotal !== undefined && expectedTotal !== null ? Number(expectedTotal) : null,
     paymentMethod: paymentMethod || 'Instant UPI',
     couponCode: couponCode || null,
     isGstEnabled: !!isGstEnabled,
     gstin: gstin || null,
+    ...(merchantId ? { merchantId } : {}),
+    ...(deliveryAddressId ? { deliveryAddressId } : {}),
+    ...(placeOfSupplyStateCode ? { placeOfSupplyStateCode } : {}),
+    ...(quoteId ? { quoteId } : {}),
+    ...(expectedTotal !== undefined && expectedTotal !== null ? { expectedTotal: Number(expectedTotal) } : {}),
   };
   const requestFingerprint = crypto.createHash('sha256').update(JSON.stringify(normalizedPayload)).digest('hex');
 
