@@ -1753,7 +1753,7 @@ async function runSprint16_1PostgresChecks(freshPool: import('pg').Pool): Promis
   console.log('[PG16-16.1] Verifying multi-connection first_order_only serialization & zero deadlock...');
   const foUserId = crypto.randomUUID();
   await freshPool.query(
-    `INSERT INTO users (id, name, phone, email, role) VALUES ($1, 'PG16 FO User', $2, $3, 'customer')`,
+    `INSERT INTO users (id, phone, name, email, is_phone_verified) VALUES ($1, $2, 'PG16 FO User', $3, TRUE)`,
     [foUserId, `+9190${Math.floor(10000000 + Math.random() * 89999999)}`, `pg16_fo_${Date.now()}@qcom.local`]
   );
   const foCpn1 = `PG16FO1_${Date.now().toString().slice(-4)}`;
@@ -1883,8 +1883,8 @@ async function runSprint16_1PostgresChecks(freshPool: import('pg').Pool): Promis
       freshPool.query(
         `INSERT INTO credit_notes (
            credit_note_number, credit_note_type, order_id, return_id, invoice_id, financial_year,
-           taxable_amount, cgst_amount, sgst_amount, igst_amount, cess_amount, total_amount, reason
-         ) VALUES ($1, 'SELLER_CREDIT_NOTE', $2, $3, $4, $5, 0, 0, 0, 0, 0, 0, 'dup test')`,
+           taxable_amount, cgst_amount, sgst_amount, igst_amount, cess_amount, total_amount, reason_code
+         ) VALUES ($1, 'SELLER_CREDIT_NOTE', $2, $3, $4, $5, 0, 0, 0, 0, 0, 0, 'DUP_TEST')`,
         [`CN-DUP-${Date.now()}`, winOrd.id, retReq.returnRequest.id, existingCn.invoice_id, existingCn.financial_year]
       ),
     (err: any) => err?.code === '23505'
