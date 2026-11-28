@@ -4,8 +4,8 @@
 **Branch:** `main`  
 **Target Directory:** `QCOM/backend`  
 **Baseline Code Commit Inspected:** `007a3653ce8d515637ef08d8efa3755ca3034121` (docs commit `640e2ee`, prior CI Run `45834260969`)  
-**Sprint 16.1 Remediated Code Commit:** `PENDING_PUSH`  
-**Sprint 16.1 CI Verification Run ID:** `PENDING_PUSH`  
+**Sprint 16.1 Remediated Code Commit:** `75b81b72481ff8135e814e9baf3e9e26555de399`  
+**Sprint 16.1 CI Verification Run ID:** `46155756761` (`test` Job `141011929294` + `real-services-integration` Job `141011929122` — both `success`)  
 **Scope Compliance:** Verified strictly scoped to `QCOM/backend/**` and `.github/workflows/ci.yml`. Zero modifications to `QCOM/customer-app/src/**`, `QCOM/delivery-app/**`, `QCOM/admin-portal/src/**`, root `src/**`, or historical migrations `001`–`031`.  
 **Payment Gateway Neutrality:** Strictly maintained — zero payment gateway selected (`mock` / provider-neutral adapter architecture preserved).
 
@@ -27,8 +27,8 @@ All 11 confirmed defects were surgically repaired in code and forward-only **Mig
 | --- | --- | --- |
 | **Expected Baseline (Sprint 16.0 Code)** | `007a3653ce8d515637ef08d8efa3755ca3034121` | Baseline source inspected (`CI Run 45834260969`). |
 | **Sprint 16.0 Docs Baseline** | `640e2ee` (`origin/main` pre-16.1) | Matched `origin/main` HEAD at start of push cycle. |
-| **Sprint 16.1 Code + Migration 032 + Docs Commit** | `PENDING_PUSH` | Contains Migration `032`, service/route remediations, Suite 61 (`sprint16-1`), `real-services.test.ts`, `.github/workflows/ci.yml`, and reconciled `.md` documentation. |
-| **Sprint 16.1 Finalized Report Commit** | `PENDING_PUSH` | Populates Sections B & S with verified CI Run ID and test/PostgreSQL/Redis evidence from GitHub Actions. |
+| **Sprint 16.1 Remediated Code + Migration 032 + Docs Commit** | `75b81b72481ff8135e814e9baf3e9e26555de399` | Contains Migration `032`, service/route remediations, PG16 extended-protocol explicit casts + transaction error logging, Suite 61 (`sprint16-1`), `real-services.test.ts`, `.github/workflows/ci.yml`, and reconciled `.md` documentation (verified by CI Run `46155756761`). |
+| **Sprint 16.1 Finalized Report Commit** | Subsequent docs-only commit on `main` (parent `75b81b72481ff8135e814e9baf3e9e26555de399`) | Populates Sections B, J & S with verified CI Run `46155756761` (`141011929294` & `141011929122`) evidence from GitHub Actions. |
 
 **Historical Immobility Verified:** Migrations `001` through `031` remain byte-for-byte unmodified. Schema remediations live exclusively in forward migration `032_sprint16_1_financial_integrity_remediation.sql`.
 
@@ -93,6 +93,7 @@ All 11 confirmed defects were surgically repaired in code and forward-only **Mig
 12. `QCOM/backend/src/routes/pricingRoutes.ts`
 13. `QCOM/backend/src/routes/cartRoutes.ts`
 14. `QCOM/backend/src/routes/returnRoutes.ts`
+15. `QCOM/backend/src/database/connection.ts` *(safe transaction error code/message logging without credential exposure)*
 
 ### Tests & CI Workflow
 15. `QCOM/backend/tests/sprint16-1-independent-financial-integrity.test.ts` *(new Suite 61)*
@@ -174,10 +175,10 @@ All 11 confirmed defects were surgically repaired in code and forward-only **Mig
    - Added CHECK constraints `chk_coupons_usage_within_limit`, `chk_promotions_usage_within_limit`, and `chk_order_items_refund_qty_bound`.
 2. **Pricing Engine (`pricingEngine.ts`):** Validates finite `distanceKm >= 0` (`400 INVALID_DISTANCE`); merges duplicate `productId` lines upfront before inventory/GST/discount passes.
 3. **Order Service & Route Fingerprint (`orderService.ts`, `orderRoutes.ts`):** Enforces quote ownership (`403 QUOTE_ACCESS_DENIED`), merchant match (`409 QUOTE_MERCHANT_MISMATCH`), single-use lock (`converted_at IS NOT NULL` -> `409 QUOTE_ALREADY_USED`), and price-drift detection (`409 PRICE_CHANGED` even when `expectedTotal` omitted); canonicalizes duplicate items and hashes optional `merchantId`/`deliveryAddressId`/`placeOfSupplyStateCode`/`quoteId`/`expectedTotal` conditionally into the `Idempotency-Key` SHA-256 fingerprint (preserving exact legacy fingerprint compatibility when omitted).
-4. **Coupon & Promotion Service (`couponPromotionService.ts`):** Locks `users`, `coupons`, and `promotions` using `FOR NO KEY UPDATE` inside `lockAndReserveForOrder` (preventing concurrent dual-coupon `first_order_only` races without triggering `FOR KEY SHARE <-> FOR UPDATE` foreign-key upgrade deadlocks against `pricing_calculation_snapshots`/`orders` on real PostgreSQL 16); throws `409 PROMOTION_INACTIVE` for inactive/expired promotions under lock; adds largest-remainder paisa sweep + funding-share reconciliation in `allocateDiscountProportionally`; skips `discountTarget === 'DELIVERY'` during `reverseForReturn` (`FREE_DELIVERY` stays `'APPLIED'`).
+4. **Coupon & Promotion Service (`couponPromotionService.ts`):** Locks `users`, `coupons`, and `promotions` using `FOR NO KEY UPDATE` inside `lockAndReserveForOrder` (preventing concurrent dual-coupon `first_order_only` races without triggering `FOR KEY SHARE <-> FOR UPDATE` foreign-key upgrade deadlocks against `pricing_calculation_snapshots`/`orders` on real PostgreSQL 16); adds explicit `$2::varchar` casts in `reverseForReturn` for PG16 extended-protocol typing safety; throws `409 PROMOTION_INACTIVE` for inactive/expired promotions under lock; adds largest-remainder paisa sweep + funding-share reconciliation in `allocateDiscountProportionally`; skips `discountTarget === 'DELIVERY'` during `reverseForReturn` (`FREE_DELIVERY` stays `'APPLIED'`).
 5. **Return Service (`returnService.ts`):** Aggregates duplicate `orderItemId` lines in `requestReturn()`; hardens `qcInspectAndResolve()` into crash-safe 3-phase execution with deterministic key `ret_qc_${ret.id}`, `RETURN_QC_IN_PROGRESS` guard on `PENDING`/`PROCESSING` refunds, `COMPLETED` refund reuse + amount check (`RETURN_REFUND_MISMATCH`), and immediate `order_returns.refund_id` linkage.
-6. **Invoice & Credit Note Service (`invoiceService.ts`):** Fixes `snapDelivery.taxAmount ?? snapDelivery.totalGstAmount ?? add(cgst, sgst, igst)` on lines `197–218`; fails closed if `statutory_tax_rules` is missing; auto-creates missing parent `SELLER_TAX_INVOICE` when issuing credit notes; reconciles final cumulative return to exact `line_total_payable` (`₹0.00` cumulative drift across uneven 3-step partial returns).
-7. **COA `5040` Unwind & GL (`sellerSettlementService.ts`, `ledgerService.ts`):** Proportionally reverses `platform_discount_subsidy` (`Cr 5040`) during return clawbacks (`reversed_platform_subsidy`), balancing `DR == CR` and restoring seller & `5040` balances cleanly to `0.00` on full return.
+6. **Invoice & Credit Note Service (`invoiceService.ts`):** Fixes `snapDelivery.taxAmount ?? snapDelivery.totalGstAmount ?? add(cgst, sgst, igst)` on lines `197–218`; eliminates duplicate `$3` parameter reuse in `invoice_line_items` fee inserts; fails closed if `statutory_tax_rules` is missing; auto-creates missing parent `SELLER_TAX_INVOICE` when issuing credit notes; reconciles final cumulative return to exact `line_total_payable` (`₹0.00` cumulative drift across uneven 3-step partial returns).
+7. **COA `5040` Unwind & GL (`sellerSettlementService.ts`, `ledgerService.ts`):** Proportionally reverses `platform_discount_subsidy` (`Cr 5040`) during return clawbacks (`reversed_platform_subsidy`) with explicit `$3::boolean` PG16 cast, balancing `DR == CR` and restoring seller & `5040` balances cleanly to `0.00` on full return.
 8. **Check `14E–14J` (`paymentReconciliationService.ts`):** Added read-only audit checks for order-item vs. snapshot totals (`14E`), invoice header vs. line items & seller invoice parity (`14F`), credit note line-sum/ceiling/missing-parent/`refunded_quantity` bounds (`14G`), coupon/promo limit & cancelled/paid state drift (`14H`), COA `5040` subsidy/reversal parity (`14I`), and journal batch `DR != CR` imbalance (`14J`).
 9. **Rate Limiters (`rateLimiter.ts`, `pricingRoutes.ts`, `cartRoutes.ts`, `returnRoutes.ts`):** Mounted `pricingQuoteRateLimiter` (60/min open), `couponValidationRateLimiter` (20/min closed `503`), `returnActionRateLimiter` (30/min closed `503`), and `cartRateLimiter` (60/min open).
 
@@ -202,8 +203,8 @@ All 6 targeted groups live in **`QCOM/backend/tests/sprint16-1-independent-finan
 | Environment | What Actually Executed | Result |
 | --- | --- | --- |
 | **Local Workspace (`pg-mem` / No local PG16/Redis daemons)** | `npm --prefix QCOM/backend run build`, `npx tsc --noEmit`, `npm run lint`, plus `pg-mem` execution of `testMigrations`, `runSprint4MigrationTests`, `runSprint7SettlementsTests`, `runSprint9ReturnsCancellationsTests` (25 tests), `testPricingAndTaxEngine`, `runSprint15_9CodCashAccountabilityTests`, `runSprint16_0PricingGstCouponsPromotionsTests`, `runSprint16_1IndependentFinancialIntegrityTests` (Groups A–F) | **PASSED LOCALLY** (`0` TS errors, all listed `pg-mem` suites green). Local PG16/Redis suites (`sprint15-5`, `real-services.test.ts`) could not connect locally (`ECONNREFUSED`) because PG16/Redis binaries do not run in the sandbox. |
-| **GitHub Actions Job 1 (`All 61 Test Suites & Infrastructure Verification`)** | Fresh PostgreSQL 16 (`qcom_test`/`qcom_staging`/`qcom_db`) + Redis `7.0.15`, Migrations `001`–`032`, Seeds, all 61 suites in `run-all-tests.ts`, `tsc`, `lint`, builds | **PENDING_CI_VERIFICATION** *(to be populated from CI Run logs)* |
-| **GitHub Actions Job 2 (`Real-Services Integration Harness — PG 16 & Redis 7.0.15`)** | Isolated Docker Compose PG `16.6` & Redis `7.0.15`, fresh + upgrade migrations (`001`–`032`), SQLSTATE `23514`/`23505`, `runSprint16_0PostgresChecks`, `runSprint16_1PostgresChecks`, `couponValidationRateLimiter` real Redis 20-request admission + 3×`429` + `503` fault mode | **PENDING_CI_VERIFICATION** *(to be populated from CI Run logs)* |
+| **GitHub Actions Job 1 (`All 61 Test Suites & Infrastructure Verification`, Run `46155756761`, Job `141011929294`)** | Fresh PostgreSQL `16.16` (`qcom_test`/`qcom_staging`/`qcom_db`) + Redis `7.0.15`, Migrations `001`–`032`, Seeds, all 61 suites in `run-all-tests.ts`, `tsc`, `lint`, root & backend builds | **PASSED (`success`)** — All 61 suites passed in `43.32s` (including Sprint 16.0 `8/8` groups & Sprint 16.1 `6/6` groups); `tsc`, `npm run lint`, `npm --prefix QCOM/backend run build`, and `npm run build` exited `0`. |
+| **GitHub Actions Job 2 (`Real-Services Integration Harness — PG 16 & Redis 7.0.15`, Run `46155756761`, Job `141011929122`)** | Isolated Docker Compose PG `16.6` & Redis `7.0.15`, fresh + upgrade migrations (`001`–`032`), SQLSTATE `23514`/`23505`, `runSprint16_0PostgresChecks`, `runSprint16_1PostgresChecks`, `couponValidationRateLimiter` real Redis 20-request admission + 3×`429` + `503` fault mode | **PASSED (`success`)** — Real PostgreSQL `16.6` and Redis `7.0.15` checks passed, including 200-way coupon race, dual `first_order_only` race, delayed webhook guard, concurrent QC single refund/CN, COA `5040` full unwind, and Check `14E–14J`. |
 | **Live Production Infrastructure** | **NOT EXECUTED** | **UNVERIFIED IN PRODUCTION** |
 
 ---
@@ -277,17 +278,17 @@ Verified via `tests/sprint16-1-independent-financial-integrity.test.ts` (Groups 
 
 ## R. Production-Readiness Assessment
 
-QCOM's pricing, GST, coupon/promotion concurrency, return refund/credit-note, COA `5040` subsidy unwind, and Check 14 reconciliation subsystems are **architecturally sound and hardened for STAGING validation** (pending CI verification below), **NOT approved for immediate production launch** due to the undecided founder/CA/tax policies in Section P and untested live gateway/IRP/production infrastructure in Section Q.
+QCOM's pricing, GST, coupon/promotion concurrency, return refund/credit-note, COA `5040` subsidy unwind, and Check 14 reconciliation subsystems are **architecturally sound, CI-verified on real PostgreSQL 16 & Redis 7.0.15 (`Run 46155756761`), and ready for STAGING validation**, **NOT approved for immediate production launch** due to the undecided founder/CA/tax policies in Section P and untested live gateway/IRP/production infrastructure in Section Q.
 
 ---
 
 ## S. Final Git Commit and GitHub Actions CI Run IDs
 
-- **Code + Migration 032 + Docs Commit (`main`):** `PENDING_PUSH`
-- **CI Workflow Run (`QCOM Backend CI`):** `PENDING_PUSH`
-- **Job 1 (`All 61 Test Suites & Infrastructure Verification`):** `PENDING_PUSH`
-- **Job 2 (`Real-Services Integration Harness (PG 16 & Redis 7.0.15)`):** `PENDING_PUSH`
-- **Final Report Update Commit (`main`):** `PENDING_PUSH`
+- **Code + Migration 032 + Docs Commit (`main`):** `75b81b72481ff8135e814e9baf3e9e26555de399`
+- **CI Workflow Run (`QCOM Backend CI`):** `46155756761` (`https://github.com/theRawHawn/Q-Com-Backend/actions/runs/46155756761`, `completed` — `success`)
+- **Job 1 (`All 61 Test Suites & Infrastructure Verification`):** `141011929294` (`completed` — `success`, PostgreSQL `16.16` + Redis `7.0.15`, 61/61 suites passed in `43.32s`)
+- **Job 2 (`Real-Services Integration Harness (PG 16 & Redis 7.0.15)`):** `141011929122` (`completed` — `success`, PostgreSQL `16.6` + Redis `7.0.15`)
+- **Final Report Update Commit (`main`):** Docs-only report finalization commit directly succeeding `75b81b72481ff8135e814e9baf3e9e26555de399` on `main`
 
 ---
 
@@ -296,6 +297,6 @@ QCOM's pricing, GST, coupon/promotion concurrency, return refund/credit-note, CO
 **`APPROVED WITH CONDITIONS — STAGING ONLY`**
 
 **Mandatory Conditions Before Production:**
-1. Green GitHub Actions CI completion (`test` All 61 suites + `real-services-integration` on PostgreSQL 16 & Redis 7.0.15) populated into Sections B, J & S.
+1. *(Satisfied)* Green GitHub Actions CI completion (`test` Job `141011929294` + `real-services-integration` Job `141011929122` in Run `46155756761` on PostgreSQL 16 & Redis 7.0.15) recorded in Sections B, J & S.
 2. Founder/CA written sign-off on all Section P policy decisions (Section 34 cutoffs, IRP threshold & credentials, partial-return coupon/BOGO clawback policy, catalog HSN/SAC audit).
 3. Dedicated payment gateway selection sprint and non-superuser runtime PostgreSQL role configuration prior to live money movement.
