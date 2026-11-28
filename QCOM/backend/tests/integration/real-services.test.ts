@@ -1802,7 +1802,10 @@ async function runSprint16_1PostgresChecks(freshPool: import('pg').Pool): Promis
     }),
   ]);
   const foWon = foRace.filter((r) => r.status === 'fulfilled') as Array<PromiseFulfilledResult<any>>;
-  const foLost = foRace.filter((r) => r.status === 'rejected');
+  const foLost = foRace.filter((r) => r.status === 'rejected') as Array<PromiseRejectedResult>;
+  if (foWon.length !== 1 || foLost.length !== 1) {
+    console.error('[PG16-16.1 foRace unexpected outcome]', foLost.map((r) => r.reason?.stack || r.reason?.message || r.reason));
+  }
   assert.equal(foWon.length, 1, 'Strictly 1 checkout may consume a first_order_only coupon under dual-coupon concurrency.');
   assert.equal(foLost.length, 1, 'Second concurrent first_order_only checkout must fail cleanly without deadlock.');
 
@@ -1870,7 +1873,12 @@ async function runSprint16_1PostgresChecks(freshPool: import('pg').Pool): Promis
     }),
   ]);
   const qcFulfilled = qcRace.filter((r) => r.status === 'fulfilled');
-  assert.ok(qcFulfilled.length >= 1, 'At least one QC worker must complete return inspection.');
+  const qcRejected = qcRace.filter((r) => r.status === 'rejected') as Array<PromiseRejectedResult>;
+  if (qcFulfilled.length === 0) {
+    const reasons = qcRejected.map((r, idx) => `#${idx + 1}: ${r.reason?.code || ''} ${r.reason?.stack || r.reason?.message || r.reason}`);
+    console.error('[PG16-16.1 qcRace rejections]', reasons);
+    assert.ok(qcFulfilled.length >= 1, `At least one QC worker must complete return inspection. Rejections: ${reasons.join(' | ')}`);
+  }
   const refundsCnt = Number((await freshPool.query(`SELECT COUNT(*) AS cnt FROM refunds WHERE order_id = $1`, [winOrd.id])).rows[0].cnt);
   const cnCnt = Number((await freshPool.query(`SELECT COUNT(*) AS cnt FROM credit_notes WHERE order_id = $1`, [winOrd.id])).rows[0].cnt);
   assert.equal(refundsCnt, 1, 'Concurrent QC must produce strictly 1 refund row.');

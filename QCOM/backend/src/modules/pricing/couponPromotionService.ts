@@ -952,8 +952,8 @@ export class CouponPromotionService {
       await client.query(
         `UPDATE coupon_redemptions
             SET reversed_amount = $1,
-                status = $2,
-                reversed_at = CASE WHEN $2 = 'REVERSED' THEN COALESCE(reversed_at, NOW()) ELSE reversed_at END,
+                status = $2::varchar,
+                reversed_at = CASE WHEN $2::varchar = 'REVERSED' THEN COALESCE(reversed_at, NOW()) ELSE reversed_at END,
                 updated_at = NOW()
           WHERE id = $3`,
         [roundCurrency(nextRev), newStatus, row.id]
@@ -985,7 +985,7 @@ export class CouponPromotionService {
       await client.query(
         `UPDATE promotion_applications
             SET reversed_amount = $1,
-                status = $2,
+                status = $2::varchar,
                 updated_at = NOW()
           WHERE id = $3`,
         [roundCurrency(nextRev), newStatus, row.id]

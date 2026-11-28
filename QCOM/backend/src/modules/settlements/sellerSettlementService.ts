@@ -1069,7 +1069,7 @@ export class SellerSettlementService {
         UPDATE order_settlement_allocations
         SET refunded_amount = $1,
             reversed_platform_subsidy = $2,
-            status = CASE WHEN $3 THEN 'REVERSED' ELSE status END
+            status = CASE WHEN $3::boolean THEN 'REVERSED' ELSE status END
         WHERE order_id = $4
       `, [
         Number(roundCurrency(updatedRefundedNetBn)),

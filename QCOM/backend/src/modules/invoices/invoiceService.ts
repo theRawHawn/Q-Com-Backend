@@ -375,6 +375,7 @@ export class InvoiceService {
 
       const qcomInvId = insQcomInv.rows[0].id;
       if (deliveryFeeBn.gt(0)) {
+        const delFeeStr = roundCurrency(deliveryFeeBn);
         const delTotal = roundCurrency(add(deliveryFeeBn, deliveryLineCalc.totalGstAmount));
         await client.query(
           `INSERT INTO invoice_line_items (
@@ -382,11 +383,12 @@ export class InvoiceService {
             discount_amount, taxable_value, gst_rate_percent, cgst_amount, sgst_amount, igst_amount,
             cess_amount, tax_inclusive, total_line_amount
           )
-          VALUES ($1, 'Rapid Hyperlocal Dispatch & Courier Transport', $2, 1, $3, 0.00, $3, $4, $5, $6, $7, 0.00, FALSE, $8)`,
+          VALUES ($1, 'Rapid Hyperlocal Dispatch & Courier Transport', $2, 1, $3, 0.00, $4, $5, $6, $7, $8, 0.00, FALSE, $9)`,
           [
             qcomInvId,
             deliveryLineCalc.sacCode,
-            roundCurrency(deliveryFeeBn),
+            delFeeStr,
+            delFeeStr,
             deliveryLineCalc.gstRatePercent,
             deliveryLineCalc.cgstAmount,
             deliveryLineCalc.sgstAmount,
@@ -397,6 +399,7 @@ export class InvoiceService {
       }
 
       if (handlingFeeBn.gt(0)) {
+        const handFeeStr = roundCurrency(handlingFeeBn);
         const handTotal = roundCurrency(add(handlingFeeBn, handlingLineCalc.totalGstAmount));
         await client.query(
           `INSERT INTO invoice_line_items (
@@ -404,11 +407,12 @@ export class InvoiceService {
             discount_amount, taxable_value, gst_rate_percent, cgst_amount, sgst_amount, igst_amount,
             cess_amount, tax_inclusive, total_line_amount
           )
-          VALUES ($1, 'Site Logistics Handling & Staging Charge', $2, 1, $3, 0.00, $3, $4, $5, $6, $7, 0.00, FALSE, $8)`,
+          VALUES ($1, 'Site Logistics Handling & Staging Charge', $2, 1, $3, 0.00, $4, $5, $6, $7, $8, 0.00, FALSE, $9)`,
           [
             qcomInvId,
             handlingLineCalc.sacCode,
-            roundCurrency(handlingFeeBn),
+            handFeeStr,
+            handFeeStr,
             handlingLineCalc.gstRatePercent,
             handlingLineCalc.cgstAmount,
             handlingLineCalc.sgstAmount,

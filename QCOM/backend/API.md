@@ -38,7 +38,7 @@
 | `/checkout/pricing-config` / `/pricing/pricing-config` | POST | Bearer (`SUPER_ADMIN`, `FINANCE_ADMIN`, `OPERATIONS`) | Updates platform pricing rules |
 | `/checkout/sellers-geofence/:sellerId` | POST | Bearer (`requireMerchantOwnership`) | Updates store availability & geofence radius |
 | `/orders/delivery-economics/config` | POST | Bearer (`SUPER_ADMIN`, `FINANCE_ADMIN`, `OPERATIONS`) | Updates delivery economics configuration |
-| `/orders/create` | POST | Bearer (`checkoutRateLimiter`) | Places order with server-recomputed pricing, single-use quote (`403`/`409 QUOTE_ALREADY_USED`/`PRICE_CHANGED`/`QUOTE_EXPIRED`), canonical payload fingerprint, and atomic `users FOR UPDATE` + coupon locks |
+| `/orders/create` | POST | Bearer (`checkoutRateLimiter`) | Places order with server-recomputed pricing, single-use quote (`403`/`409 QUOTE_ALREADY_USED`/`PRICE_CHANGED`/`QUOTE_EXPIRED`), canonical payload fingerprint, and atomic `users FOR NO KEY UPDATE` + coupon locks |
 | `/orders` | GET | Bearer | Retrieves authenticated customer's order history |
 | `/orders/:orderId` | GET | Bearer (`requireOrderOwnership`) | Retrieves single order details (customer, merchant staff, assigned rider, or admin only) |
 | `/orders/:orderId/cancel` | POST | Bearer (`requireOrderOwnership`) | Cancels unassigned/unpacked order with stock restitution and coupon/promo reservation release |

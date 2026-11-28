@@ -94,7 +94,8 @@ export async function transaction<T>(
         const result = await callback(client);
         await client.query('COMMIT');
         return result;
-      } catch (err) {
+      } catch (err: any) {
+        console.error('[Database Transaction Error] [pg-mem]', err?.code || 'ERR', err?.message || err);
         if (memDbBackup) {
           try {
             memDbBackup.restore();
@@ -124,7 +125,8 @@ export async function transaction<T>(
     const result = await callback(client);
     await client.query('COMMIT');
     return result;
-  } catch (err) {
+  } catch (err: any) {
+    console.error('[Database Transaction Error]', err?.code || 'ERR', err?.message || err);
     try {
       await client.query('ROLLBACK');
     } catch (rollbackErr: any) {
